@@ -1,0 +1,8 @@
+{
+  global:
+    tf_*;
+    zf_tajweed_*;
+    zf_platform_*;
+  local:
+    *;
+};

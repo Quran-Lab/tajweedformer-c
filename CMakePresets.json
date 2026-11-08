@@ -1,0 +1,47 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "windows-clang",
+      "displayName": "Windows x64, clang on the Microsoft runtime (the default: about 1.5x faster than MinGW)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-clang",
+      "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows"},
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "ZF_NATIVE_RELEASE": "ON"
+      }
+    },
+    {
+      "name": "windows-mingw",
+      "displayName": "Windows x64, MinGW-w64 GCC",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-mingw",
+      "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows"},
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_CXX_COMPILER": "g++",
+        "ZF_NATIVE_RELEASE": "ON"
+      }
+    },
+    {
+      "name": "linux",
+      "displayName": "Linux x64 (GCC or clang)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux",
+      "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux"},
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ZF_NATIVE_RELEASE": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {"name": "windows-clang", "configurePreset": "windows-clang", "targets": ["tajweedformer", "tajweedformer_static", "tajweedformer_cli", "tf_tests", "vnni_check", "dropin_check", "hooked_check", "cpu_detect"]},
+    {"name": "windows-mingw", "configurePreset": "windows-mingw", "targets": ["tajweedformer", "tajweedformer_static", "tajweedformer_cli", "tf_tests", "vnni_check", "dropin_check", "hooked_check", "cpu_detect"]},
+    {"name": "linux", "configurePreset": "linux", "targets": ["tajweedformer", "tajweedformer_static", "tajweedformer_cli", "tf_tests", "vnni_check", "dropin_check", "hooked_check", "cpu_detect"]}
+  ]
+}

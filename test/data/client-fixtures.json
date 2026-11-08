@@ -1,0 +1,1458 @@
+{
+  "about": "Request and response pairs recorded by `npm run e2e:client` against the local stack (PLATFORM_CLIENT.md). Keys, tokens and signatures of URLs are redacted; signed bodies keep their real Ed25519 signature by the LOCAL throwaway key below, so an SDK can replay verification with it pinned.",
+  "local_public_key_hex": "9d43515af4e6686bd22516bfd989cd6686368cfffbdda9aca52bc559baf68289",
+  "local_key_id": "4dbf8427f2ba2185",
+  "recorded": "2026-11-07",
+  "exchanges": [
+    {
+      "name": "cors preflight (web)",
+      "request": {
+        "method": "OPTIONS",
+        "path": "/v1/register",
+        "headers": {
+          "origin": "https://client-e2e.example.org",
+          "access-control-request-method": "POST"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 204,
+        "headers": {
+          "access-control-allow-origin": "https://client-e2e.example.org",
+          "access-control-allow-methods": "GET, POST, OPTIONS",
+          "access-control-allow-headers": "x-qlab-key, authorization, content-type, if-none-match, x-qlab-id, x-qlab-contributor, x-qlab-turnstile"
+        },
+        "body": ""
+      }
+    },
+    {
+      "name": "attest unattested (apple)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/attest",
+        "headers": {
+          "x-qlab-key": "<redacted>"
+        },
+        "body": {
+          "platform": "ios",
+          "bundle_id": "org.example.clientmw6frljs"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"token\":\"<app token>\",\"expires_in\":86400,\"attested\":false}"
+      }
+    },
+    {
+      "name": "attest unattested (android)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/attest",
+        "headers": {
+          "x-qlab-key": "<redacted>"
+        },
+        "body": {
+          "platform": "android",
+          "bundle_id": "org.example.clientmw6frljs"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"token\":\"<app token>\",\"expires_in\":86400,\"attested\":false}"
+      }
+    },
+    {
+      "name": "attest unattested (web)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/attest",
+        "headers": {
+          "x-qlab-key": "<app key>",
+          "origin": "https://client-e2e.example.org"
+        },
+        "body": {
+          "platform": "web",
+          "bundle_id": "https://client-e2e.example.org"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store",
+          "access-control-allow-origin": "https://client-e2e.example.org"
+        },
+        "body": "{\"token\":\"<app token>\",\"expires_in\":86400,\"attested\":false}"
+      }
+    },
+    {
+      "name": "attest unattested (native linux)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/attest",
+        "headers": {
+          "x-qlab-key": "<app key>"
+        },
+        "body": {
+          "platform": "linux",
+          "bundle_id": "org.example.Clientmw6frljs"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"token\":\"<app token>\",\"expires_in\":86400,\"attested\":false}"
+      }
+    },
+    {
+      "name": "attest unattested (native windows)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/attest",
+        "headers": {
+          "x-qlab-key": "<app key>"
+        },
+        "body": {
+          "platform": "windows",
+          "bundle_id": "Example.Clientmw6frljs"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"token\":\"<app token>\",\"expires_in\":86400,\"attested\":false}"
+      }
+    },
+    {
+      "name": "attest challenge",
+      "request": {
+        "method": "GET",
+        "path": "/v1/attest/challenge",
+        "headers": {
+          "x-qlab-key": "<redacted>"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"challenge\":\"c1.1794058229.OGEl7VdqNgq5jwTVKvv6LA.rUCXq9v3tDMtyhBh7kSLka\",\"expires_in\":300}"
+      }
+    },
+    {
+      "name": "attest play integrity (android)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/attest",
+        "headers": {
+          "x-qlab-key": "<redacted>"
+        },
+        "body": {
+          "platform": "android",
+          "bundle_id": "org.example.clientmw6frljs",
+          "challenge": "c1.1794058229.E0Z8keS2LI5-XaasOi2dkw._uU8Cez-cEij-3IOugI4rp",
+          "integrity_token": "<integrity token>"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"token\":\"<app token>\",\"expires_in\":86400,\"attested\":true}"
+      }
+    },
+    {
+      "name": "register (ios)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/register",
+        "headers": {
+          "authorization": "Bearer <app token>"
+        },
+        "body": {
+          "platform": "ios",
+          "bundle_id": "org.example.clientmw6frljs",
+          "app_name": "Client e2e",
+          "app_version": "1.0",
+          "sdk_version": "2.0.0",
+          "model_revision": "v4.0+e2e",
+          "new_install": true
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"ok\":true,\"app_id\":\"ios:org.example.clientmw6frljs\",\"store_status\":\"pending\"}"
+      }
+    },
+    {
+      "name": "register (android)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/register",
+        "headers": {
+          "authorization": "Bearer <app token>"
+        },
+        "body": {
+          "platform": "android",
+          "bundle_id": "org.example.clientmw6frljs",
+          "app_name": "Client e2e",
+          "app_version": "1.0",
+          "sdk_version": "2.0.0",
+          "model_revision": "v4.0+e2e",
+          "new_install": true
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"ok\":true,\"app_id\":\"android:org.example.clientmw6frljs\",\"store_status\":\"pending\"}"
+      }
+    },
+    {
+      "name": "register (web)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/register",
+        "headers": {
+          "authorization": "Bearer <app token>",
+          "origin": "https://client-e2e.example.org"
+        },
+        "body": {
+          "platform": "web",
+          "bundle_id": "https://client-e2e.example.org",
+          "app_name": "Client e2e",
+          "app_version": "1.0",
+          "sdk_version": "2.0.0",
+          "model_revision": "v4.0+e2e",
+          "new_install": true
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store",
+          "access-control-allow-origin": "https://client-e2e.example.org"
+        },
+        "body": "{\"ok\":true,\"app_id\":\"web:https://client-e2e.example.org\",\"store_status\":\"pending\"}"
+      }
+    },
+    {
+      "name": "register (linux)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/register",
+        "headers": {
+          "authorization": "Bearer <app token>"
+        },
+        "body": {
+          "platform": "linux",
+          "bundle_id": "org.example.Clientmw6frljs",
+          "app_name": "Client e2e",
+          "app_version": "1.0",
+          "sdk_version": "2.0.0",
+          "model_revision": "v4.0+e2e",
+          "new_install": true
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"ok\":true,\"app_id\":\"linux:org.example.Clientmw6frljs\",\"store_status\":\"pending\"}"
+      }
+    },
+    {
+      "name": "register (windows)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/register",
+        "headers": {
+          "authorization": "Bearer <app token>"
+        },
+        "body": {
+          "platform": "windows",
+          "bundle_id": "Example.Clientmw6frljs",
+          "app_name": "Client e2e",
+          "app_version": "1.0",
+          "sdk_version": "2.0.0",
+          "model_revision": "v4.0+e2e",
+          "new_install": true
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"ok\":true,\"app_id\":\"windows:Example.Clientmw6frljs\",\"store_status\":\"pending\"}"
+      }
+    },
+    {
+      "name": "config sdk 2.0.0 (apple, V4)",
+      "request": {
+        "method": "GET",
+        "path": "/v1/config?bucket=37&sdk=2.0.0",
+        "headers": {
+          "authorization": "Bearer <app token>"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "private, max-age=300",
+          "etag": "\"c81e435d2b0fd917e87c8218262526fc\"",
+          "x-qlab-signature": "ed25519=wwMKjg0C3vCqrH7VrmdcVZHQ2bTKJtEvRFoMW_YYu5G8Cyqqzok4L75_tO8phHEMPhV4r5ZzmhGvIG1_PbIiAQ",
+          "x-qlab-key-id": "4dbf8427f2ba2185"
+        },
+        "body": "{\"v\":1,\"app\":\"ios:org.example.clientmw6frljs\",\"channel\":\"beta\",\"issued_at\":1794057929,\"expires_at\":1794144329,\"models\":{\"Quran-Lab/tajweedformer-v4\":{\"revision\":\"10d9f5c10b2fa8bc956699efc9d2a98c305916a7\",\"source\":\"beta\",\"model_id\":\"v4.0\",\"folder\":\"sdk/v4.0\"},\"Quran-Lab/zipformer_p-arabic-v3\":{\"revision\":\"v3.1+beta.4\",\"source\":\"beta\",\"model_id\":\"v3.1\",\"folder\":\"sdk/v3.1\"}},\"recommended\":{\"model\":\"Quran-Lab/tajweedformer-v4\",\"model_id\":\"v4.0\",\"folder\":\"sdk/v4.0\",\"revision\":\"10d9f5c10b2fa8bc956699efc9d2a98c305916a7\",\"source\":\"beta\"},\"denylist\":[{\"platform\":\"ios\",\"os_version\":\"17.0*\",\"device_class\":\"A12\",\"sdk_version\":\"*\",\"model_revision\":\"*\",\"backend_forced\":\"exact\",\"reason\":\"Self-test fails on the Neural Engine for A12 under iOS 17.0\"}],\"flags\":{\"analytics\":true,\"issues\":true,\"contributions\":true},\"tajweed\":{\"v\":1}}"
+      }
+    },
+    {
+      "name": "config 304 (unchanged)",
+      "request": {
+        "method": "GET",
+        "path": "/v1/config?bucket=37&sdk=2.0.0",
+        "headers": {
+          "authorization": "Bearer <app token>",
+          "if-none-match": "\"c81e435d2b0fd917e87c8218262526fc\""
+        },
+        "body": null
+      },
+      "response": {
+        "status": 304,
+        "headers": {
+          "cache-control": "private, max-age=300",
+          "etag": "\"c81e435d2b0fd917e87c8218262526fc\""
+        },
+        "body": ""
+      }
+    },
+    {
+      "name": "config 200 after a portal change",
+      "request": {
+        "method": "GET",
+        "path": "/v1/config?bucket=37&sdk=2.0.0",
+        "headers": {
+          "authorization": "Bearer <app token>",
+          "if-none-match": "\"c81e435d2b0fd917e87c8218262526fc\""
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "private, max-age=300",
+          "etag": "\"63b97e0269181735192a1d1180af4a10\"",
+          "x-qlab-signature": "ed25519=vuBlgHzs_GVVGo4kNk5oe3LWotIayYffB7JEK6riWtNMDjJNUhwVQlJrUBCWA71kawRqLIIqQwfWtqKdEdKaBg",
+          "x-qlab-key-id": "4dbf8427f2ba2185"
+        },
+        "body": "{\"v\":1,\"app\":\"ios:org.example.clientmw6frljs\",\"channel\":\"beta\",\"issued_at\":1794057929,\"expires_at\":1794144329,\"models\":{\"Quran-Lab/tajweedformer-v4\":{\"revision\":\"10d9f5c10b2fa8bc956699efc9d2a98c305916a7\",\"source\":\"beta\",\"model_id\":\"v4.0\",\"folder\":\"sdk/v4.0\"},\"Quran-Lab/zipformer_p-arabic-v3\":{\"revision\":\"v3.1+beta.4\",\"source\":\"beta\",\"model_id\":\"v3.1\",\"folder\":\"sdk/v3.1\"}},\"recommended\":{\"model\":\"Quran-Lab/tajweedformer-v4\",\"model_id\":\"v4.0\",\"folder\":\"sdk/v4.0\",\"revision\":\"10d9f5c10b2fa8bc956699efc9d2a98c305916a7\",\"source\":\"beta\"},\"denylist\":[{\"platform\":\"ios\",\"os_version\":\"17.0*\",\"device_class\":\"A12\",\"sdk_version\":\"*\",\"model_revision\":\"*\",\"backend_forced\":\"exact\",\"reason\":\"Self-test fails on the Neural Engine for A12 under iOS 17.0\"}],\"flags\":{\"analytics\":true,\"issues\":true,\"contributions\":true},\"tajweed\":{\"v\":1,\"preset\":\"sensitive\"}}"
+      }
+    },
+    {
+      "name": "config with a web key (origin)",
+      "request": {
+        "method": "GET",
+        "path": "/v1/config?bucket=37&sdk=2.0.0",
+        "headers": {
+          "x-qlab-key": "<app key>",
+          "origin": "https://client-e2e.example.org"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "private, max-age=300",
+          "etag": "\"699c2517ef9740ca586a49420f828425\"",
+          "x-qlab-signature": "ed25519=WZY1e9roNhjIlqhu1uufxAGiuaegPID9L3vWQoAyLmT_9bgxCvbH7LXAXXX75n1NEV7HU_EDM92v1R1IHzVFDw",
+          "x-qlab-key-id": "4dbf8427f2ba2185",
+          "access-control-allow-origin": "https://client-e2e.example.org"
+        },
+        "body": "{\"v\":1,\"app\":\"web:https://client-e2e.example.org\",\"channel\":\"stable\",\"issued_at\":1794057929,\"expires_at\":1794144329,\"models\":{\"Quran-Lab/zipformer_p-arabic-v3\":{\"revision\":\"v3.1+2f9c1ab\",\"source\":\"stable\",\"model_id\":\"v3.1\",\"folder\":\"sdk/v3.1\"}},\"recommended\":{\"model\":\"Quran-Lab/zipformer_p-arabic-v3\",\"model_id\":\"v3.1\",\"folder\":\"sdk/v3.1\",\"revision\":\"v3.1+2f9c1ab\",\"source\":\"stable\"},\"denylist\":[],\"flags\":{\"analytics\":true,\"issues\":true,\"contributions\":true}}"
+      }
+    },
+    {
+      "name": "config with a desktop key (linux, before a token)",
+      "request": {
+        "method": "GET",
+        "path": "/v1/config?bucket=37&sdk=2.0.0&platform=linux&bundle_id=org.example.Clientmw6frljs",
+        "headers": {
+          "x-qlab-key": "<app key>"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "private, max-age=300",
+          "etag": "\"8f51e377053c124d76eb3885279c2fa5\"",
+          "x-qlab-signature": "ed25519=Ivu01hMsAKLkay_xVnnOdj5EwsexEjoo407M8dnM3S87IJV7DRctpM4OHHIJjs8YGT_oipwgNdd1t_-3xGQhCA",
+          "x-qlab-key-id": "4dbf8427f2ba2185"
+        },
+        "body": "{\"v\":1,\"app\":\"linux:org.example.Clientmw6frljs\",\"channel\":\"stable\",\"issued_at\":1794057929,\"expires_at\":1794144329,\"models\":{\"Quran-Lab/zipformer_p-arabic-v3\":{\"revision\":\"v3.1+2f9c1ab\",\"source\":\"stable\",\"model_id\":\"v3.1\",\"folder\":\"sdk/v3.1\"}},\"recommended\":{\"model\":\"Quran-Lab/zipformer_p-arabic-v3\",\"model_id\":\"v3.1\",\"folder\":\"sdk/v3.1\",\"revision\":\"v3.1+2f9c1ab\",\"source\":\"stable\"},\"denylist\":[],\"flags\":{\"analytics\":true,\"issues\":true,\"contributions\":true}}"
+      }
+    },
+    {
+      "name": "cdn manifest",
+      "request": {
+        "method": "GET",
+        "path": "/manifest.json",
+        "headers": {
+          "x-qlab-key": "<redacted>"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "private, max-age=60",
+          "x-qlab-signature": "ed25519=mCZMzafeFyYf4cur_IHfX211LYzItrLOeda-N-5mPlYI6exCASDDgTBeC7tlx-uAPvxA71VZ4ogTKTA0caPjCQ",
+          "x-qlab-key-id": "4dbf8427f2ba2185"
+        },
+        "body": "{\"base\":\"https://cdn.quranlab.ai\",\"expires_at\":1794144329,\"files\":{\"hf/Quran-Lab/tajweedformer-v4/10d9f5c10b2fa8bc956699efc9d2a98c305916a7/sdk/v4.0/calibration.json\":{\"path\":\"sdk/v4.0/calibration.json\",\"regions\":[\"weur\",\"eeur\",\"enam\",\"wnam\",\"apac\",\"oc\"],\"repo\":\"Quran-Lab/tajweedformer-v4\",\"revision\":\"10d9f5c10b2fa8bc956699efc9d2a98c305916a7\",\"sha256\":\"4b6a0871b55a05ca24741f27710fd24aaa5be1a69ee731e298c7f7a4aa8e0cd8\",\"size\":15451},\"hf/Quran-Lab/tajweedformer-v4/10d9f5c10b2fa8bc956699efc9d2a98c305916a7/sdk/v4.0/engine/c16_l64.zfm\":{\"path\":\"sdk/v4.0/engine/c16_l64.zfm\",\"regions\":[\"weur\",\"eeur\",\"enam\",\"wnam\",\"apac\",\"oc\"],\"repo\":\"Quran-Lab/tajweedformer-v4\",\"revision\":\"10d9f5c10b2fa8bc956699efc9d2a98c305916a7\",\"sha256\":\"bc133e4b8b52d2fcd781d58a4f3a8b88dd2137f677264b480205d079960ca1d5\",\"size\":2048},\"hf/Quran-Lab/tajweedformer-v4/10d9f5c10b2fa8bc956699efc9d2a98c305916a7/sdk/v4.0/engine/c24_l256.zfm\":{\"path\":\"sdk/v4.0/engine/c24_l256.zfm\",\"regions\":[\"weur\",\"eeur\",\"enam\",\"wnam\",\"apac\",\"oc\"],\"repo\":\"Quran-Lab/tajweedformer-v4\",\"revision\":\"10d9f5c10b2fa8bc956699efc9d2a98c305916a7\",\"sha256\":\"24699ca067d1feae268d002b30c48a0bf014c93db87bf4b5d506bf674a17a62d\",\"size\":2048},\"hf/Quran-Lab/tajweedformer-v4/10d9f5c10b2fa8bc956699efc9d2a98c305916a7/sdk/v4.0/engine/c24_l72.zfm\":{\"path\":\"sdk/v4.0/engine/c24_l72.zfm\",\"regions\":[\"weur\",\"eeur\",\"enam\",\"wnam\",\"apac\",\"oc\"],\"repo\":\"Quran-Lab/tajweedformer-v4\",\"revision\":\"10d9f5c10b2fa8bc956699efc9d2a98c305916a7\",\"sha256\":\"d2644f0cd94e10c44bffb8d127e99089b4ecd497b63011f12101002a6b404e54\",\"size\":2048},\"hf/Quran-Lab/tajweedformer-v4/10d9f5c10b2fa8bc956699efc9d2a98c305916a7/sdk/v4.0/expected_tj3.bin\":{\"path\":\"sdk/v4.0/expected_tj3.bin\",\"regions\":[\"weur\",\"eeur\",\"enam\",\"wnam\",\"apac\",\"oc\"],\"repo\":\"Quran-Lab/tajweedformer-v4\",\"revision\":\"10d9f5c10b2fa8bc956699efc9d2a98c305916a7\",\"sha256\":\"f7cde6417545a72b57f73b86ea186b07e77b046ad860d74b3886434674161fb8\",\"size\":4096},\"hf/Quran-Lab/tajweedformer-v4/10d9f5c10b2fa8bc956699efc9d2a98c305916a7/sdk/v4.0/manifest.json\":{\"path\":\"sdk/v4.0/manifest.json\",\"regions\":[\"weur\",\"eeur\",\"enam\",\"wnam\",\"apac\",\"oc\"],\"repo\":\"Quran-Lab/tajweedformer-v4\",\"revision\":\"10d9f5c10b2fa8bc956699efc9d2a98c305916a7\",\"sha256\":\"02edb303ad1667a25f5377fc779ac47030ad4fc9d052a69a3d9e5cef4397da45\",\"size\":1541},\"hf/Quran-Lab/tajweedformer-v4/10d9f5c10b2fa8bc956699efc9d2a98c305916a7/sdk/v4.0/npu/qnn/sm8650/c16_l64.bin\":{\"path\":\"sdk/v4.0/npu/qnn/sm8650/c16_l64.bin\",\"regions\":[\"weur\",\"eeur\",\"enam\",\"wnam\",\"apac\",\"oc\"],\"repo\":\"Quran-Lab/tajweedformer-v4\",\"revision\":\"10d9f5c10b2fa8bc956699efc9d2a98c305916a7\",\"sha256\":\"f160e24f7bcca14a505f2b45fb2f1c46af8363354895d1adf6776d022613f131\",\"size\":1024},\"hf/Quran-Lab/tajweedformer-v4/10d9f5c10b2fa8bc956699efc9d2a98c305916a7/sdk/v4.0/tokens.txt\":{\"path\":\"sdk/v4.0/tokens.txt\",\"regions\":[\"weur\",\"eeur\",\"enam\",\"wnam\",\"apac\",\"oc\"],\"repo\":\"Quran-Lab/tajweedformer-v4\",\"revision\":\"10d9f5c10b2fa8bc956699efc9d2a98c305916a7\",\"sha256\":\"66fe6eb81b15506270f9e3c6efb0724cda757cd54326f26ca4bcd6be4f3b2aa4\",\"size\":224},\"hf/Quran-Lab/tajweedformer-v4/eaa15fcbb37f2b1a50da07ad4deae5bc7db51975/sdk/v4.0/calibration.json\":{\"path\":\"sdk/v4.0/calibration.json\",\"regions\":[\"weur\",\"eeur\",\"enam\",\"wnam\",\"apac\",\"oc\"],\"repo\":\"Quran-Lab/tajweedformer-v4\",\"revision\":\"eaa15fcbb37f2b1a50da07ad4deae5bc7db51975\",\"sha256\":\"4b6a0871b55a05ca24741f27710fd24aaa5be1a69ee731e298c7f7a4aa8e0cd8\",\"size\":15451},\"hf/Quran-Lab/tajweedformer-v4/eaa15fcbb37f2b1a50da07ad4deae5bc7db51975/sdk/v4.0/engine/c16_l64.zfm\":{\"path\":\"sdk/v4.0/engine/c16_l64.zfm\",\"regions\":[\"weur\",\"eeur\",\"enam\",\"wnam\",\"apac\",\"oc\"],\"repo\":\"Quran-Lab/tajweedformer-v4\",\"revision\":\"eaa15fcbb37f2b1a50da07ad4deae5bc7db51975\",\"sha256\":\"bc133e4b8b52d2fcd781d58a4f3a8b88dd2137f677264b480205d079960ca1d5\",\"size\":2048},\"hf/Quran-Lab/tajweedformer-v4/eaa15fcbb37f2b1a50da07ad4deae5bc7db51975/sdk/v4.0/engine/c24_l256.zfm\":{\"path\":\"sdk/v4.0/engine/c24_l256.zfm\",\"regions\":[\"weur\",\"eeur\",\"enam\",\"wnam\",\"apac\",\"oc\"],\"repo\":\"Quran-Lab/tajweedformer-v4\",\"revision\":\"eaa15fcbb37f2b1a50da07ad4deae5bc7db51975\",\"sha256\":\"24699ca067d1feae268d002b30c48a0bf014c93db87bf4b5d506bf674a17a62d\",\"size\":2048},\"hf/Quran-Lab/tajweedformer-v4/eaa15fcbb37f2b1a50da07ad4deae5bc7db51975/sdk/v4.0/engine/c24_l72.zfm\":{\"path\":\"sdk/v4.0/engine/c24_l72.zfm\",\"regions\":[\"weur\",\"eeur\",\"enam\",\"wnam\",\"apac\",\"oc\"],\"repo\":\"Quran-Lab/tajweedformer-v4\",\"revision\":\"eaa15fcbb37f2b1a50da07ad4deae5bc7db51975\",\"sha256\":\"d2644f0cd94e10c44bffb8d127e99089b4ecd497b63011f12101002a6b404e54\",\"size\":2048},\"hf/Quran-Lab/tajweedformer-v4/eaa15fcbb37f2b1a50da07ad4deae5bc7db51975/sdk/v4.0/expected_tj3.bin\":{\"path\":\"sdk/v4.0/expected_tj3.bin\",\"regions\":[\"weur\",\"eeur\",\"enam\",\"wnam\",\"apac\",\"oc\"],\"repo\":\"Quran-Lab/tajweedformer-v4\",\"revision\":\"eaa15fcbb37f2b1a50da07ad4deae5bc7db51975\",\"sha256\":\"f7cde6417545a72b57f73b86ea186b07e77b046ad860d74b3886434674161fb8\",\"size\":4096},\"hf/Quran-Lab/tajweedformer-v4/eaa15fcbb37f2b1a50da07ad4deae5bc7db51975/sdk/v4.0/manifest.json\":{\"path\":\"sdk/v4.0/manifest.json\",\"regions\":[\"weur\",\"eeur\",\"enam\",\"wnam\",\"apac\",\"oc\"],\"repo\":\"Quran-Lab/tajweedformer-v4\",\"revision\":\"eaa15fcbb37f2b1a50da07ad4deae5bc7db51975\",\"sha256\":\"f2438e915b47a9c8d3faf0ee0963d13b73b41e2ada7bf2602ac2c2279dd6eee2\",\"size\":1541},\"hf/Quran-Lab/tajweedformer-v4/eaa15fcbb37f2b1a50da07ad4deae5bc7db51975/sdk/v4.0/npu/qnn/sm8650/c16_l64.bin\":{\"path\":\"sdk/v4.0/npu/qnn/sm8650/c16_l64.bin\",\"regions\":[\"weur\",\"eeur\",\"enam\",\"wnam\",\"apac\",\"oc\"],\"repo\":\"Quran-Lab/tajweedformer-v4\",\"revision\":\"eaa15fcbb37f2b1a50da07ad4deae5bc7db51975\",\"sha256\":\"f160e24f7bcca14a505f2b45fb2f1c46af8363354895d1adf6776d022613f131\",\"size\":1024},\"hf/Quran-Lab/tajweedformer-v4/eaa15fcbb37f2b1a50da07ad4deae5bc7db51975/sdk/v4.0/tokens.txt\":{\"path\":\"sdk/v4.0/tokens.txt\",\"regions\":[\"weur\",\"eeur\",\"enam\",\"wnam\",\"apac\",\"oc\"],\"repo\":\"Quran-Lab/tajweedformer-v4\",\"revision\":\"eaa15fcbb37f2b1a50da07ad4deae5bc7db51975\",\"sha256\":\"66fe6eb81b15506270f9e3c6efb0724cda757cd54326f26ca4bcd6be4f3b2aa4\",\"size\":224},\"hf/Quran-Lab/zipformer_p-arabic-v3/2f9c1ab0000000000000000000000000000000000/model.fp16.mlpackage.zip\":{\"path\":\"model.fp16.mlpackage.zip\",\"regions\":[\"weur\",\"eeur\",\"enam\",\"wnam\",\"apac\",\"oc\"],\"repo\":\"Quran-Lab/zipformer_p-arabic-v3\",\"revision\":\"2f9c1ab0000000000000000000000000000000000\",\"sha256\":\"aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44\",\"size\":90000000}},\"generated\":\"2026-11-07T13:25:29.576Z\",\"hosts\":{\"apac\":\"https://apac.cdn.quranlab.ai\",\"eeur\":\"https://eeur.cdn.quranlab.ai\",\"enam\":\"https://enam.cdn.quranlab.ai\",\"oc\":\"https://oc.cdn.quranlab.ai\",\"weur\":\"https://weur.cdn.quranlab.ai\",\"wnam\":\"https://wnam.cdn.quranlab.ai\"},\"releases\":{\"Quran-Lab/zipformer_p-arabic-v3\":\"2f9c1ab0000000000000000000000000000000000\"},\"version\":1}"
+      }
+    },
+    {
+      "name": "events v2 (android)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/events",
+        "headers": {
+          "authorization": "Bearer <app token>"
+        },
+        "body": {
+          "v": 2,
+          "day": "2026-11-07",
+          "product": "android",
+          "platform": "android",
+          "sdk_version": "2.0.0",
+          "app_version": "1.0",
+          "device": {
+            "class": "x86_64",
+            "soc": "x86_64",
+            "os_major": 14,
+            "ram_tier": "8_16"
+          },
+          "cohorts": [
+            {
+              "revision": "v4.0+e2e",
+              "context": "c16_l64",
+              "backend": "cpu",
+              "preset": "balanced",
+              "word_level": "general",
+              "word_bucket": "",
+              "site_overrides": 0,
+              "sessions": 3,
+              "minutes": 6.5,
+              "chunks": 1200,
+              "aborted": 0,
+              "fallbacks": {
+                "deadline": 1
+              },
+              "self_test": {
+                "pass": 1
+              },
+              "latency_ms": {
+                "le_10": 1100,
+                "le_20": 100
+              },
+              "rtf": {
+                "le_0_1": 1150,
+                "le_0_25": 50
+              },
+              "cold_start_ms": {
+                "le_1000": 1
+              },
+              "model_load_ms": {
+                "le_500": 1
+              },
+              "thermal": {
+                "transitions": 0,
+                "throttled_sessions": 0
+              },
+              "checks_on": {
+                "letters": 3,
+                "vowels": 3,
+                "length": 3,
+                "madd": 3
+              },
+              "classes": {
+                "vowel_sub": {
+                  "sites": 200,
+                  "flagged": 2
+                },
+                "cons_sub": {
+                  "sites": 180,
+                  "flagged": 1
+                }
+              },
+              "session_flag_pct": {
+                "le_1": 2,
+                "le_2": 1
+              },
+              "margin": {
+                "le_4": 100,
+                "gt_8": 900
+              },
+              "confidence": {
+                "gt_0_95": 1000
+              },
+              "madd": {
+                "c2": 20,
+                "c4": 6,
+                "c6": 1,
+                "flagged": 0
+              },
+              "words": {
+                "scored": 60,
+                "flagged": 2
+              }
+            }
+          ],
+          "coverage": {
+            "1": 7,
+            "112": 4
+          },
+          "downloads": [
+            {
+              "revision": "v4.0+e2e",
+              "profile": "android-cpu",
+              "bytes": 72000000,
+              "success": 1,
+              "failed": 0,
+              "resumed": 0
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 202,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"ok\":true,\"points\":9}"
+      }
+    },
+    {
+      "name": "events v2 (ios)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/events",
+        "headers": {
+          "authorization": "Bearer <app token>"
+        },
+        "body": {
+          "v": 2,
+          "day": "2026-11-07",
+          "product": "apple",
+          "platform": "ios",
+          "sdk_version": "2.0.0",
+          "app_version": "1.0",
+          "device": {
+            "class": "x86_64",
+            "soc": "x86_64",
+            "os_major": 14,
+            "ram_tier": "8_16"
+          },
+          "cohorts": [
+            {
+              "revision": "v4.0+e2e",
+              "context": "c16_l64",
+              "backend": "cpu",
+              "preset": "balanced",
+              "word_level": "general",
+              "word_bucket": "",
+              "site_overrides": 0,
+              "sessions": 3,
+              "minutes": 6.5,
+              "chunks": 1200,
+              "aborted": 0,
+              "fallbacks": {
+                "deadline": 1
+              },
+              "self_test": {
+                "pass": 1
+              },
+              "latency_ms": {
+                "le_10": 1100,
+                "le_20": 100
+              },
+              "rtf": {
+                "le_0_1": 1150,
+                "le_0_25": 50
+              },
+              "cold_start_ms": {
+                "le_1000": 1
+              },
+              "model_load_ms": {
+                "le_500": 1
+              },
+              "thermal": {
+                "transitions": 0,
+                "throttled_sessions": 0
+              },
+              "checks_on": {
+                "letters": 3,
+                "vowels": 3,
+                "length": 3,
+                "madd": 3
+              },
+              "classes": {
+                "vowel_sub": {
+                  "sites": 200,
+                  "flagged": 2
+                },
+                "cons_sub": {
+                  "sites": 180,
+                  "flagged": 1
+                }
+              },
+              "session_flag_pct": {
+                "le_1": 2,
+                "le_2": 1
+              },
+              "margin": {
+                "le_4": 100,
+                "gt_8": 900
+              },
+              "confidence": {
+                "gt_0_95": 1000
+              },
+              "madd": {
+                "c2": 20,
+                "c4": 6,
+                "c6": 1,
+                "flagged": 0
+              },
+              "words": {
+                "scored": 60,
+                "flagged": 2
+              }
+            }
+          ],
+          "coverage": {
+            "1": 7,
+            "112": 4
+          },
+          "downloads": [
+            {
+              "revision": "v4.0+e2e",
+              "profile": "apple-cpu",
+              "bytes": 72000000,
+              "success": 1,
+              "failed": 0,
+              "resumed": 0
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 202,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"ok\":true,\"points\":9}"
+      }
+    },
+    {
+      "name": "events v2 (web)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/events",
+        "headers": {
+          "authorization": "Bearer <app token>",
+          "origin": "https://client-e2e.example.org"
+        },
+        "body": {
+          "v": 2,
+          "day": "2026-11-07",
+          "product": "web",
+          "platform": "web",
+          "sdk_version": "2.0.0",
+          "app_version": "1.0",
+          "device": {
+            "class": "browser",
+            "soc": "wasm",
+            "os_major": 14,
+            "ram_tier": "8_16"
+          },
+          "cohorts": [
+            {
+              "revision": "v4.0+e2e",
+              "context": "c16_l64",
+              "backend": "cpu",
+              "preset": "balanced",
+              "word_level": "general",
+              "word_bucket": "",
+              "site_overrides": 0,
+              "sessions": 3,
+              "minutes": 6.5,
+              "chunks": 1200,
+              "aborted": 0,
+              "fallbacks": {
+                "deadline": 1
+              },
+              "self_test": {
+                "pass": 1
+              },
+              "latency_ms": {
+                "le_10": 1100,
+                "le_20": 100
+              },
+              "rtf": {
+                "le_0_1": 1150,
+                "le_0_25": 50
+              },
+              "cold_start_ms": {
+                "le_1000": 1
+              },
+              "model_load_ms": {
+                "le_500": 1
+              },
+              "thermal": {
+                "transitions": 0,
+                "throttled_sessions": 0
+              },
+              "checks_on": {
+                "letters": 3,
+                "vowels": 3,
+                "length": 3,
+                "madd": 3
+              },
+              "classes": {
+                "vowel_sub": {
+                  "sites": 200,
+                  "flagged": 2
+                },
+                "cons_sub": {
+                  "sites": 180,
+                  "flagged": 1
+                }
+              },
+              "session_flag_pct": {
+                "le_1": 2,
+                "le_2": 1
+              },
+              "margin": {
+                "le_4": 100,
+                "gt_8": 900
+              },
+              "confidence": {
+                "gt_0_95": 1000
+              },
+              "madd": {
+                "c2": 20,
+                "c4": 6,
+                "c6": 1,
+                "flagged": 0
+              },
+              "words": {
+                "scored": 60,
+                "flagged": 2
+              }
+            }
+          ],
+          "coverage": {
+            "1": 7,
+            "112": 4
+          },
+          "downloads": [
+            {
+              "revision": "v4.0+e2e",
+              "profile": "web-cpu",
+              "bytes": 72000000,
+              "success": 1,
+              "failed": 0,
+              "resumed": 0
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 202,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store",
+          "access-control-allow-origin": "https://client-e2e.example.org"
+        },
+        "body": "{\"ok\":true,\"points\":9}"
+      }
+    },
+    {
+      "name": "events v2 (linux)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/events",
+        "headers": {
+          "authorization": "Bearer <app token>"
+        },
+        "body": {
+          "v": 2,
+          "day": "2026-11-07",
+          "product": "native",
+          "platform": "linux",
+          "sdk_version": "2.0.0",
+          "app_version": "1.0",
+          "device": {
+            "class": "x86_64",
+            "soc": "x86_64",
+            "os_major": 14,
+            "ram_tier": "8_16"
+          },
+          "cohorts": [
+            {
+              "revision": "v4.0+e2e",
+              "context": "c16_l64",
+              "backend": "cpu",
+              "preset": "balanced",
+              "word_level": "general",
+              "word_bucket": "",
+              "site_overrides": 0,
+              "sessions": 3,
+              "minutes": 6.5,
+              "chunks": 1200,
+              "aborted": 0,
+              "fallbacks": {
+                "deadline": 1
+              },
+              "self_test": {
+                "pass": 1
+              },
+              "latency_ms": {
+                "le_10": 1100,
+                "le_20": 100
+              },
+              "rtf": {
+                "le_0_1": 1150,
+                "le_0_25": 50
+              },
+              "cold_start_ms": {
+                "le_1000": 1
+              },
+              "model_load_ms": {
+                "le_500": 1
+              },
+              "thermal": {
+                "transitions": 0,
+                "throttled_sessions": 0
+              },
+              "checks_on": {
+                "letters": 3,
+                "vowels": 3,
+                "length": 3,
+                "madd": 3
+              },
+              "classes": {
+                "vowel_sub": {
+                  "sites": 200,
+                  "flagged": 2
+                },
+                "cons_sub": {
+                  "sites": 180,
+                  "flagged": 1
+                }
+              },
+              "session_flag_pct": {
+                "le_1": 2,
+                "le_2": 1
+              },
+              "margin": {
+                "le_4": 100,
+                "gt_8": 900
+              },
+              "confidence": {
+                "gt_0_95": 1000
+              },
+              "madd": {
+                "c2": 20,
+                "c4": 6,
+                "c6": 1,
+                "flagged": 0
+              },
+              "words": {
+                "scored": 60,
+                "flagged": 2
+              }
+            }
+          ],
+          "coverage": {
+            "1": 7,
+            "112": 4
+          },
+          "downloads": [
+            {
+              "revision": "v4.0+e2e",
+              "profile": "native-cpu",
+              "bytes": 72000000,
+              "success": 1,
+              "failed": 0,
+              "resumed": 0
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 202,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"ok\":true,\"points\":9}"
+      }
+    },
+    {
+      "name": "events v2 (windows)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/events",
+        "headers": {
+          "authorization": "Bearer <app token>"
+        },
+        "body": {
+          "v": 2,
+          "day": "2026-11-07",
+          "product": "native",
+          "platform": "windows",
+          "sdk_version": "2.0.0",
+          "app_version": "1.0",
+          "device": {
+            "class": "x86_64",
+            "soc": "x86_64",
+            "os_major": 14,
+            "ram_tier": "8_16"
+          },
+          "cohorts": [
+            {
+              "revision": "v4.0+e2e",
+              "context": "c16_l64",
+              "backend": "cpu",
+              "preset": "balanced",
+              "word_level": "general",
+              "word_bucket": "",
+              "site_overrides": 0,
+              "sessions": 3,
+              "minutes": 6.5,
+              "chunks": 1200,
+              "aborted": 0,
+              "fallbacks": {
+                "deadline": 1
+              },
+              "self_test": {
+                "pass": 1
+              },
+              "latency_ms": {
+                "le_10": 1100,
+                "le_20": 100
+              },
+              "rtf": {
+                "le_0_1": 1150,
+                "le_0_25": 50
+              },
+              "cold_start_ms": {
+                "le_1000": 1
+              },
+              "model_load_ms": {
+                "le_500": 1
+              },
+              "thermal": {
+                "transitions": 0,
+                "throttled_sessions": 0
+              },
+              "checks_on": {
+                "letters": 3,
+                "vowels": 3,
+                "length": 3,
+                "madd": 3
+              },
+              "classes": {
+                "vowel_sub": {
+                  "sites": 200,
+                  "flagged": 2
+                },
+                "cons_sub": {
+                  "sites": 180,
+                  "flagged": 1
+                }
+              },
+              "session_flag_pct": {
+                "le_1": 2,
+                "le_2": 1
+              },
+              "margin": {
+                "le_4": 100,
+                "gt_8": 900
+              },
+              "confidence": {
+                "gt_0_95": 1000
+              },
+              "madd": {
+                "c2": 20,
+                "c4": 6,
+                "c6": 1,
+                "flagged": 0
+              },
+              "words": {
+                "scored": 60,
+                "flagged": 2
+              }
+            }
+          ],
+          "coverage": {
+            "1": 7,
+            "112": 4
+          },
+          "downloads": [
+            {
+              "revision": "v4.0+e2e",
+              "profile": "native-cpu",
+              "bytes": 72000000,
+              "success": 1,
+              "failed": 0,
+              "resumed": 0
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 202,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"ok\":true,\"points\":9}"
+      }
+    },
+    {
+      "name": "events v1 (1.x SDKs)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/events",
+        "headers": {
+          "authorization": "Bearer <app token>"
+        },
+        "body": {
+          "day": "2026-11-07",
+          "platform": "android",
+          "sdk_version": "1.0.0",
+          "app_version": "1",
+          "device_class": "Pixel8",
+          "os_major": 15,
+          "cohorts": [
+            {
+              "backend": "exact",
+              "revision": "v3.2",
+              "sessions": 1,
+              "minutes": 1,
+              "chunks": 1
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 202,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"ok\":true,\"points\":1}"
+      }
+    },
+    {
+      "name": "issue (android)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/issues",
+        "headers": {
+          "authorization": "Bearer <app token>"
+        },
+        "body": {
+          "day": "2026-11-07",
+          "platform": "android",
+          "sdk_version": "2.0.0",
+          "app_version": "1.0",
+          "os_version": "14",
+          "device_class": "x86_64",
+          "backend": "exact",
+          "revision": "v4.0+e2e",
+          "kind": "model_load",
+          "code": "client_e2e",
+          "frames": [
+            "ModelStore.kt:41"
+          ]
+        }
+      },
+      "response": {
+        "status": 202,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"ok\":true}"
+      }
+    },
+    {
+      "name": "issue (ios)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/issues",
+        "headers": {
+          "authorization": "Bearer <app token>"
+        },
+        "body": {
+          "day": "2026-11-07",
+          "platform": "ios",
+          "sdk_version": "2.0.0",
+          "app_version": "1.0",
+          "os_version": "14",
+          "device_class": "x86_64",
+          "backend": "exact",
+          "revision": "v4.0+e2e",
+          "kind": "model_load",
+          "code": "client_e2e",
+          "frames": [
+            "ModelStore.kt:41"
+          ]
+        }
+      },
+      "response": {
+        "status": 202,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"ok\":true}"
+      }
+    },
+    {
+      "name": "issue (web)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/issues",
+        "headers": {
+          "authorization": "Bearer <app token>",
+          "origin": "https://client-e2e.example.org"
+        },
+        "body": {
+          "day": "2026-11-07",
+          "platform": "web",
+          "sdk_version": "2.0.0",
+          "app_version": "1.0",
+          "os_version": "14",
+          "device_class": "x86_64",
+          "backend": "exact",
+          "revision": "v4.0+e2e",
+          "kind": "model_load",
+          "code": "client_e2e",
+          "frames": [
+            "ModelStore.kt:41"
+          ]
+        }
+      },
+      "response": {
+        "status": 202,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store",
+          "access-control-allow-origin": "https://client-e2e.example.org"
+        },
+        "body": "{\"ok\":true}"
+      }
+    },
+    {
+      "name": "issue (linux)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/issues",
+        "headers": {
+          "authorization": "Bearer <app token>"
+        },
+        "body": {
+          "day": "2026-11-07",
+          "platform": "linux",
+          "sdk_version": "2.0.0",
+          "app_version": "1.0",
+          "os_version": "14",
+          "device_class": "x86_64",
+          "backend": "exact",
+          "revision": "v4.0+e2e",
+          "kind": "model_load",
+          "code": "client_e2e",
+          "frames": [
+            "ModelStore.kt:41"
+          ]
+        }
+      },
+      "response": {
+        "status": 202,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"ok\":true}"
+      }
+    },
+    {
+      "name": "issue (windows)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/issues",
+        "headers": {
+          "authorization": "Bearer <app token>"
+        },
+        "body": {
+          "day": "2026-11-07",
+          "platform": "windows",
+          "sdk_version": "2.0.0",
+          "app_version": "1.0",
+          "os_version": "14",
+          "device_class": "x86_64",
+          "backend": "exact",
+          "revision": "v4.0+e2e",
+          "kind": "model_load",
+          "code": "client_e2e",
+          "frames": [
+            "ModelStore.kt:41"
+          ]
+        }
+      },
+      "response": {
+        "status": 202,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"ok\":true}"
+      }
+    },
+    {
+      "name": "upload start (android, attested)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/uploads",
+        "headers": {
+          "authorization": "Bearer <app token>",
+          "x-qlab-id": "f21f8978f0a6ff5bac42833465f295cc"
+        },
+        "body": {
+          "format": 1,
+          "audio": {
+            "codec": "opus",
+            "container": "ogg",
+            "sample_rate": 48000,
+            "channels": 1,
+            "input_sample_rate": 44100,
+            "input_route": "built_in"
+          },
+          "decode": {
+            "model_revision": "v4.0+e2e",
+            "backend": "exact",
+            "weights_sha256": null,
+            "sdk_version": "2.0.0"
+          },
+          "consent_version": "qlab-share-2026-11",
+          "contributor": "bebe6c8dec12c213f5cbffd20453dfb0",
+          "day": "2026-11-07",
+          "device_class": "x86_64",
+          "os_major": 14,
+          "contributor_key": "BLs1JD5zfPDZoglJdh6haSfLtJQWOYKxRuRu5rzM4sIwe_ZjMou0NHyTBm1MSww_2gsgo8ySRqhc1_vBQ-xdXik",
+          "recovery_hash": "ef100cc8ab2e89e10de70087b1cc288faa7cea63d4a64955b14e09b9616149b7"
+        }
+      },
+      "response": {
+        "status": 201,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"id\":\"f21f8978f0a6ff5bac42833465f295cc\",\"urls\":[{\"n\":1,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00001.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":2,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00002.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":3,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00003.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":4,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00004.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":5,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00005.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":6,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00006.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":7,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00007.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":8,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00008.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":9,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00009.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":10,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00010.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":11,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00011.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":12,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00012.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":13,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00013.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":14,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00014.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":15,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00015.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":16,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00016.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":17,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00017.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":18,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00018.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":19,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00019.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731},{\"n\":20,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00020.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132531Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662731}]}"
+      }
+    },
+    {
+      "name": "upload next batch",
+      "request": {
+        "method": "POST",
+        "path": "/v1/uploads/f21f8978f0a6ff5bac42833465f295cc/urls?from=21",
+        "headers": {
+          "authorization": "Bearer <app token>",
+          "x-qlab-contributor": "bebe6c8dec12c213f5cbffd20453dfb0"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"id\":\"f21f8978f0a6ff5bac42833465f295cc\",\"urls\":[{\"n\":21,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00021.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":22,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00022.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":23,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00023.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":24,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00024.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":25,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00025.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":26,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00026.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":27,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00027.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":28,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00028.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":29,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00029.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":30,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00030.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":31,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00031.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":32,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00032.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":33,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00033.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":34,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00034.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":35,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00035.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":36,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00036.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":37,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00037.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":38,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00038.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":39,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00039.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732},{\"n\":40,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/f21f8978f0a6ff5bac42833465f295cc/seg-00040.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132532Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662732}]}"
+      }
+    },
+    {
+      "name": "upload start (web, capped tier)",
+      "request": {
+        "method": "POST",
+        "path": "/v1/uploads",
+        "headers": {
+          "authorization": "Bearer <app token>",
+          "origin": "https://client-e2e.example.org",
+          "x-qlab-id": "e9ddc39af1edbaa880f0f7e031b3efaa"
+        },
+        "body": {
+          "format": 1,
+          "audio": {
+            "codec": "opus",
+            "container": "ogg",
+            "sample_rate": 48000,
+            "channels": 1,
+            "input_sample_rate": 44100,
+            "input_route": "built_in"
+          },
+          "decode": {
+            "model_revision": "v4.0+e2e",
+            "backend": "exact",
+            "weights_sha256": null,
+            "sdk_version": "2.0.0"
+          },
+          "consent_version": "qlab-share-2026-11",
+          "contributor": "eaec03197b02d14a803d5af5db937d57",
+          "day": "2026-11-07",
+          "device_class": "x86_64",
+          "os_major": 14,
+          "contributor_key": "BIgxOw0vLTQcDPyhfqwY-k8L4D5zeHdB1Ca_QX0gGkaRalqxi4sOR_U8iVQohdXzsZdAJhuTbfjanDfSmkwmHy4",
+          "recovery_hash": "c522826c791b95a7545eb3acacbcdded198f55e3e6fff09d77ff39b50ae4e414"
+        }
+      },
+      "response": {
+        "status": 201,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store",
+          "access-control-allow-origin": "https://client-e2e.example.org"
+        },
+        "body": "{\"id\":\"e9ddc39af1edbaa880f0f7e031b3efaa\",\"urls\":[{\"n\":1,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/e9ddc39af1edbaa880f0f7e031b3efaa/seg-00001.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132535Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662735},{\"n\":2,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/e9ddc39af1edbaa880f0f7e031b3efaa/seg-00002.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132535Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662735},{\"n\":3,\"url\":\"http://localhost:8797/_local_r2/s3/qlab-contributions/v1/e9ddc39af1edbaa880f0f7e031b3efaa/seg-00003.opus?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=local-parent-key%2F20261107%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261107T132535Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature=<sig>\",\"expires_at\":1794662735}]}"
+      }
+    },
+    {
+      "name": "contributions summary",
+      "request": {
+        "method": "GET",
+        "path": "/v1/contributions/summary",
+        "headers": {
+          "authorization": "Bearer <app token>",
+          "x-qlab-contributor": "bebe6c8dec12c213f5cbffd20453dfb0"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"you\":{\"sessions\":1,\"minutes\":1.2},\"app\":null,\"all\":{\"contributors\":6,\"minutes\":4.1}}"
+      }
+    },
+    {
+      "name": "deletion challenge",
+      "request": {
+        "method": "POST",
+        "path": "/v1/contributions/challenge",
+        "headers": {},
+        "body": {
+          "app": "android:org.example.clientmw6frljs",
+          "contributor": "bebe6c8dec12c213f5cbffd20453dfb0"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"nonce\":\"d1.1794058239.nd8kmQ21LQZ3kDknu79rtQ.TcYO-Quacdvgybz-CV_Huh\",\"expires_in\":300}"
+      }
+    },
+    {
+      "name": "deletion signed by the device key",
+      "request": {
+        "method": "POST",
+        "path": "/v1/contributions/delete",
+        "headers": {},
+        "body": {
+          "app": "android:org.example.clientmw6frljs",
+          "contributor": "bebe6c8dec12c213f5cbffd20453dfb0",
+          "nonce": "d1.1794058241.4_vWANIGz2ErxkbSLVvUbw.yXsYmZk3RyX_P1XRTUqa5R",
+          "timestamp": 1794057941,
+          "action": "delete-all",
+          "signature": "OlEGcRZInwcKYnA1wXpwUlS8pDa1mYFib-Tya6gE4bEWJJkLKrnOamGiI_L1Qg7NGXRr92T20Ug4kMDuvVjzeQ"
+        }
+      },
+      "response": {
+        "status": 202,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"ok\":true}"
+      }
+    },
+    {
+      "name": "recovery code",
+      "request": {
+        "method": "POST",
+        "path": "/v1/contributions/recover",
+        "headers": {},
+        "body": {
+          "code": "4rv7 xhrs eyg1 fhpy s6hy jmsd y8"
+        }
+      },
+      "response": {
+        "status": 202,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "body": "{\"ok\":true}"
+      }
+    }
+  ]
+}

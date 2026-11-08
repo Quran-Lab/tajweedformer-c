@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Engine submodule
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci-engine.sh vendor/zipformer-sdk
+      - name: Ninja (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ninja -y --no-progress
+      - name: Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y ninja-build
+      - name: Build
+        run: |
+          X=""; if [ "$RUNNER_OS" = Windows ]; then X="-DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++"; fi
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release $X
+          cmake --build build
+      - name: Kernels against the engine
+        run: ctest --test-dir build --output-on-failure

@@ -1,0 +1,68 @@
+# libopus 1.6.1 for recitation sharing (the whole-session Ogg Opus upload, PLATFORM_CLIENT.md section 10), as a
+# static library linked into tajweedformer. The same release and checksum as the Swift SDK's Opus.xcframework and
+# the web SDK's dist/tajweedformer-opus (tajweedformer-wasm scripts/build_opus.sh), the same build choices: float
+# (no FIXED_POINT), no DNN features (DEEP_PLC, DRED, OSCE off), no QEXT, plain C (no x86 SIMD paths, so every
+# platform encodes with the same code). The sources are compiled from the release's own source lists
+# (celt_sources.mk, silk_sources.mk, opus_sources.mk): no configure, CMake or other script from the tarball runs.
+#
+#   -DOPUS_TARBALL=<path>   a tarball already on disk (still checked); otherwise it is downloaded at configure time
+set(OPUS_VERSION 1.6.1)
+set(OPUS_SHA256 6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1)
+set(OPUS_URL "https://downloads.xiph.org/releases/opus/opus-${OPUS_VERSION}.tar.gz")
+set(OPUS_TARBALL "" CACHE FILEPATH "libopus ${OPUS_VERSION} tarball on disk (its SHA-256 is checked)")
+set(OPUS_ROOT "${CMAKE_BINARY_DIR}/_opus")
+set(OPUS_SRC "${OPUS_ROOT}/opus-${OPUS_VERSION}")
+
+if(NOT EXISTS "${OPUS_SRC}/include/opus.h")
+  if(OPUS_TARBALL)
+    set(_tar "${OPUS_TARBALL}")
+  else()
+    set(_tar "${OPUS_ROOT}/opus-${OPUS_VERSION}.tar.gz")
+    if(NOT EXISTS "${_tar}")
+      message(STATUS "libopus: downloading ${OPUS_URL}")
+      file(DOWNLOAD "${OPUS_URL}" "${_tar}" EXPECTED_HASH SHA256=${OPUS_SHA256} STATUS _st TLS_VERIFY ON)
+      list(GET _st 0 _code)
+      if(NOT _code EQUAL 0)
+        message(FATAL_ERROR "libopus download failed: ${_st}; pass -DOPUS_TARBALL=<path>")
+      endif()
+    endif()
+  endif()
+  file(SHA256 "${_tar}" _got)
+  if(NOT _got STREQUAL OPUS_SHA256)
+    message(FATAL_ERROR "libopus tarball ${_tar}: sha256 ${_got}, want ${OPUS_SHA256}")
+  endif()
+  file(ARCHIVE_EXTRACT INPUT "${_tar}" DESTINATION "${OPUS_ROOT}")
+endif()
+
+# a make variable's file list from one of the release's .mk files ("VAR = \" then one file a line)
+function(opus_mk_list out file var)
+  file(READ "${OPUS_SRC}/${file}" _t)
+  string(REPLACE "\r" "" _t "${_t}")
+  string(REPLACE "\\\n" " " _t "${_t}")
+  string(REGEX MATCH "(^|\n)${var} =[^\n]*" _line "${_t}")
+  string(REGEX REPLACE "^\n?${var} =" "" _line "${_line}")
+  separate_arguments(_files UNIX_COMMAND "${_line}")
+  set(_abs "")
+  foreach(f ${_files})
+    list(APPEND _abs "${OPUS_SRC}/${f}")
+  endforeach()
+  set(${out} ${_abs} PARENT_SCOPE)
+endfunction()
+opus_mk_list(_celt celt_sources.mk CELT_SOURCES)
+opus_mk_list(_silk silk_sources.mk SILK_SOURCES)
+opus_mk_list(_silk_float silk_sources.mk SILK_SOURCES_FLOAT)
+opus_mk_list(_opus opus_sources.mk OPUS_SOURCES)
+opus_mk_list(_opus_float opus_sources.mk OPUS_SOURCES_FLOAT)
+set(_all ${_celt} ${_silk} ${_silk_float} ${_opus} ${_opus_float})
+list(LENGTH _all _n)
+if(_n LESS 100)
+  message(FATAL_ERROR "libopus: only ${_n} sources found in the .mk lists")
+endif()
+
+add_library(tf_opus STATIC ${_all})
+target_include_directories(tf_opus PUBLIC "${OPUS_SRC}/include"
+  PRIVATE "${OPUS_SRC}/celt" "${OPUS_SRC}/silk" "${OPUS_SRC}/silk/float" "${OPUS_SRC}/src" "${OPUS_SRC}")
+target_compile_definitions(tf_opus PRIVATE OPUS_BUILD USE_ALLOCA HAVE_LRINT HAVE_LRINTF "PACKAGE_VERSION=\"${OPUS_VERSION}\"")
+target_compile_options(tf_opus PRIVATE -O2 -w)
+set_target_properties(tf_opus PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
+message(STATUS "libopus ${OPUS_VERSION} (sha256 ${OPUS_SHA256}): ${_n} sources, float, plain C")

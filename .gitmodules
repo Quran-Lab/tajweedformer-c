@@ -1,0 +1,3 @@
+[submodule "vendor/zipformer-sdk"]
+	path = vendor/zipformer-sdk
+	url = https://github.com/Quran-Lab/tajweedformer-engine.git
