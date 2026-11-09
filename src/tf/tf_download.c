@@ -21,7 +21,7 @@ TfDownloadOptions tf_download_default_options(void) {
   TfDownloadOptions o;
   memset(&o, 0, sizeof o);
   o.struct_size = sizeof o;
-  o.cdn_url = "https://cdn.quranlab.ai";
+  o.cdn_url = "https://cdn.quranlab.ai/models";
   o.repo = "Quran-Lab/tajweedformer-v4";
   o.folder = "sdk/v4.0";
   return o;
@@ -86,9 +86,27 @@ static int file_ok(const char *full, long long size, const char *sha_hex) {
   return !tf_hex_decode(sha_hex, want, 32) && !tf_sha256_file(full, got, &n) && n == size && !memcmp(got, want, 32);
 }
 
+/* {base}/{repo}/{revision}/{folder}/{rel}: Quran Lab's model hosting (base https://cdn.quranlab.ai/models). A bare cdn.quranlab.ai
+ * base, or a regional {region}.cdn.quranlab.ai, keeps the old shape {cdn}/hf/{repo}/..., served for every revision.
+ * Returns 0, or -1 when the URL does not fit in n bytes. */
+int tf__model_url(char *out, size_t n, const char *base, const char *repo, const char *revision, const char *folder, const char *rel) {
+  static const char *const legacy[] = {"cdn", "weur.cdn", "eeur.cdn", "enam.cdn", "wnam.cdn", "apac.cdn", "oc.cdn"};
+  size_t bl = strlen(base);
+  while (bl && base[bl - 1] == '/') bl--;
+  const char *hf = "";
+  for (size_t i = 0; i < sizeof legacy / sizeof legacy[0]; ++i) {
+    char want[64];
+    snprintf(want, sizeof want, "https://%s.quranlab.ai", legacy[i]);
+    if (bl == strlen(want) && !strncmp(base, want, bl)) hf = "/hf";
+  }
+  const int w = snprintf(out, n, "%.*s%s/%s/%s/%s/%s", (int)bl, base, hf, repo, revision, folder, rel);
+  return w < 0 || (size_t)w >= n ? -1 : 0;
+}
+
 static int get(const TfDownloadOptions *o, const char *rel, const char *to_file, long long from, TfHttpResponse *r) {
   char url[4096], key[512];
-  snprintf(url, sizeof url, "%s/hf/%s/%s/%s/%s", o->cdn_url, o->repo, o->revision, o->folder, rel);
+  if (tf__model_url(url, sizeof url, o->cdn_url ? o->cdn_url : "https://cdn.quranlab.ai/models", o->repo, o->revision, o->folder, rel))
+    return tf__fail(TF_ERR_ARGUMENT, "download: the model URL is too long");
   snprintf(key, sizeof key, "x-qlab-key: %s", o->key ? o->key : "");
   const char *hdr[] = {key, NULL};
   TfHttpRequest q;

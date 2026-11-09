@@ -319,7 +319,8 @@ typedef void (*TfProgressCallback)(void *user, const char *path, long long done,
 
 typedef struct {
   size_t struct_size;
-  const char *cdn_url;        /* default https://cdn.quranlab.ai */
+  const char *cdn_url;        /* the model base: default https://cdn.quranlab.ai/models ({base}/{repo}/{revision}/{folder}/...);
+                                 https://cdn.quranlab.ai still works (its /hf/ path), and the signed config's base fits here */
   const char *key;            /* developer key (qlk_v1_...) */
   const char *repo;           /* "Quran-Lab/tajweedformer-v4" */
   const char *revision;       /* commit, from the signed config's models entry */

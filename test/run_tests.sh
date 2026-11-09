@@ -6,7 +6,7 @@
 # <data dir> is the v4-test-c16 release asset unpacked: v4/ (calibration, tokens, expected table, c16_l64/ engine
 # files; c24_l72/ and c24_l256/ too when present), audio/*.pcm (the 35 conformance clips), fixture/ (the reference's scorer
 # fixture), layers_vectors.json, config_vectors.json, calibration_fixture.json, and optionally
-# v4_<ctx>_audio_native_x86.jsonl for the chunk-24 contexts. Exits nonzero on any failure.
+# v4_<ctx>_audio_native_x86.jsonl for the contexts other than c16_l64 (c8_l64, c24_l72, c24_l256). Exits nonzero on any failure.
 set -uo pipefail
 B=$1 D=$2 CTXS=${3:-c16_l64}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -23,7 +23,7 @@ run "crypto (SHA-2, Ed25519 RFC 8032, base64, JSON)" "$T" crypto
 
 # model folders with manifests: the V4 folder signed with the test key; the scorer and settings fixtures unsigned
 args=()
-for c in c16_l64 c24_l72 c24_l256; do
+for c in c16_l64 c8_l64 c24_l72 c24_l256; do
   [ -d "$D/v4/$c" ] || continue
   for f in model_engine2.onnx model_engine2.onnx.zfg model_engine2.onnx.zfg.bin frontend.zfw layers.zfw; do args+=("$D/v4/$c/$f=$c/$f"); done
 done
@@ -56,10 +56,10 @@ done
 # layout 3 (DELIVERY: one shared layers.zfw, a frames.zfw overlay per context, manifest format 3), made from the
 # per-context folders with the engine's own tools/zfshare.py
 if [ -f "$ENG/tools/zfshare.py" ]; then
-  cargs=(); for c in c16_l64 c24_l72 c24_l256; do [ -d "$D/v4/$c" ] && cargs+=(--context "$c=$D/v4/$c"); done
+  cargs=(); for c in c16_l64 c8_l64 c24_l72 c24_l256; do [ -d "$D/v4/$c" ] && cargs+=(--context "$c=$D/v4/$c"); done
   (cd "$ENG" && "$PY" -m tools.zfshare "${cargs[@]}" --out "$W/l3src" --no-onnx >/dev/null)
   l3=("$W/l3src/layers.zfw=layers.zfw" "$W/l3src/frontend.zfw=frontend.zfw")
-  for c in c16_l64 c24_l72 c24_l256; do
+  for c in c16_l64 c8_l64 c24_l72 c24_l256; do
     [ -d "$W/l3src/$c" ] || continue
     for f in model_engine2.onnx.zfg model_engine2.onnx.zfg.bin frames.zfw; do l3+=("$W/l3src/$c/$f=$c/$f"); done
   done

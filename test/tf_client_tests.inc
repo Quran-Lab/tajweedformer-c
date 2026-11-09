@@ -370,10 +370,13 @@ static int sharing_tests(const char *vdir, const char *fx_path, const char *dir)
 /* the downloader against a local "CDN" folder (a layout-3 folder published with gzip files): the native profile,
  * Range resume after an interrupted transfer, gzip decoding, every hash; then the downloaded folder opens */
 static char g_cdn[1024];
-static int g_cut_once, g_requests, g_ranged;
+static int g_cut_once, g_requests, g_ranged, g_bad_url;
 static int serve_cdn(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
   (void)u;
   g_requests++;
+  /* the default base: cdn.quranlab.ai/models, no /hf/ */
+  static const char want[] = "https://cdn.quranlab.ai/models/Quran-Lab/tajweedformer-v4/test/sdk/v4.0/";
+  if (strncmp(q->url, want, sizeof want - 1)) g_bad_url++;
   const char *rel = strstr(q->url, "/sdk/v4.0/");
   if (!rel) return tf__fail(TF_ERR_NETWORK, "unexpected URL");
   rel += 10;
@@ -423,6 +426,20 @@ static int download_tests(const char *cdn, const char *dest, const char *key) {
   const int second = tf_download_model(&d);
   CHECK(second == 0, "the resumed download: %s", tf_last_error() ? tf_last_error() : "");
   CHECK(g_ranged >= 1, "no Range request after the interruption");
+  CHECK(g_bad_url == 0, "a download URL is not under https://cdn.quranlab.ai/models/Quran-Lab/tajweedformer-v4/test/sdk/v4.0/");
+  {
+    /* the base: the /models shape; a bare cdn.quranlab.ai (or regional) base keeps its /hf/ path */
+    static const char *const cases[][2] = {
+      {"https://cdn.quranlab.ai/models/", "https://cdn.quranlab.ai/models/Quran-Lab/m/r/sdk/v4.0/a"},
+      {"https://cdn.quranlab.ai", "https://cdn.quranlab.ai/hf/Quran-Lab/m/r/sdk/v4.0/a"},
+      {"https://oc.cdn.quranlab.ai", "https://oc.cdn.quranlab.ai/hf/Quran-Lab/m/r/sdk/v4.0/a"},
+      {"https://mirror.test/x", "https://mirror.test/x/Quran-Lab/m/r/sdk/v4.0/a"},
+    };
+    char u[256];
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
+      CHECK(!tf__model_url(u, sizeof u, cases[i][0], "Quran-Lab/m", "r", "sdk/v4.0", "a") && !strcmp(u, cases[i][1]), "model URL for %s: %s", cases[i][0], u);
+    }
+  }
   char *c24 = tf_path_join(dest, "c24_l72/frames.zfw"), *gzleft = tf_path_join(dest, "layers.zfw.gz");
   CHECK(!tf_file_exists(c24), "a context that was not asked for was downloaded");
   CHECK(!tf_file_exists(gzleft), "the stored gz file was kept");

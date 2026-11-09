@@ -209,7 +209,7 @@ upload; `off` or `attested` = nothing is uploaded (`tf_client_sharing_status_jso
 ## Downloads (the native profile)
 
 ```c
-TfDownloadOptions d = tf_download_default_options();   /* cdn.quranlab.ai, Quran-Lab/tajweedformer-v4, sdk/v4.0 */
+TfDownloadOptions d = tf_download_default_options();   /* cdn.quranlab.ai/models, Quran-Lab/tajweedformer-v4, sdk/v4.0 */
 d.key = "qlk_v1_..."; d.revision = "<commit from the config>"; d.dest = "models/sdk/v4.0";
 tf_download_model(&d);    /* signed manifest, then every CPU file, resumed with Range, SHA-256 checked */
 ```

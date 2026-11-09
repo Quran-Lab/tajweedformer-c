@@ -9,6 +9,8 @@
 
 /* ---- errors (thread-local) ---- */
 int tf__fail(int code, const char *fmt, ...);
+/* a model file's URL under a download base (tf_download.c) */
+int tf__model_url(char *out, size_t n, const char *base, const char *repo, const char *revision, const char *folder, const char *rel);
 void tf__clear_error(void);
 
 /* ---- growable text buffer ---- */
