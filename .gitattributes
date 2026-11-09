@@ -1,0 +1,5 @@
+# Test data and expected outputs are compared byte for byte (their hashes are checked), so a Windows
+# checkout must not convert their line endings.
+test/data/** -text
+# Shell scripts run under bash on every platform.
+*.sh text eol=lf

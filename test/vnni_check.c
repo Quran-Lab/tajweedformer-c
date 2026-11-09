@@ -70,6 +70,10 @@ int main(void) {
   printf("cpu int8 tier: %s\n", zf_int8_tier_name(best));
   if (best < ZF_INT8_AVX512VNNI) printf("SKIP: avx512vnni (this CPU or OS does not have it; not tested here)\n");
   for (int tier = best; tier >= ZF_INT8_SCALAR; --tier) {
+    if (!zf_int8_tier_available(tier)) {
+      printf("SKIP: %s (this CPU or OS does not have it; not tested here)\n", zf_int8_tier_name(tier));
+      continue;
+    }
     zf_int8_set_tier(tier);
     int f = 0, cases = 0;
     for (size_t i=0;i<sizeof ms/sizeof*ms;++i) for (size_t j=0;j<sizeof ns/sizeof*ns;++j) for (size_t l=0;l<sizeof ks/sizeof*ks;++l) {

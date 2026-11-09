@@ -37,11 +37,14 @@ int zf_vnni_available(void);
 int zf_int8_cpu_tier(void);
 
 /* The tier in use: the CPU's best, lowered by the environment variable ZF_NATIVE_INT8 (scalar,
- * avx2, avxvnni, avx512vnni; a tier the CPU lacks falls back to the best it has) or by
+ * avx2, avxvnni, avx512vnni; a tier the CPU lacks falls back to the widest one below it that it has) or by
  * zf_int8_set_tier. Every tier gives the same integers; this exists to test them against each other. */
 int zf_int8_tier(void);
-/* Ask for a tier (clamped to the CPU's best); returns the tier now in use. Not thread safe: call it
- * before any kernel runs. */
+/* Whether this CPU and OS can run a tier. The tiers are not nested: Ice Lake and Zen 4 have AVX-512 VNNI but
+ * not AVX-VNNI, so a tier below zf_int8_cpu_tier() can be missing. */
+int zf_int8_tier_available(int tier);
+/* Ask for a tier (lowered to the widest available one not above it); returns the tier now in use. Not
+ * thread safe: call it before any kernel runs. */
 int zf_int8_set_tier(int tier);
 /* The tier the engine's hook uses, or -1 when ZF_NATIVE_INT8=off (the hook declines and the
  * engine's own kernel runs). */

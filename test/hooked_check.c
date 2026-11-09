@@ -59,6 +59,10 @@ int main(void) {
   const int ms[] = {1,3,4,6,12,24,32,48,100,300}, ns[] = {4,16,38,192,251,512}, ks[] = {9,16,80,192,512}, zps[] = {0,1,128,255};
   int fails = 0;
   for (int tier = best; tier >= ZF_INT8_SCALAR; --tier) {
+    if (!zf_int8_tier_available(tier)) {
+      printf("SKIP: %s (this CPU or OS does not have it; not tested here)\n", zf_int8_tier_name(tier));
+      continue;
+    }
     zf_int8_set_tier(tier);
     const long long before = zf_int8_hook_calls(tier);
     int f = 0, cases = 0;

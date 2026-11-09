@@ -75,6 +75,10 @@ int main(void) {
   int fails = 0;
   const int best = zf_int8_cpu_tier();
   for (int tier = best; tier >= ZF_INT8_SCALAR; --tier) {
+    if (!zf_int8_tier_available(tier)) {
+      printf("SKIP: %s (this CPU or OS does not have it; not tested here)\n", zf_int8_tier_name(tier));
+      continue;
+    }
     zf_int8_set_tier(tier);
     int f = 0, cases = 0;
     for (size_t i=0;i<sizeof ms/sizeof*ms;++i) for (size_t j=0;j<sizeof ns/sizeof*ns;++j) for (size_t l=0;l<sizeof ks/sizeof*ks;++l) {

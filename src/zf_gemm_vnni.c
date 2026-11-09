@@ -99,17 +99,28 @@ static void read_bits(CpuBits *c) {
 #endif
 }
 
-static int tier_of(const CpuBits *c) {
+/* Whether this CPU and OS can run a tier. The tiers are not nested: Ice Lake and Zen 4 have AVX-512 VNNI but
+ * not AVX-VNNI, so a tier below the best one may still be missing. */
+static int tier_ok(const CpuBits *c, int tier) {
+  if (tier == ZF_INT8_SCALAR) return 1;
   const int osxsave = (c->l1_ecx >> 27) & 1;
-  if (!osxsave || !c->read_xcr0 || !c->read_l7) return ZF_INT8_SCALAR;
+  if (!osxsave || !c->read_xcr0 || !c->read_l7) return 0;
   const int ymm = (c->xcr0 & 0x6) == 0x6, zmm = (c->xcr0 & 0xE6) == 0xE6;
   const int avx2 = (c->l7_ebx >> 5) & 1;
   const int f = (c->l7_ebx >> 16) & 1, bw = (c->l7_ebx >> 30) & 1, vl = (c->l7_ebx >> 31) & 1, vnni = (c->l7_ecx >> 11) & 1;
   const int avxvnni = c->read_l7s1 && ((c->l7s1_eax >> 4) & 1);
-  if (f && bw && vl && vnni && zmm) return ZF_INT8_AVX512VNNI;
-  if (avxvnni && avx2 && ymm) return ZF_INT8_AVXVNNI;
-  if (avx2 && ymm) return ZF_INT8_AVX2;
-  return ZF_INT8_SCALAR;
+  switch (tier) {
+    case ZF_INT8_AVX512VNNI: return f && bw && vl && vnni && zmm;
+    case ZF_INT8_AVXVNNI: return avxvnni && avx2 && ymm;
+    case ZF_INT8_AVX2: return avx2 && ymm;
+    default: return 0;
+  }
+}
+
+static int tier_of(const CpuBits *c) {
+  int t = ZF_INT8_AVX512VNNI;
+  while (t > ZF_INT8_SCALAR && !tier_ok(c, t)) --t;
+  return t;
 }
 
 static int detect_tier(void) {
@@ -149,10 +160,23 @@ const char *zf_int8_tier_name(int tier) {
   return tier >= 0 && tier <= ZF_INT8_AVX512VNNI ? k_names[tier] : "off";
 }
 
+int zf_int8_tier_available(int tier) {
+  if (tier < ZF_INT8_SCALAR || tier > ZF_INT8_AVX512VNNI) return 0;
+  CpuBits c;
+  read_bits(&c);
+  return tier_ok(&c, tier);
+}
+
+/* The tier to run for a request: the widest available one not above it (-1, "off", stays). */
+static int usable_tier(int tier) {
+  while (tier > ZF_INT8_SCALAR && !zf_int8_tier_available(tier)) --tier;
+  return tier;
+}
+
 int zf_int8_set_tier(int tier) {
-  const int best = zf_int8_cpu_tier();
-  if (tier > best) tier = best;
+  if (tier > ZF_INT8_AVX512VNNI) tier = ZF_INT8_AVX512VNNI;
   if (tier < -1) tier = -1;
+  tier = usable_tier(tier);
   __atomic_store_n(&g_tier, tier, __ATOMIC_RELEASE);
   return tier;
 }
@@ -165,7 +189,7 @@ static int tier_from_env(void) {
   if (!e || !*e) return best;
   if (!strcmp(e, "off") || !strcmp(e, "engine")) return -1;
   for (int t = 0; t <= ZF_INT8_AVX512VNNI; ++t)
-    if (!strcmp(e, k_names[t])) return t > best ? best : t;
+    if (!strcmp(e, k_names[t])) return usable_tier(t);
   return best;
 }
 static int tier_or_off(void) {
