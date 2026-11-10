@@ -41,10 +41,17 @@ jobs:
         run: |
           PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
           $PY test/quickstart_check.py
-      - name: The README's compile line (Linux), and the program starts
-        if: runner.os == 'Linux'
+      - name: The README's install (its CMakeLists with this repository as a subproject), and the program starts
         run: |
-          cc examples/quickstart.c -I include -I vendor/zipformer-sdk/tajweed/include -L build -ltajweedformer -o quickstart_readme
-          code=0; LD_LIBRARY_PATH=build ./quickstart_readme || code=$?
+          # the README's first CMake block is the app's CMakeLists; FetchContent takes this checkout instead of the tag
+          mkdir -p "$RUNNER_TEMP/app"
+          awk '/^```cmake/{f=1;next} /^```/{if(f)exit} f' README.md > "$RUNNER_TEMP/app/CMakeLists.txt"
+          grep -q 'FetchContent_Declare(tajweedformer' "$RUNNER_TEMP/app/CMakeLists.txt"
+          cp examples/quickstart.c "$RUNNER_TEMP/app/quickstart.c"
+          X=""; if [ "$RUNNER_OS" = Windows ]; then X="-DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++"; fi
+          cmake -S "$RUNNER_TEMP/app" -B "$RUNNER_TEMP/app/build" -G Ninja -DCMAKE_BUILD_TYPE=Release $X \
+            -DFETCHCONTENT_SOURCE_DIR_TAJWEEDFORMER="$GITHUB_WORKSPACE"
+          cmake --build "$RUNNER_TEMP/app/build"
+          code=0; "$RUNNER_TEMP/app/build/quickstart" || code=$?
           # without a key it prints its usage and exits 2: it linked, and the library loaded
-          [ "$code" -eq 2 ] || { echo "::error::quickstart_readme exited $code, 2 expected"; exit 1; }
+          [ "$code" -eq 2 ] || { echo "::error::the quick start exited $code, 2 expected"; exit 1; }

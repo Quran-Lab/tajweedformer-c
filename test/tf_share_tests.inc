@@ -157,6 +157,13 @@ static struct {
   int starts, url_calls, puts, put_403, put_failed;
   int url_from[64];
   int bad_put_headers, bad_session_body;
+  /* 2.0.3: POST /v1/uploads/{id}/takes. The k-th call answers takes_status[k] (0: 204; -401: 401 with an error
+   * code other than invalid_token); while takes_net_down > 0 a call finds no connection. */
+  int takes_calls, takes_status[16], takes_net_down, bad_takes, attests;
+  char *takes_body[16];
+  char takes_id[16][33], takes_contributor[16][33];
+  int takes_after_puts[16]; /* segment PUTs answered 200 before the call */
+  char start_contributor[33]; /* the contributor of the last session JSON */
 } g_st;
 static StubSession *stub_session(const char *id) {
   for (int i = 0; i < g_st.n_s; ++i)
@@ -235,12 +242,39 @@ static int stub(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
       }
     }
   } else if (!strcmp(path, "/v1/attest")) {
+    g_st.attests++;
     reply(r, 200, "{\"token\":\"qlt_v1.test.sig\",\"expires_in\":86400,\"attested\":false}");
+  } else if (!strncmp(path, "/v1/uploads/", 12) && strlen(path) == 50 && !strcmp(path + 44, "/takes")) {
+    /* 2.0.3, the take list of an uploaded recording */
+    const int k = g_st.takes_calls++;
+    const char *ctr = hdr_value(q, "x-qlab-contributor"), *ct = hdr_value(q, "content-type");
+    if (strcmp(q->method, "POST") || !hdr_value(q, "authorization") || !ctr || !ct || strcmp(ct, "application/json")) g_st.bad_takes++;
+    if (k < 16) {
+      snprintf(g_st.takes_id[k], 33, "%.32s", path + 12);
+      snprintf(g_st.takes_contributor[k], 33, "%s", ctr ? ctr : "");
+      g_st.takes_body[k] = (char *)malloc(q->body_n + 1);
+      memcpy(g_st.takes_body[k], q->body, q->body_n);
+      g_st.takes_body[k][q->body_n] = 0;
+      g_st.takes_after_puts[k] = g_st.puts;
+    }
+    const int st = k < 16 ? g_st.takes_status[k] : 0;
+    if (g_st.takes_net_down > 0) {
+      g_st.takes_net_down--;
+      rc = tf__fail(TF_ERR_NETWORK, "the network is down (test)");
+    } else if (!st) {
+      reply(r, 204, "");
+    } else {
+      reply(r, st < 0 ? -st : st,
+            st == 404 ? "{\"error\":\"not_found\"}" : st == 410 ? "{\"error\":\"upload_deleted\"}" : st == 401 ? "{\"error\":\"invalid_token\"}"
+            : st == -401 ? "{\"error\":\"token_expired\"}" : st == 400 ? "{\"error\":\"invalid_body\"}" : "{\"error\":\"unavailable\"}");
+    }
   } else if (!strcmp(path, "/v1/uploads")) {
     g_st.starts++;
     const char *id = hdr_value(q, "x-qlab-id");
     TfJson *j = tf_json_parse((const char *)q->body, q->body_n, NULL);
     const char *ck = tf_json_str(tf_json_get(j, "contributor_key")), *rh = tf_json_str(tf_json_get(j, "recovery_hash"));
+    const char *sc = tf_json_str(tf_json_get(j, "contributor"));
+    snprintf(g_st.start_contributor, sizeof g_st.start_contributor, "%s", sc ? sc : "");
     const TfJson *audio = tf_json_get(j, "audio");
     if (!ck || strlen(ck) != 87 || !rh || strlen(rh) != 64 || !tf_json_get(j, "format") || !audio ||
         tf_json_get(audio, "sample_rate")->num != 48000 || !hdr_value(q, "authorization") || !id || strlen(id) != 32)
@@ -282,6 +316,7 @@ static int stub(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
 static void stub_reset(void) {
   for (int i = 0; i < g_st.n_s; ++i)
     for (int k = 0; k < 400; ++k) free(g_st.s[i].seg[k]);
+  for (int k = 0; k < 16; ++k) free(g_st.takes_body[k]);
   TfMutex m = g_st.m;
   memset(&g_st, 0, sizeof g_st);
   g_st.m = m;
@@ -306,7 +341,9 @@ static int joined_ok(const StubSession *s, int want_eos, int *segments) {
 }
 
 static TfClient *share_client(const char *dir) {
-  seed_config(dir, "{\"contributions\":true}"); /* 2.0.1: offered only where the signed config says so */
+  /* 2.0.1: offered only where the signed config says so. 2.0.3: a join window of 0, so a take's recording closes
+   * when the take ends, as these tests (written for 2.0.2) expect; joined takes are in tf_203_tests.inc */
+  seed_config(dir, "{\"contributions\":true,\"share_join_ms\":0}");
   TfClientOptions o = tf_client_default_options();
   o.key = "qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa";
   o.app_id = "org.example.ShareTest";

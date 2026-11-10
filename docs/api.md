@@ -1,4 +1,4 @@
-# The C API: `tajweedformer.h` (SDK 2.0.2)
+# The C API: `tajweedformer.h` (SDK 2.0.3)
 
 One library for Windows and Linux apps and for servers: `tajweedformer.dll` / `libtajweedformer.so` (or the static
 library), with `include/tajweedformer.h` and the engine's `zf_tajweed.h`. It runs the V4 TajweedFormer model only
@@ -20,7 +20,7 @@ puts(tf_model_info_json(m));    /* model id, revision, contexts, chunk length, t
 
 `tf_model_open` refuses anything that is not a verified V4 folder: manifest format 3 (layout 3: one shared
 `layers.zfw` and `frontend.zfw`, a `frames.zfw` per context; engine format 3) or format 2 (a folder per context;
-engine format 2), family `tajweedformer`, `min_sdk_version` at most 2.0.2, an Ed25519 signature by Quran Lab's key (key id
+engine format 2), family `tajweedformer`, `min_sdk_version` at most 2.0.3, an Ed25519 signature by Quran Lab's key (key id
 `660a07197c4808da`), and every file it reads matching its size and SHA-256. A file the manifest does not list is
 never opened. Errors: `signature_invalid`, `signature_required`, `checksum_mismatch`, `not_listed`,
 `sdk_too_old`, `unsupported_model`, `calibration_invalid`.
@@ -284,6 +284,46 @@ aborts the PUT in flight and deletes the queue at once. Errors follow the platfo
 / `contributor_key_mismatch` make a new contributor, key and recovery code; `segment_cap` ends the session's
 upload; `volume_limit` / `capped_limit` wait until the next UTC day; 5xx, 429 and network errors back off.
 `tf_sharing_outbox_pending` counts what is queued; `tf_sharing_outbox_json` lists it.
+
+Takes in a row are one recording (2.0.3). An app often stops and starts its takes while the learner keeps reciting,
+so a session here is one take and the shared recording (one Ogg stream, one upload) outlives it. When a take ends
+(`tf_sharing_session_finish`, or `tf_stream_finish` / `tf_stream_reset` of a stream with a client) the recording
+stays open for the join window: the signed config's `flags.share_join_ms`, a whole number 0 to 10000 ms (absent
+or anything else: 3000, `TF_SHARING_JOIN_MS_DEFAULT`; 0 never joins). A take that begins within the window
+(`tf_sharing_session_begin`, or the stream's next first push) with the same input sample rate continues the same
+stream: no new headers, the encoder and the resampler keep their state, segments and the bitrate ladder run on, and
+the time between the takes gets no audio. Otherwise the recording closes as before (its last page with EOS) and
+the take starts a new one. The recording also closes at once:
+
+- when the window ends (a timer thread of the client; the wall clock decides);
+- at `tf_client_background(c)`, and at `tf_sharing_recording_close(c)` when the app knows that no take follows
+  (with a take running: when that take ends); `tf_client_destroy` closes a recording that still waits;
+- when sharing goes off: `tf_client_sharing_set(c, 0)` and `tf_client_sharing_delete` delete it with the queue,
+  also between two takes;
+- at 20 minutes of audio (`TF_SHARING_RECORDING_MAX_S`) and at 256 takes: the next take starts a new recording. A
+  take is never cut: one that joined with more than 30 s of room and runs past 20 minutes stays whole; with 30 s
+  of room or less its audio is held in memory until it ends, and joins only if it fits;
+- when the next take has another input sample rate, contributor, consent version or model revision (the input
+  route may differ: the session JSON is written once, at the first take, and keeps the first take's).
+
+The recording is completed when its last take with audio was; a cancelled take (`completed` 0) is kept when the
+recording holds 2 s or more in all. `tf_sharing_session_finish` returns the take's milliseconds that went into a
+recording (0: nothing was recorded, or the recording was dropped). A take begun while another take of the same
+client is running records on its own, as before 2.0.3.
+
+The take list (2.0.3). A recording of two or more takes keeps where each take starts in the stream and the pause
+before it: `{"takes":[{"start_ms":0,"gap_ms":0},{"start_ms":5000,"gap_ms":1200}]}`. `start_ms` is the recording's
+input samples before the take, in ms, rounded down; `gap_ms` is the wall time since the previous take with audio
+ended, rounded to the nearest 100, at most 10000; a take without audio has no entry. The list is kept in the
+session's folder as `takes.json` (replaced atomically as a take joins, so a crash keeps it; a session recovered
+after a crash keeps the takes that begin before its last whole page) and sent once the recording is closed and all
+its segments are uploaded: `POST /v1/uploads/{id}/takes` with the token and `x-qlab-contributor`. The session
+counts as uploaded when its segments are; the list follows and never changes that: 2xx done; 404 (a server
+without the route) drops the list, with one line in the client's log per client (debug builds); 400 drops it and
+queues the issue `bad_request:takes`; 410 drops it; 401 asks for a new token and sends it again; 429, 5xx and
+network errors send the same body again with the outbox's backoff, also after a restart, for at most 7 days. A
+recording of one take sends nothing. `tf_sharing_outbox_json` lists `takes` (how many takes the recording holds
+so far); `tf_sharing_outbox_pending` does not count a session whose segments are all uploaded.
 
 Bitrate on bad networks (2.0.1): Opus starts at 192 kbit/s and follows a ladder of 192, 96, 64 and 32 kbit/s, one per
 client, in memory. An upload's network failure (no connection, a timeout, HTTP 408 or 5xx on `POST /v1/uploads`,

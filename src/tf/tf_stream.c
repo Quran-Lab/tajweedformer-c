@@ -167,7 +167,9 @@ TfStream *tf_stream_create(TfModel *m, const TfStreamOptions *opt) {
   return s;
 }
 
-/* the shared copy of the take: begun at its first push (when sharing is on), finished with the take */
+/* the shared copy of the take: begun at its first push (when sharing is on), finished with the take. Since 2.0.3
+ * a take that begins within the join window of the previous take's end continues the client's open recording
+ * (tf_share.c): the stream only says where its takes begin and end. */
 static void share_push(TfStream *s, const float *x, int n) {
   if (!s->client || n <= 0) return;
   if (!s->share) {

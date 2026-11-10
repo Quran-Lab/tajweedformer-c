@@ -9,7 +9,8 @@
  *   tf_tests folder <folder> <key_hex|->        open a folder, print the info JSON or the error code name
  *   tf_tests ogg | codec | sharing | upload | stream_share | client | download   (tf_client_tests.inc, tf_share_tests.inc)
  *   tf_tests bitrate | consent | telemetry | sdk_latest                          (2.0.1: tf_201_tests.inc)
- *   tf_tests manifest <data dir> <work dir>     the real signed V4 manifests (2.0.2: tf_manifest_tests.inc) */
+ *   tf_tests manifest <data dir> <work dir>     the real signed V4 manifests (2.0.2: tf_manifest_tests.inc)
+ *   tf_tests takes <vectors dir> <work dir>     takes in a row share one recording (2.0.3: tf_203_tests.inc) */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -507,6 +508,7 @@ static int settings(const char *vp, const char *dir, const char *outp) {
 #include "tf_client_tests.inc"
 #include "tf_share_tests.inc"
 #include "tf_201_tests.inc"
+#include "tf_203_tests.inc"
 #include "tf_manifest_tests.inc"
 
 static int folder(const char *dir, const char *key) {
@@ -687,6 +689,7 @@ int main(int argc, char **argv) {
   if (argc >= 5 && !strcmp(argv[1], "consent")) return consent_tests(argv[2], argv[3], argv[4]);
   if (argc >= 4 && !strcmp(argv[1], "sdk_latest")) return sdk_latest_tests(argv[2], argv[3], argc > 4 ? argv[4] : NULL);
   if (argc >= 4 && !strcmp(argv[1], "manifest")) return manifest_tests(argv[2], argv[3]);
+  if (argc >= 4 && !strcmp(argv[1], "takes")) return takes_tests(argv[2], argv[3]);
   if (argc >= 3 && !strcmp(argv[1], "telemetry")) return telemetry_tests(argv[2], argc > 4 ? argv[3] : NULL, argc > 4 ? argv[4] : NULL);
   fprintf(stderr, "usage: see the comment at the top of test/tf_tests.c\n");
   return 2;

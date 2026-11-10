@@ -114,6 +114,9 @@ run "bitrate ladder vector, a 150 s stream at 192/96/32/64/192 kbit/s (pages, de
 run "consent wording vector, pause and update ask, session JSON, withdrawal, deletion; copy decks 2026-11-09.1" "$T" consent "$HERE/data/sharing_vectors" "$HERE/data/client-fixtures.json" "$W/consent"
 run "sdk_latest in the signed config: one debug warning per client when newer, silent otherwise and in release builds" "$T" sdk_latest "$HERE/data/sdk_latest_configs.json" "$W/sdk_latest" "$W/fx_c16_l64"
 run "telemetry deltas (report_id, retries, midnight, send points, timer, scored-result fields, share counters, daily register)" "$T" telemetry "$W/telemetry" "$W/fx_c16_l64" "$D/fixture"
+# 2.0.3: takes in a row share one recording (the shared takes_join.json through the real recorder, three takes byte
+# for byte one continuous encode, crash recovery with the take list, the take list call, withdrawal, background)
+run "takes in a row: one recording, the take list call, recovery, withdrawal, background, the 20-minute cap" "$T" takes "$HERE/data/sharing_vectors" "$W/takes"
 
 rm -rf "$W"
 echo "$fails failing"

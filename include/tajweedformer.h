@@ -1,4 +1,4 @@
-/* tajweedformer.h: the TajweedFormer SDK for Windows and Linux (C API, SDK 2.0.2).
+/* tajweedformer.h: the TajweedFormer SDK for Windows and Linux (C API, SDK 2.0.3).
  *
  * The exact engine (bit for bit the reference arithmetic) runs the V4 TajweedFormer model from a
  * verified model folder (sdk/v4.0), and this library gives every layer of what it computes:
@@ -52,7 +52,7 @@ extern "C" {
 #define TF_API
 #endif
 
-#define TF_SDK_VERSION "2.0.2"
+#define TF_SDK_VERSION "2.0.3"
 #define TF_API_VERSION 1
 
 typedef enum {
@@ -77,7 +77,7 @@ typedef enum {
   TF_ERR_CONFIG = -18            /* a remote config failed verification (signature, key id, expiry) */
 } TfError;
 
-TF_API const char *tf_version(void); /* "2.0.2" */
+TF_API const char *tf_version(void); /* "2.0.3" */
 TF_API int tf_api_version(void);
 TF_API const char *tf_error_name(int code); /* "signature_invalid", ... */
 TF_API const char *tf_last_error(void);     /* this thread's last failure, or NULL */
@@ -199,7 +199,8 @@ typedef struct {
   TfChunkCallback on_chunk;    /* optional, called on the pushing thread after every chunk */
   void *user;
   /* Recitation sharing (optional): with a platform client whose learner agreed to share, every take this stream
-   * listens to is shared in full in the background (tf_sharing_session_*); nothing happens otherwise. */
+   * listens to is shared in full in the background (tf_sharing_session_*); nothing happens otherwise. Takes in a
+   * row (the next push within the join window of the last finish or reset) share one recording (2.0.3). */
   TfClient *client;
   const char *input_route;     /* built_in, wired, usb, bluetooth, car, continuity, other, unknown (default) */
 } TfStreamOptions;
@@ -430,7 +431,8 @@ TF_API void tf_client_session_finished(TfClient *c, const TfSessionStats *st);
 /* Seals what was counted (include_today: also today's counts; 0: only earlier days) and sends every sealed delta,
  * oldest first. Returns the deltas accepted. */
 TF_API int tf_client_flush(TfClient *c, int include_today);
-/* The app goes to the background or idle (a window minimized, the app about to sleep): seals and sends a delta now.
+/* The app goes to the background or idle (a window minimized, the app about to sleep): seals and sends a delta now,
+ * and (2.0.3) the shared recording that waits for another take closes now (with a take running: when it ends).
  * Returns the deltas accepted, or < 0. */
 TF_API int tf_client_background(TfClient *c);
 TF_API int tf_client_report_issue(TfClient *c, const char *kind, const char *code, const char *message);
@@ -483,19 +485,39 @@ TF_API const char *tf_client_sharing_summary_json(TfClient *c);
  * or more of closed audio waits steps down; three segment uploads in a row while at most 30 s waits step up. The
  * rung in force when a segment opens is that segment's bitrate (tf_sharing_outbox_json "segmentBitrates"). */
 #define TF_SHARING_BITRATE_DEFAULT 192000 /* bit/s: the ladder's top and start */
+/* Takes in a row are one recording (2.0.3). A session here is one take; the shared recording (one Ogg stream, one
+ * upload) is kept open when a take ends, for the join window: the signed config's flags.share_join_ms (a whole
+ * number 0 to 10000 ms; absent or anything else 3000; 0 never joins). A take that begins within the window with
+ * the same input sample rate continues the same stream (no new headers, the encoder keeps its state, segments and
+ * the bitrate ladder run on); the time between the takes gets no audio. Otherwise the recording closes as a
+ * session ended before 2.0.3, and the take starts a new one. It also closes at once when the window ends, at
+ * tf_client_background, when sharing goes off (its audio is deleted with the queue), at
+ * tf_sharing_recording_close, at 20 minutes of audio (TF_SHARING_RECORDING_MAX_S) and at 256 takes. The recording
+ * is completed when its last take with audio was; a cancelled take is kept when the recording holds 2 s or more.
+ * For a recording of two or more takes the SDK sends, after its last segment, where each take starts in the stream
+ * and the pause before it (POST /v1/uploads/{id}/takes); tf_sharing_outbox_json lists "takes". */
+#define TF_SHARING_JOIN_MS_DEFAULT 3000   /* the join window without flags.share_join_ms */
+#define TF_SHARING_JOIN_MS_MAX 10000      /* the longest window a config may set */
+#define TF_SHARING_RECORDING_MAX_S 1200   /* a recording with this much audio takes no further take */
 typedef struct TfShareSession TfShareSession;
-/* NULL (TF_ERR_NOT_AVAILABLE) when sharing is off: no consent, the option, flags.contributions or upload_trust. */
+/* A take begins: it joins the client's open recording or starts a new one. NULL (TF_ERR_NOT_AVAILABLE) when sharing
+ * is off: no consent, flags.contributions or upload_trust. */
 TF_API TfShareSession *tf_sharing_session_begin(TfClient *c, int input_sample_rate, const char *input_route);
 TF_API int tf_sharing_session_push(TfShareSession *s, const float *samples, int n); /* mono, [-1, 1] */
-/* The end of the session (completed 1), or a cancelled one (0: kept only from 2 s). Frees the session; returns
- * the milliseconds shared (0: nothing). */
+/* The end of the take (completed 1), or a cancelled one (0). Frees the session; returns the take's milliseconds
+ * that went into a recording (0: nothing was recorded, or the recording was dropped: a cancelled take is kept only
+ * when its recording holds 2 s or more). The recording itself ends later (the join window). */
 TF_API int tf_sharing_session_finish(TfShareSession *s, int completed);
+/* No take follows: the open recording closes now instead of at the end of its join window (with a take running:
+ * when that take ends). tf_client_background does the same. 0, or TF_ERR_ARGUMENT without a client. */
+TF_API int tf_sharing_recording_close(TfClient *c);
 /* No effect since 2.0.1 (the ladder decides, the same in every SDK); kept for compatibility: 0, or TF_ERR_ARGUMENT
  * outside 6000 to 510000. */
 TF_API int tf_sharing_set_bitrate(TfClient *c, int bits_per_second);
 TF_API int tf_sharing_bitrate(TfClient *c); /* the bitrate the next segment opens with (bit/s) */
-/* The outbox's sessions, oldest first: [{"id","created","ended","completed","segments" (closed),"uploaded",
- * "segmentBitrates":[bit/s per closed segment, in order],"error"}]. Free with tf_free; NULL on error. */
+/* The outbox's sessions (recordings), oldest first: [{"id","created","ended","completed","segments" (closed),
+ * "uploaded","segmentBitrates":[bit/s per closed segment, in order],"takes" (how many takes the recording holds,
+ * 2.0.3),"error"}]. Free with tf_free; NULL on error. */
 TF_API char *tf_sharing_outbox_json(TfClient *c);
 TF_API int tf_sharing_outbox_pending(TfClient *c);                     /* sessions not uploaded yet */
 TF_API int tf_sharing_outbox_resume(TfClient *c);                      /* start or wake the uploader */

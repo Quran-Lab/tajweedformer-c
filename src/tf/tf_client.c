@@ -30,6 +30,8 @@ void tf__sharing_init(TfClient *c);
 void tf__sharing_free(TfClient *c);
 void tf__share_init(TfClient *c);
 void tf__share_free(TfClient *c);
+void tf__share_background(TfClient *c);
+void tf__share_window_check(TfClient *c);
 int tf_sharing_outbox_resume(TfClient *c);
 void tf__telemetry_add(TfClient *c, const char *field, long long n);
 int tf__client_telemetry_on(const TfClient *c);
@@ -202,6 +204,13 @@ int tf__client_call(TfClient *c, const char *method, const char *path, const cha
                     TfHttpResponse *r) {
   Call k = {method, path, body, auth, extra};
   return call(c, &k, r);
+}
+/* the app token was refused (a 401 whatever its error code): the next call with a token asks for a new one */
+void tf__client_token_forget(TfClient *c) {
+  tf_mutex_lock(&c->lock);
+  c->token[0] = 0;
+  c->token_exp = 0;
+  tf_mutex_unlock(&c->lock);
 }
 
 /* ------------------------------------------------------------------ state */
@@ -494,6 +503,9 @@ int tf_client_refresh_config(TfClient *c) {
   tf_mutex_unlock(&c->lock);
   tf_http_response_free(&r);
   check_sdk_latest(c);
+  /* 2.0.3: a config that turns sharing off, or sets another join window, reaches a recording that waits for its
+   * next take now, not at the end of the window it started with */
+  tf__share_window_check(c);
   return 0;
 }
 
@@ -581,6 +593,21 @@ int tf__client_flag(const TfClient *c, const char *name, int dflt) {
   tf_mutex_unlock((TfMutex *)&c->lock);
   const TfJson *f = tf_json_get(tf_json_get(j, "flags"), name);
   const int v = f && f->type == TJ_BOOL ? f->boolean : dflt;
+  tf_json_free(j);
+  return v;
+}
+/* flags.<name> of the verified config when it is a whole number lo to hi; `dflt` when it is absent, anything else (a
+ * boolean, a string, a fraction, a number outside the range) or no config is in force */
+int tf__client_flag_int(const TfClient *c, const char *name, int lo, int hi, int dflt) {
+  tf_mutex_lock((TfMutex *)&c->lock);
+  if (!c->config || c->config_exp <= now_unix()) {
+    tf_mutex_unlock((TfMutex *)&c->lock);
+    return dflt;
+  }
+  TfJson *j = tf_json_parse(c->config, strlen(c->config), NULL);
+  tf_mutex_unlock((TfMutex *)&c->lock);
+  const TfJson *f = tf_json_get(tf_json_get(j, "flags"), name);
+  const int v = tf_json_is_int(f) && f->num >= lo && f->num <= hi ? (int)f->num : dflt;
   tf_json_free(j);
   return v;
 }
@@ -1347,6 +1374,8 @@ static int telemetry_send_point(TfClient *c) {
 int tf_client_background(TfClient *c) {
   tf__clear_error();
   if (!c) return tf__fail(TF_ERR_ARGUMENT, "no client");
+  /* 2.0.3: the shared recording does not wait for another take while the app is in the background */
+  tf__share_background(c);
   if (!tf__client_telemetry_on(c)) {
     send_reports(c); /* drops the queue */
     return 0;

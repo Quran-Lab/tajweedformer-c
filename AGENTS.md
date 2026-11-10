@@ -87,9 +87,9 @@ One model, one engine, the same bits on every platform. Each SDK compiles the sa
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
 | [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+ on arm64-v8a and armeabi-v7a, desktop JVM | Maven Central `ai.quranlab:tajweedformer:2.0.2` |
-| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "2.0.2"`, product `TajweedFormer` |
+| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "2.0.3"`, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node 20+ | `npm install @quran-lab/tajweedformer` |
-| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | Build tag 2.0.2 with CMake |
+| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 2.0.3 |
 | [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) | The engine: exact C runtime, tajweed scorer, conformance suite | everything above | Git submodule |
 
 The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), hosted by Quran Lab and served by
@@ -101,23 +101,33 @@ per-class thresholds) your users see, without shipping a new build.
 
 ## Install
 
-There are no prebuilt binaries: build the release tag with CMake.
+There are no prebuilt binaries: CMake builds the release tag inside your own project. `CMakeLists.txt`:
 
-```sh
-git clone --recurse-submodules --branch 2.0.2 https://github.com/Quran-Lab/tajweedformer-c
-cd tajweedformer-c
-cmake --preset linux && cmake --build --preset linux                    # Linux
-cmake --preset windows-clang && cmake --build --preset windows-clang    # Windows
+```cmake
+cmake_minimum_required(VERSION 3.24)
+project(app C CXX)
+
+include(FetchContent)
+FetchContent_Declare(tajweedformer
+  GIT_REPOSITORY https://github.com/Quran-Lab/tajweedformer-c.git
+  GIT_TAG        2.0.3)
+FetchContent_MakeAvailable(tajweedformer)
+
+add_executable(quickstart quickstart.c)
+target_link_libraries(quickstart PRIVATE tajweedformer)
+if(WIN32)   # the library beside the program
+  add_custom_command(TARGET quickstart POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_RUNTIME_DLLS:quickstart> $<TARGET_FILE_DIR:quickstart> COMMAND_EXPAND_LISTS)
+endif()
 ```
 
-The build leaves the library (`libtajweedformer.so`, or `tajweedformer.dll` with `tajweedformer.lib`) and the `tajweedformer` command-line tool in `build/linux` or `build/windows-clang`. Your program includes `include/tajweedformer.h` and links the library. From the repository's root:
-
 ```sh
-cc quickstart.c -I include -I vendor/zipformer-sdk/tajweed/include -L build/linux -ltajweedformer -o quickstart                    # Linux
-clang quickstart.c -I include -I vendor/zipformer-sdk/tajweed/include -L build/windows-clang -ltajweedformer -o quickstart.exe    # Windows
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release                                                         # Linux
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++     # Windows
+cmake --build build
 ```
 
-At run time the program needs the library: `LD_LIBRARY_PATH=build/linux` on Linux; on Windows keep `tajweedformer.dll` beside the program or on `PATH`.
+To build the repository by itself (the library, the `tajweedformer` command-line tool and the tests), clone it with `git clone --recurse-submodules --branch 2.0.3 https://github.com/Quran-Lab/tajweedformer-c`, then `cmake --preset linux` or `cmake --preset windows-clang`, and `cmake --build --preset` with the same name.
 
 ## Before you start
 
@@ -133,8 +143,9 @@ At run time the program needs the library: `LD_LIBRARY_PATH=build/linux` on Linu
 
 ## Quick start
 
-From your key to what the model hears from the microphone. Save this as `quickstart.c` (it is
-[`examples/quickstart.c`](examples/quickstart.c), which every build compiles):
+From your key to what the model hears from the microphone. Save this as `quickstart.c` beside the
+`CMakeLists.txt` of Install (it is [`examples/quickstart.c`](examples/quickstart.c), which every build of this
+repository compiles):
 
 ```c
 #include <stdio.h>
@@ -214,12 +225,11 @@ int main(int argc, char **argv) {
 }
 ```
 
-Compile it against the library you built (the two lines under Install), then pipe the microphone in as raw mono
-float samples at 16 kHz. Capture is the system's recorder, because it is a platform API this library does not wrap:
+Build it with the three commands under Install, then pipe the microphone in as raw mono float samples at 16 kHz. Capture is the system's recorder, because it is a platform API this library does not wrap:
 
 ```sh
-arecord -q -f FLOAT_LE -r 16000 -c 1 -t raw | LD_LIBRARY_PATH=build/linux ./quickstart qlk_v1_...                                  # Linux
-ffmpeg -loglevel error -f dshow -i audio="<your microphone>" -ac 1 -ar 16000 -f f32le - | quickstart.exe qlk_v1_...              # Windows
+arecord -q -f FLOAT_LE -r 16000 -c 1 -t raw | ./build/quickstart qlk_v1_...                                                       # Linux
+ffmpeg -loglevel error -f dshow -i audio="<your microphone>" -ac 1 -ar 16000 -f f32le - | build\quickstart.exe qlk_v1_...        # Windows
 ```
 
 (`ffmpeg -list_devices true -f dshow -i dummy` lists the Windows microphones.) The first run downloads the model
@@ -492,6 +502,13 @@ same page in every TajweedFormer SDK); the C calls are in [docs/api.md](docs/api
 - **Bitrate on bad networks.** Opus starts at 192 kbit/s and steps down to 96, 64 and 32 kbit/s when uploads fail
   for network reasons or the queue backs up, and back up when uploads succeed; each segment keeps one bitrate,
   recorded on disk and listed by `tf_sharing_outbox_json`.
+- **Takes in a row are one recording** (2.0.3). When a take ends, the shared recording stays open for a few
+  seconds (3 s, or what the signed config's `flags.share_join_ms` sets): a take that starts in that time with
+  the same sample rate continues the same Ogg stream, with no new headers, and the time between the takes is
+  left out. The recording closes when no take follows in time, at `tf_client_background` or
+  `tf_sharing_recording_close`, when sharing is turned off, after 20 minutes, or when the next take has another
+  sample rate. For a recording of several takes the SDK then sends where each take starts and how long the
+  pause before it was; `tf_sharing_outbox_json` lists `takes`.
 - **Stop and delete** at any time (`tf_client_sharing_set(c, 0)`, `tf_client_sharing_delete`), whatever wording the
   learner agreed to.
 

@@ -73,23 +73,33 @@ Copy the setup prompt from [portal.quranlab.ai](https://portal.quranlab.ai) and 
 
 ## Install
 
-There are no prebuilt binaries: build the release tag with CMake.
+There are no prebuilt binaries: CMake builds the release tag inside your own project. `CMakeLists.txt`:
 
-```sh
-git clone --recurse-submodules --branch 2.0.2 https://github.com/Quran-Lab/tajweedformer-c
-cd tajweedformer-c
-cmake --preset linux && cmake --build --preset linux                    # Linux
-cmake --preset windows-clang && cmake --build --preset windows-clang    # Windows
+```cmake
+cmake_minimum_required(VERSION 3.24)
+project(app C CXX)
+
+include(FetchContent)
+FetchContent_Declare(tajweedformer
+  GIT_REPOSITORY https://github.com/Quran-Lab/tajweedformer-c.git
+  GIT_TAG        2.0.3)
+FetchContent_MakeAvailable(tajweedformer)
+
+add_executable(quickstart quickstart.c)
+target_link_libraries(quickstart PRIVATE tajweedformer)
+if(WIN32)   # the library beside the program
+  add_custom_command(TARGET quickstart POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_RUNTIME_DLLS:quickstart> $<TARGET_FILE_DIR:quickstart> COMMAND_EXPAND_LISTS)
+endif()
 ```
 
-The build leaves the library (`libtajweedformer.so`, or `tajweedformer.dll` with `tajweedformer.lib`) and the `tajweedformer` command-line tool in `build/linux` or `build/windows-clang`. Your program includes `include/tajweedformer.h` and links the library. From the repository's root:
-
 ```sh
-cc quickstart.c -I include -I vendor/zipformer-sdk/tajweed/include -L build/linux -ltajweedformer -o quickstart                    # Linux
-clang quickstart.c -I include -I vendor/zipformer-sdk/tajweed/include -L build/windows-clang -ltajweedformer -o quickstart.exe    # Windows
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release                                                         # Linux
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++     # Windows
+cmake --build build
 ```
 
-At run time the program needs the library: `LD_LIBRARY_PATH=build/linux` on Linux; on Windows keep `tajweedformer.dll` beside the program or on `PATH`.
+To build the repository by itself (the library, the `tajweedformer` command-line tool and the tests), clone it with `git clone --recurse-submodules --branch 2.0.3 https://github.com/Quran-Lab/tajweedformer-c`, then `cmake --preset linux` or `cmake --preset windows-clang`, and `cmake --build --preset` with the same name.
 
 ## Before you start
 
@@ -105,8 +115,9 @@ At run time the program needs the library: `LD_LIBRARY_PATH=build/linux` on Linu
 
 ## Quick start
 
-From your key to what the model hears from the microphone. Save this as `quickstart.c` (it is
-[`examples/quickstart.c`](examples/quickstart.c), which every build compiles):
+From your key to what the model hears from the microphone. Save this as `quickstart.c` beside the
+`CMakeLists.txt` of Install (it is [`examples/quickstart.c`](examples/quickstart.c), which every build of this
+repository compiles):
 
 ```c
 #include <stdio.h>
@@ -186,12 +197,11 @@ int main(int argc, char **argv) {
 }
 ```
 
-Compile it against the library you built (the two lines under Install), then pipe the microphone in as raw mono
-float samples at 16 kHz. Capture is the system's recorder, because it is a platform API this library does not wrap:
+Build it with the three commands under Install, then pipe the microphone in as raw mono float samples at 16 kHz. Capture is the system's recorder, because it is a platform API this library does not wrap:
 
 ```sh
-arecord -q -f FLOAT_LE -r 16000 -c 1 -t raw | LD_LIBRARY_PATH=build/linux ./quickstart qlk_v1_...                                  # Linux
-ffmpeg -loglevel error -f dshow -i audio="<your microphone>" -ac 1 -ar 16000 -f f32le - | quickstart.exe qlk_v1_...              # Windows
+arecord -q -f FLOAT_LE -r 16000 -c 1 -t raw | ./build/quickstart qlk_v1_...                                                       # Linux
+ffmpeg -loglevel error -f dshow -i audio="<your microphone>" -ac 1 -ar 16000 -f f32le - | build\quickstart.exe qlk_v1_...        # Windows
 ```
 
 (`ffmpeg -list_devices true -f dshow -i dummy` lists the Windows microphones.) The first run downloads the model

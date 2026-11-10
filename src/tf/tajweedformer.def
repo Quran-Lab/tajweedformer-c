@@ -66,6 +66,7 @@ EXPORTS
   tf_sharing_outbox_pending
   tf_sharing_outbox_resume
   tf_sharing_outbox_wait
+  tf_sharing_recording_close
   tf_sharing_session_begin
   tf_sharing_session_finish
   tf_sharing_session_push

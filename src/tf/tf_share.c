@@ -5,14 +5,41 @@
  *
  * On disk, one folder per session under <storage>/outbox/<id>/:
  *   session.json   the POST /v1/uploads body (closed schema, sorted keys, contributor_key and recovery_hash)
- *   capture.json   written by the capture: segments closed, ended, completed, duration, created (unix s)
- *   item.json      written by the uploader: started, URLs with expiry, segments uploaded, attempts, next attempt
+ *   capture.json   written by the capture: segments closed, ended, completed, duration, created (unix s), pre_skip
+ *   item.json      written by the uploader: started, URLs with expiry, segments uploaded, attempts, next attempt;
+ *                  "done" once every segment went up and only the take list is still to send
  *   seg-NNNNN.opus the segment files (each deleted once its PUT succeeded)
  *   seg-NNNNN.json the segment's marker: {"n", "bitrate"} written when the segment opens, plus "granule" (the
  *                  granule position of its last page) when it closes; kept until the session is removed
+ *   takes.json     the takes of a recording of two or more takes (2.0.3, below): the take list call's body
  * A crash or restart leaves the folders; the next launch resumes them (a session whose capture died is closed at
  * its last whole page, with the bitrate its marker recorded when it opened). Sessions older than 7 days are
  * deleted unsent. Turning sharing off deletes them at once and aborts the PUT in flight.
+ *
+ * Takes in a row share one recording (SDK 2.0.3, the shared vectors' takes_join.json). A take is one
+ * tf_sharing_session_begin .. finish (one take of a TfStream); the RECORDING (the capture: its Ogg stream, outbox
+ * folder and session id) is decoupled from it:
+ * - When a take ends while sharing is on, its recording stays open for the JOIN WINDOW: the signed config's
+ *   flags.share_join_ms (a whole number 0 to 10000; absent or anything else 3000; 0 never joins).
+ * - A take that starts within the window (wall ms since the previous take with audio ended <= the window) with the
+ *   same input rate, contributor, consent version and model revision continues the same stream: no new headers,
+ *   the resampler and the encoder keep their state (a partial Opus frame is completed by the next take's first
+ *   samples), granules and page sequence continue, segments are cut by the same plan counted across takes, the
+ *   bitrate ladder applies as before. The gap gets no audio.
+ * - Otherwise the recording closes as a 2.0.2 session ends (its last page with EOS, capture.json ended) and the
+ *   take starts a new recording. Closed at once as well: the window expiring, tf_client_background, sharing going
+ *   off (its files deleted with the queue), tf_sharing_recording_close, 20 minutes of audio, 256 takes.
+ * - `completed` is the last take's that had audio; the 2 s minimum of a cancelled session applies to the
+ *   recording's total audio; the session JSON is written once, at the first take.
+ * - The takes: [{"start_ms","gap_ms"}], start_ms the stream position of the take's first sample (floor(1000 x
+ *   input samples before it / input rate)), gap_ms the wall gap rounded to the nearest 100 (0 to 10000), the first
+ *   {0, 0}. Kept in takes.json from the second take on (rewritten atomically as a take joins, so recovery keeps
+ *   it) and sent once the recording is closed and all its segments are uploaded: POST /v1/uploads/{id}/takes. A
+ *   recording of one take has no list. The call never touches the session's uploaded state or the ladder.
+ * Tried and rejected: silence in the gap (made-up audio in training data); holding the upload until the recording
+ * closes so the session JSON could list the takes (a long recording would wait to upload and its backlog would
+ * push the ladder down); cutting a take at the 20-minute mark (it would split a recitation, what joining removes);
+ * flushing a page when a take ends (the stream would no longer be the bytes of one continuous encode).
  *
  * Bitrate (SDK 2.0.1, the shared vectors' bitrate_ladder.json): one ladder per client, in memory, rungs 192000,
  * 96000, 64000, 32000 bit/s, starting at the top. A network failure of an upload request (no connection, a
@@ -60,12 +87,24 @@ void tf__sharing_uploaded(TfClient *c);
 void tf__sharing_grant(TfClient *c, char version[40], char hash[65]);
 int tf__contributor(const char *dir, int create, char id[33], char contributor_key[90], char recovery_hash[65]);
 void tf__contributor_forget(const char *dir);
+int tf__client_flag_int(const TfClient *c, const char *name, int lo, int hi, int dflt);
+void tf__client_token_forget(TfClient *c);
+void tf__client_log(TfClient *c, int level, const char *message);
 extern long long tf__now_override;
+extern int tf__client_no_timer;
 TfShareSession *tf__share_begin(TfClient *c, int input_sample_rate, const char *input_route, const char *revision);
+void tf__share_window_check(TfClient *c);
 
 #define MAX_AGE_S (7LL * 86400)
 #define URL_MARGIN_S 300
 #define MIN_PARTIAL_S 2.0
+/* back-to-back takes (2.0.3; the same numbers in every SDK) */
+#define JOIN_MS_DEFAULT TF_SHARING_JOIN_MS_DEFAULT /* 3000: the join window when the signed config sets none */
+#define JOIN_MS_MAX TF_SHARING_JOIN_MS_MAX         /* 10000: the longest window, and the largest gap recorded */
+#define REC_CAP_MS (TF_SHARING_RECORDING_MAX_S * 1000LL) /* 20 minutes: such a recording takes no further take */
+#define MAX_TAKES 256                  /* takes per recording (the take list call takes no more) */
+#define HOLD_MS 30000                  /* with this little room under the cap a joining take's audio is held */
+#define PRE_SKIP_DEFAULT 312           /* libopus's lookahead at 48 kHz: a capture.json written before 2.0.3 */
 #ifdef _WIN32
 #define SLEEP_SHORT() Sleep(20)
 #else
@@ -74,8 +113,28 @@ TfShareSession *tf__share_begin(TfClient *c, int input_sample_rate, const char *
 
 static long long now_s(void) { return tf__now_override ? tf__now_override : (long long)time(NULL); }
 
+/* The wall clock in ms: what the join window is measured with (a take's start minus the previous take's end). The
+ * wall clock, not a monotonic one: a computer that slept between two takes must not join them. Tests set
+ * tf__share_now_ms (0: the system's clock). */
+long long tf__share_now_ms;
+static long long now_ms(void) {
+  if (tf__share_now_ms) return tf__share_now_ms;
+#ifdef _WIN32
+  FILETIME ft;
+  GetSystemTimeAsFileTime(&ft);
+  const unsigned long long t = ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime; /* 100 ns since 1601 */
+  return (long long)(t / 10000ULL) - 11644473600000LL;
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
+
 /* ------------------------------------------------------------------ per-client state */
+typedef struct Rec Rec;
 typedef struct {
+  TfClient *c;
   TfMutex m;
   TfCond cv;
   TfThread th;
@@ -86,17 +145,33 @@ typedef struct {
   int n_active;
   int passes;          /* finished upload passes (tests) */
   char outbox[1024];
+  /* 2.0.3, the recorder. rm guards it: takes begin, push and end on the app's audio thread, the window ends on the
+   * timer's, the app's life and the settings switch arrive on others. Lock order: rm, then m or tm; never back. */
+  TfMutex rm;
+  Rec *open;           /* the recording takes join: one with a take running, or waiting in its join window */
+  /* the window's timer: it only prompts tf__share_window_check, where the clock decides */
+  TfMutex tm;
+  TfCond tcv;
+  TfThread tth;
+  int t_on, t_quit, t_armed, t_fire;
+  double t_due;        /* on the monotonic clock, ms */
+  int takes_404;       /* the missing take list route was logged (once per client) */
 } Share;
 
 static Share *sh(TfClient *c) { return c ? (Share *)*tf__client_share_slot(c) : NULL; }
 
 static void share_thread(void *arg);
+static void recorder_free(Share *s);
 
 void tf__share_init(TfClient *c) {
   Share *s = (Share *)calloc(1, sizeof *s);
   if (!s) return;
+  s->c = c;
   tf_mutex_init(&s->m);
   tf_cond_init(&s->cv);
+  tf_mutex_init(&s->rm);
+  tf_mutex_init(&s->tm);
+  tf_cond_init(&s->tcv);
   char *p = tf_path_join(tf__client_dir(c), "outbox");
   if (p) snprintf(s->outbox, sizeof s->outbox, "%s", p);
   free(p);
@@ -105,6 +180,13 @@ void tf__share_init(TfClient *c) {
 void tf__share_free(TfClient *c) {
   Share *s = sh(c);
   if (!s) return;
+  /* the window's timer first, then the recording it would have closed: it ends here, as when its window ends */
+  tf_mutex_lock(&s->tm);
+  s->t_quit = 1;
+  tf_cond_signal(&s->tcv);
+  tf_mutex_unlock(&s->tm);
+  if (s->t_on) tf_thread_join(s->tth);
+  recorder_free(s);
   if (s->thread_on) {
     tf_mutex_lock(&s->m);
     s->quit = 1;
@@ -113,6 +195,9 @@ void tf__share_free(TfClient *c) {
     tf__http_cancel(&s->cancel);
     tf_thread_join(s->th);
   }
+  tf_cond_destroy(&s->tcv);
+  tf_mutex_destroy(&s->tm);
+  tf_mutex_destroy(&s->rm);
   tf_cond_destroy(&s->cv);
   tf_mutex_destroy(&s->m);
   free(s);
@@ -312,31 +397,76 @@ static double backlog_s(const Share *s) {
   return sum;
 }
 
-/* ------------------------------------------------------------------ the capture */
-struct TfShareSession {
+/* ------------------------------------------------------------------ the recording and its takes */
+typedef struct {
+  long long start_ms;
+  int gap_ms;
+} Take;
+/* One recording: the capture of 2.0.2 (one Ogg stream written into one outbox folder), fed by one take or by
+ * several in a row. */
+struct Rec {
   TfClient *c;
   char id[33];
   int input_rate, resample;
   TfResampler rs;
   TfEncoder enc;
   TfOgg ogg;
-  int opened, failed, closed, finished;
-  long long samples, created;
+  int opened, failed, closed;
+  long long samples, created; /* input samples of every take so far; unix s */
   int seg_bitrate;      /* the bitrate of the segment being written */
   int next_seg;         /* the next segment to open */
   long long next_start; /* its first packet */
+  /* what a take must have in common with the recording to join it (the session JSON is written once) */
+  char contributor[33], consent_version[40], consent_hash[65], revision[80];
+  Take takes[MAX_TAKES]; /* the first is {0, 0} */
+  int n_takes;
+  int completed;        /* of the last take that had audio */
+  long long last_end;   /* when that take ended (wall ms) */
+  int close_at_end;     /* the app went to the background during the take: no waiting when it ends */
+  int standalone;       /* begun while another take of the client was running: never joined, closed with its take */
+  TfShareSession *take; /* the take writing into it now */
+};
+/* One take: what tf_sharing_session_begin hands out. */
+struct TfShareSession {
+  TfClient *c;          /* NULL once the client is gone */
+  Rec *rec;             /* NULL: nothing is recorded (any more): sharing went off, a write failed */
+  int input_rate;
+  char route[16], revision[80];
+  long long samples;    /* this take's audio */
+  int gap_ms;           /* a joining take: the rounded wall gap before it; -1: the first take of its recording */
+  int entered;          /* its boundary is decided (at its first audio) */
+  /* The 20-minute cap, live (a take's length is not known when it starts): with at most HOLD_MS of room left
+   * under the cap, a joining take's audio is held here until the take ends (it joins if the recording's ms plus the
+   * take's ms stay within the cap) or outgrows the room (the recording closes without it and the take starts a new
+   * recording with the held audio). With more room the take joins at once; if it then runs past the cap it stays
+   * whole and the recording closes when it ends. Tried and rejected: holding every joining take (a crash would lose
+   * it, and its segments would wait); cutting the recording at the cap inside a take. */
+  int holding;
+  float *hold;
+  long long hold_n, hold_cap;
 };
 
-static void capture_save(TfShareSession *x, int ended, int completed) {
-  char t[256];
-  snprintf(t, sizeof t, "{\"v\":1,\"created\":%lld,\"closed\":%d,\"ended\":%s,\"completed\":%s,\"duration_ms\":%lld}", x->created, x->closed,
-           ended ? "true" : "false", completed ? "true" : "false", x->samples * 1000 / (x->input_rate ? x->input_rate : 48000));
+static long long ms_of(long long samples, int rate) { return rate > 0 ? samples * 1000 / rate : 0; }
+static long long rec_ms(const Rec *o) { return ms_of(o->samples, o->input_rate); }
+/* a wall gap in ms, rounded to the nearest 100 (half up) within 0 to 10000 (a clock set back gives 0) */
+static int round_gap(long long gap) {
+  if (gap < 0) gap = 0;
+  if (gap > JOIN_MS_MAX) gap = JOIN_MS_MAX;
+  return (int)((gap + 50) / 100 * 100);
+}
+/* the join window in force: flags.share_join_ms, a whole number 0 to 10000, else 3000 */
+static int join_window(const TfClient *c) { return tf__client_flag_int(c, "share_join_ms", 0, JOIN_MS_MAX, JOIN_MS_DEFAULT); }
+
+static void capture_save(Rec *x, int ended, int completed) {
+  char t[320];
+  snprintf(t, sizeof t, "{\"v\":1,\"created\":%lld,\"closed\":%d,\"ended\":%s,\"completed\":%s,\"duration_ms\":%lld,\"pre_skip\":%d}",
+           x->created, x->closed, ended ? "true" : "false", completed ? "true" : "false", rec_ms(x), x->enc.pre_skip);
   write_text(sh(x->c), x->id, "capture.json", t);
 }
 /* a segment closed: its marker gets the granule of its last page, capture.json the count, and the ladder hears
  * of the backlog (this segment included) */
 static void on_segment(void *user, int n, int last) {
-  TfShareSession *x = (TfShareSession *)user;
+  Rec *x = (Rec *)user;
   Share *s = sh(x->c);
   (void)last;
   marker_write(s, x->id, n, x->seg_bitrate, x->ogg.last_granule);
@@ -348,7 +478,7 @@ static void on_segment(void *user, int n, int last) {
 /* before each packet: at a segment boundary the closing segment is paged and closed first (so the ladder hears of
  * it), then the next segment opens at the ladder's bitrate, recorded in its marker before its first packet */
 static int before_packet(void *user, long long packet) {
-  TfShareSession *x = (TfShareSession *)user;
+  Rec *x = (Rec *)user;
   if (packet != x->next_start) return 0;
   Share *s = sh(x->c);
   if (tf_ogg_flush(&x->ogg)) return -1;
@@ -360,15 +490,127 @@ static int before_packet(void *user, long long packet) {
   x->next_start = tf_ogg_segment_start(x->next_seg);
   return 0;
 }
-static int put_packet(void *user, const uint8_t *p, int n) { return tf_ogg_packet(&((TfShareSession *)user)->ogg, p, n); }
+static int put_packet(void *user, const uint8_t *p, int n) { return tf_ogg_packet(&((Rec *)user)->ogg, p, n); }
 static int put_samples(void *user, const float *x, int n) {
-  TfShareSession *s = (TfShareSession *)user;
+  Rec *s = (Rec *)user;
   return tf_enc_encode(&s->enc, x, n, put_packet, s);
 }
 
+/* ---- the take list ---- */
+/* takes.json: exactly the take list call's body. Written when a second take adds its entry, and again when a later
+ * one does (tf_write_file replaces the file atomically, so a crash leaves the old list or the new one). */
+static void takes_write(const Share *s, const Rec *o) {
+  TfBuf b;
+  tf_buf_init(&b);
+  tf_buf_puts(&b, "{\"takes\":[");
+  for (int i = 0; i < o->n_takes; ++i)
+    tf_buf_printf(&b, "%s{\"start_ms\":%lld,\"gap_ms\":%d}", i ? "," : "", o->takes[i].start_ms, o->takes[i].gap_ms);
+  tf_buf_puts(&b, "]}");
+  if (b.p) write_text(s, o->id, "takes.json", b.p);
+  tf_buf_free(&b);
+}
+/* The take list of a session folder as the server takes it (the bytes takes.json was written with), or NULL: 2 to
+ * 256 entries, the first {0, 0}, start_ms whole and strictly increasing, gap_ms 0 to 10000 in steps of 100.
+ * limit_ms >= 0 (a recording closed at its last whole page): the takes that start at or beyond it are left out,
+ * none of their audio was kept. *count gets the number of takes (1 without a list). The caller frees. */
+static char *takes_body(const Share *s, const char *id, long long limit_ms, int *count) {
+  if (count) *count = 1;
+  TfJson *j = read_json(s, id, "takes.json");
+  const TfJson *a = tf_json_get(j, "takes");
+  TfBuf b;
+  tf_buf_init(&b);
+  tf_buf_puts(&b, "{\"takes\":[");
+  int n = 0, ok = a && a->type == TJ_ARR;
+  long long prev = -1;
+  for (int i = 0; ok && i < a->n; ++i) {
+    const TfJson *st = tf_json_get(&a->kids[i], "start_ms"), *g = tf_json_get(&a->kids[i], "gap_ms");
+    if (!tf_json_is_int(st) || !tf_json_is_int(g)) {
+      ok = 0;
+      break;
+    }
+    const long long start = (long long)st->num, gap = (long long)g->num;
+    if (i == 0 ? (start != 0 || gap != 0) : start <= prev) ok = 0;
+    if (gap < 0 || gap > JOIN_MS_MAX || gap % 100) ok = 0;
+    if (!ok) break;
+    if (i > 0 && limit_ms >= 0 && start >= limit_ms) break;
+    tf_buf_printf(&b, "%s{\"start_ms\":%lld,\"gap_ms\":%lld}", n ? "," : "", start, gap);
+    prev = start;
+    n++;
+  }
+  tf_buf_puts(&b, "]}");
+  tf_json_free(j);
+  if (!ok || n < 2 || n > MAX_TAKES) {
+    tf_buf_free(&b);
+    return NULL;
+  }
+  if (count) *count = n;
+  return tf_buf_take(&b);
+}
+/* a recording closed short of its end (its capture died): the list keeps the takes that begin before
+ * `duration_ms`; with fewer than 2 left there is no list */
+static void takes_trim(const Share *s, const char *id, long long duration_ms) {
+  char *p = sess_path(s, id, "takes.json");
+  if (p && tf_file_exists(p)) {
+    char *body = takes_body(s, id, duration_ms, NULL);
+    if (body) write_text(s, id, "takes.json", body);
+    else remove(p);
+    free(body);
+  }
+  free(p);
+}
+
+/* ---- the window's timer ---- */
+static void join_timer(void *arg) {
+  TfClient *c = (TfClient *)arg;
+  Share *s = sh(c);
+  tf_mutex_lock(&s->tm);
+  while (!s->t_quit) {
+    if (!s->t_armed && !s->t_fire) {
+      tf_cond_wait_ms(&s->tcv, &s->tm, 600000);
+      continue;
+    }
+    const double left = s->t_due - tf__now_s() * 1000.0;
+    if (left > 0 && !s->t_fire) {
+      tf_cond_wait_ms(&s->tcv, &s->tm, (long)left + 1);
+      continue;
+    }
+    s->t_armed = s->t_fire = 0;
+    tf_mutex_unlock(&s->tm);
+    tf__share_window_check(c);
+    tf_mutex_lock(&s->tm);
+  }
+  tf_mutex_unlock(&s->tm);
+}
+/* prompt a window check in `ms` (a thread of the client, started at the first use; none in the tests' one-thread
+ * mode, which call tf__share_window_check themselves) */
+static void timer_arm(Share *s, long long ms) {
+  if (tf__client_no_timer) return;
+  tf_mutex_lock(&s->tm);
+  if (!s->t_on && !s->t_quit && !tf_thread_start(&s->tth, join_timer, s->c)) s->t_on = 1;
+  s->t_armed = 1;
+  s->t_due = tf__now_s() * 1000.0 + (double)(ms < 0 ? 0 : ms) + 1.0;
+  tf_cond_signal(&s->tcv);
+  tf_mutex_unlock(&s->tm);
+}
+static void timer_disarm(Share *s) {
+  tf_mutex_lock(&s->tm);
+  s->t_armed = 0;
+  tf_mutex_unlock(&s->tm);
+}
+/* tests: the timer's thread checks the window now, whatever its own wait says */
+void tf__share_timer_poke(TfClient *c) {
+  Share *s = sh(c);
+  if (!s) return;
+  tf_mutex_lock(&s->tm);
+  s->t_fire = 1;
+  tf_cond_signal(&s->tcv);
+  tf_mutex_unlock(&s->tm);
+}
+
+/* ---- a recording's life ---- */
 /* the session JSON, sorted keys (as the Swift and web SDKs write it) */
-static char *session_json(TfClient *c, const char *contributor, const char *key, const char *rhash, int input_rate, const char *route,
-                          const char *revision) {
+static char *session_json(const char *contributor, const char *key, const char *rhash, const char *cv, const char *ch, int input_rate,
+                          const char *route, const char *revision) {
   TfBuf b;
   tf_buf_init(&b);
   char day[16];
@@ -388,8 +630,6 @@ static char *session_json(TfClient *c, const char *contributor, const char *key,
   /* the version the learner agreed to; with the app's own wording also the SHA-256 of that text (sorted keys:
    * consent_text_sha256 before consent_version). Without own wording the field is absent: the 2.0.0 schema is
    * closed. */
-  char cv[40], ch[65];
-  tf__sharing_grant(c, cv, ch);
   if (ch[0]) {
     tf_buf_puts(&b, ",\"consent_text_sha256\":");
     tf_buf_json_str(&b, ch);
@@ -409,23 +649,167 @@ static char *session_json(TfClient *c, const char *contributor, const char *key,
 
 static const char *const kRoutes[] = {"built_in", "wired", "usb", "bluetooth", "car", "continuity", "other", "unknown", NULL};
 
+/* the recording is over (closed, dropped or lost): nothing points at it any more */
+static void rec_release(Share *s, Rec *o) {
+  if (s->open == o) {
+    s->open = NULL;
+    timer_disarm(s);
+  }
+  if (o->take) {
+    o->take->rec = NULL;
+    o->take->holding = 0;
+    o->take = NULL;
+  }
+  if (o->resample) tf_rs_free(&o->rs);
+  tf_enc_free(&o->enc);
+  set_active(s, o->id, 0);
+  wake(s);
+  free(o);
+}
+/* nothing of the recording is kept: sharing went off, what was shared was deleted, or a write failed */
+static void rec_drop(Share *s, Rec *o) {
+  tf_ogg_abandon(&o->ogg);
+  remove_session(s, o->id);
+  rec_release(s, o);
+}
+/* The end of a recording, as a 2.0.2 session ends: the resampler and the encoder are flushed, the last page gets
+ * EOS, capture.json says ended. Nothing is kept when sharing went off, a write failed, or the last take with audio
+ * was cancelled and the recording holds under 2 s with no segment closed. Returns the milliseconds kept. */
+static int rec_close(Share *s, Rec *o) {
+  int ms = 0;
+  const double dur = o->input_rate ? (double)o->samples / o->input_rate : 0;
+  const int keep = o->opened && !o->failed && tf_client_sharing_state(o->c) && dur > 0 &&
+                   (o->completed || dur >= MIN_PARTIAL_S || o->closed > 0);
+  int rc = keep ? 0 : -1;
+  if (keep) {
+    rc = o->resample ? tf_rs_flush(&o->rs, put_samples, o) : 0;
+    if (!rc) rc = tf_enc_flush(&o->enc, put_packet, o);
+    if (!rc) rc = tf_ogg_finish(&o->ogg, tf_enc_final_granule(&o->enc));
+  }
+  if (!rc) {
+    capture_save(o, 1, o->completed);
+    ms = (int)(dur * 1000 + 0.5);
+  } else {
+    tf_ogg_abandon(&o->ogg);
+    remove_session(s, o->id);
+  }
+  rec_release(s, o);
+  return ms;
+}
+/* tests: the process "dies" (the files stay as they are, nothing is finished) */
+static void rec_crash(Share *s, Rec *o) {
+  tf_ogg_abandon(&o->ogg);
+  rec_release(s, o);
+}
+
+uint32_t tf__share_serial; /* tests: the Ogg serial of the next recordings (0: random) */
+
+/* a new recording: its folder, session JSON, capture.json and first marker, the encoder and the stream's headers */
+static Rec *rec_open(TfClient *c, Share *s, int rate, const char *route, const char *revision, const char *contributor,
+                     const char *key, const char *rhash, const char *cv, const char *ch) {
+  Rec *x = (Rec *)calloc(1, sizeof *x);
+  if (!x) {
+    tf__fail(TF_ERR_NO_MEMORY, "out of memory");
+    return NULL;
+  }
+  uint8_t r[16];
+  tf_random_bytes(r, sizeof r);
+  tf_hex_encode(r, 16, x->id);
+  x->c = c;
+  x->input_rate = rate;
+  x->resample = rate != 48000;
+  x->created = now_s();
+  snprintf(x->contributor, sizeof x->contributor, "%s", contributor);
+  snprintf(x->consent_version, sizeof x->consent_version, "%s", cv);
+  snprintf(x->consent_hash, sizeof x->consent_hash, "%s", ch);
+  snprintf(x->revision, sizeof x->revision, "%s", revision);
+  x->n_takes = 1; /* the first take: {0, 0} */
+  char *dir = sess_path(s, x->id, NULL);
+  char *body = session_json(contributor, key, rhash, cv, ch, rate, route, revision);
+  if (!dir || !body || tf_mkdirs(dir) || write_text(s, x->id, "session.json", body)) {
+    free(dir);
+    free(body);
+    free(x);
+    tf__fail(TF_ERR_IO, "cannot write the sharing outbox");
+    return NULL;
+  }
+  free(body);
+  set_active(s, x->id, 1);
+  /* segment 1 opens with the rung in force when the capture starts */
+  const int bitrate = ladder_bitrate(s);
+  x->seg_bitrate = bitrate;
+  x->next_seg = 2;
+  x->next_start = tf_ogg_segment_start(2);
+  uint32_t serial;
+  tf_random_bytes((uint8_t *)&serial, sizeof serial);
+  if (tf__share_serial) serial = tf__share_serial;
+  char vendor[96];
+  snprintf(vendor, sizeof vendor, "QuranLab SDK %s %s", TF_SDK_VERSION, tf_opus_version());
+  int bad = (x->resample && tf_rs_init(&x->rs, rate)) || tf_enc_init(&x->enc, bitrate);
+  if (!bad) {
+    capture_save(x, 0, 0); /* after the encoder: it carries the pre-skip, which recovery needs for the duration */
+    marker_write(s, x->id, 1, bitrate, -1);
+    bad = tf_ogg_open(&x->ogg, dir, serial, x->enc.pre_skip, rate, vendor);
+  }
+  free(dir);
+  if (bad) {
+    rec_drop(s, x);
+    tf__fail(TF_ERR_ENGINE, "the Opus encoder or the Ogg writer could not start");
+    return NULL;
+  }
+  x->ogg.on_segment = on_segment;
+  x->ogg.user = x;
+  x->enc.before = before_packet;
+  x->enc.before_user = x;
+  x->opened = 1;
+  return x;
+}
+
+/* audio into the recording's stream; a failed write ends the recording for good (it is deleted when it closes) */
+static int rec_encode(Rec *o, const float *pcm, long long n) {
+  while (n > 0) {
+    const int k = n > 48000 ? 48000 : (int)n;
+    o->samples += k;
+    const int rc = o->resample ? tf_rs_process(&o->rs, pcm, k, put_samples, o) : tf_enc_encode(&o->enc, pcm, k, put_packet, o);
+    if (rc) {
+      o->failed = 1;
+      return -1;
+    }
+    pcm += k;
+    n -= k;
+  }
+  return 0;
+}
+
+/* The take's first audio is about to go into the recording: a joining take adds its boundary there, so a take
+ * without audio adds none. A boundary that would not be after the previous one (a take of under a millisecond
+ * before it) is left out too, its audio still joins: the list stays strictly increasing. */
+static void take_enter(Share *s, Rec *o, TfShareSession *x) {
+  x->entered = 1;
+  if (x->gap_ms < 0) return; /* the first take of the recording */
+  const long long start = rec_ms(o);
+  if (o->n_takes >= MAX_TAKES || start <= o->takes[o->n_takes - 1].start_ms) return;
+  o->takes[o->n_takes].start_ms = start;
+  o->takes[o->n_takes].gap_ms = x->gap_ms;
+  o->n_takes++;
+  takes_write(s, o);
+}
+
 TfShareSession *tf_sharing_session_begin(TfClient *c, int input_sample_rate, const char *input_route) {
   return tf__share_begin(c, input_sample_rate, input_route, NULL);
 }
 
-TfShareSession *tf__share_begin(TfClient *c, int input_sample_rate, const char *input_route, const char *revision) {
-  tf__clear_error();
-  Share *s = sh(c);
-  if (!s) {
-    tf__fail(TF_ERR_ARGUMENT, "no client");
-    return NULL;
-  }
+static TfShareSession *begin_locked(TfClient *c, Share *s, int rate, const char *input_route, const char *revision) {
+  Rec *o = s->open;
   if (!tf_client_sharing_state(c) || !tf__sharing_may_upload(c)) {
+    /* sharing went off while a recording waited for its next take: it ends now (nothing of it is kept without the
+     * learner's yes or the config's offer; with uploads only paused for this platform it waits in the queue) */
+    if (o && !o->take) rec_close(s, o);
     tf__fail(TF_ERR_NOT_AVAILABLE, "sharing is off (consent, the contributions option, flags.contributions or upload_trust)");
     return NULL;
   }
-  if (input_sample_rate < 8000 || input_sample_rate > 192000) {
-    tf__fail(TF_ERR_ARGUMENT, "input sample rate %d is not 8000 to 192000", input_sample_rate);
+  if (rate < 8000 || rate > 192000) {
+    tf__fail(TF_ERR_ARGUMENT, "input sample rate %d is not 8000 to 192000", rate);
     return NULL;
   }
   const char *route = "unknown";
@@ -436,119 +820,293 @@ TfShareSession *tf__share_begin(TfClient *c, int input_sample_rate, const char *
     tf__fail(TF_ERR_NOT_AVAILABLE, "the device key cannot be created");
     return NULL;
   }
+  char cv[40], ch[65];
+  tf__sharing_grant(c, cv, ch);
   TfShareSession *x = (TfShareSession *)calloc(1, sizeof *x);
   if (!x) {
     tf__fail(TF_ERR_NO_MEMORY, "out of memory");
     return NULL;
   }
-  uint8_t r[16];
-  tf_random_bytes(r, sizeof r);
-  tf_hex_encode(r, 16, x->id);
   x->c = c;
-  x->input_rate = input_sample_rate;
-  x->resample = input_sample_rate != 48000;
-  x->created = now_s();
-  char *dir = sess_path(s, x->id, NULL);
-  char *body = session_json(c, contributor, key, rhash, input_sample_rate, route, revision);
-  if (!dir || !body || tf_mkdirs(dir) || write_text(s, x->id, "session.json", body)) {
-    free(dir);
-    free(body);
+  x->input_rate = rate;
+  x->gap_ms = -1;
+  snprintf(x->route, sizeof x->route, "%s", route);
+  snprintf(x->revision, sizeof x->revision, "%s", revision ? revision : "");
+  if (o && !o->take) {
+    /* a recording waits in its join window: this take continues it, or ends it */
+    const long long gap = now_ms() - o->last_end;
+    const int win = join_window(c);
+    /* the uploader may have dropped the session under its capture (the server refused the upload, capped it or
+     * does not know it): nothing joins such a recording, and nothing of it is kept */
+    char *alive = sess_path(s, o->id, "capture.json");
+    if (!alive || !tf_file_exists(alive)) o->failed = 1;
+    free(alive);
+    if (win > 0 && gap <= win && !o->failed && o->input_rate == rate && rec_ms(o) < REC_CAP_MS && o->n_takes < MAX_TAKES &&
+        !strcmp(o->contributor, contributor) && !strcmp(o->consent_version, cv) && !strcmp(o->consent_hash, ch) &&
+        !strcmp(o->revision, x->revision)) {
+      timer_disarm(s);
+      x->rec = o;
+      o->take = x;
+      x->gap_ms = round_gap(gap);
+      x->holding = REC_CAP_MS - rec_ms(o) <= HOLD_MS;
+      return x;
+    }
+    rec_close(s, o);
+    o = NULL;
+  }
+  Rec *n = rec_open(c, s, rate, route, x->revision, contributor, key, rhash, cv, ch);
+  if (!n) {
     free(x);
-    tf__fail(TF_ERR_IO, "cannot write the sharing outbox");
     return NULL;
   }
-  free(body);
-  set_active(s, x->id, 1);
-  capture_save(x, 0, 0);
-  /* segment 1 opens with the rung in force when the capture starts */
-  const int bitrate = ladder_bitrate(s);
-  x->seg_bitrate = bitrate;
-  x->next_seg = 2;
-  x->next_start = tf_ogg_segment_start(2);
-  marker_write(s, x->id, 1, bitrate, -1);
-  uint32_t serial;
-  tf_random_bytes((uint8_t *)&serial, sizeof serial);
-  char vendor[96];
-  snprintf(vendor, sizeof vendor, "QuranLab SDK %s %s", TF_SDK_VERSION, tf_opus_version());
-  if ((x->resample && tf_rs_init(&x->rs, input_sample_rate)) || tf_enc_init(&x->enc, bitrate) ||
-      tf_ogg_open(&x->ogg, dir, serial, x->enc.pre_skip, input_sample_rate, vendor)) {
-    free(dir);
-    x->failed = 1;
-    tf_sharing_session_finish(x, 0);
-    tf__fail(TF_ERR_ENGINE, "the Opus encoder or the Ogg writer could not start");
-    return NULL;
-  }
-  free(dir);
-  x->ogg.on_segment = on_segment;
-  x->ogg.user = x;
-  x->enc.before = before_packet;
-  x->enc.before_user = x;
-  x->opened = 1;
+  /* A take begun while another take of this client runs (the calls allow it) records on its own, as before 2.0.3:
+   * its recording closes when it ends and no take joins it. */
+  n->standalone = o != NULL;
+  if (!n->standalone) s->open = n;
+  n->take = x;
+  x->rec = n;
+  x->entered = 1;
   return x;
+}
+
+TfShareSession *tf__share_begin(TfClient *c, int input_sample_rate, const char *input_route, const char *revision) {
+  tf__clear_error();
+  Share *s = sh(c);
+  if (!s) {
+    tf__fail(TF_ERR_ARGUMENT, "no client");
+    return NULL;
+  }
+  tf_mutex_lock(&s->rm);
+  TfShareSession *x = begin_locked(c, s, input_sample_rate, input_route, revision);
+  tf_mutex_unlock(&s->rm);
+  return x;
+}
+
+static void hold_free(TfShareSession *x) {
+  free(x->hold);
+  x->hold = NULL;
+  x->hold_n = x->hold_cap = 0;
+  x->holding = 0;
+}
+
+static int push_locked(Share *s, TfShareSession *x, const float *pcm, int n) {
+  Rec *o = x->rec;
+  if (!o || o->failed) return 0;
+  /* consent withdrawn during the take: nothing more is written and what the recording holds is deleted at once */
+  if (!tf_client_sharing_state(x->c)) {
+    hold_free(x);
+    rec_drop(s, o);
+    return 0;
+  }
+  if (x->holding) {
+    if (x->hold_n + n > x->hold_cap) {
+      long long cap = x->hold_cap ? x->hold_cap : 65536;
+      while (cap < x->hold_n + n) cap *= 2;
+      float *p = (float *)realloc(x->hold, sizeof(float) * (size_t)cap);
+      if (!p) { /* no memory to hold it: the recording closes without this take, which is not shared */
+        hold_free(x);
+        o->take = NULL;
+        x->rec = NULL;
+        rec_close(s, o);
+        return tf__fail(TF_ERR_NO_MEMORY, "out of memory");
+      }
+      x->hold = p;
+      x->hold_cap = cap;
+    }
+    memcpy(x->hold + x->hold_n, pcm, sizeof(float) * (size_t)n);
+    x->hold_n += n;
+    x->samples += n;
+    if (ms_of(o->samples, o->input_rate) + ms_of(x->hold_n, o->input_rate) <= REC_CAP_MS) return 0;
+    /* the held take outgrew the room under the cap: the recording closes without it, and the take starts a new
+     * recording with the held audio */
+    o->take = NULL;
+    x->rec = NULL;
+    x->holding = 0;
+    rec_close(s, o);
+    char contributor[33], key[90], rhash[65], cv[40], ch[65];
+    Rec *nr = NULL;
+    if (tf__sharing_may_upload(x->c) && !tf__contributor(tf__client_dir(x->c), 1, contributor, key, rhash)) {
+      tf__sharing_grant(x->c, cv, ch);
+      nr = rec_open(x->c, s, x->input_rate, x->route, x->revision, contributor, key, rhash, cv, ch);
+    }
+    int rc = 0;
+    if (nr) {
+      s->open = nr;
+      nr->take = x;
+      x->rec = nr;
+      x->gap_ms = -1;
+      x->entered = 1;
+      rc = rec_encode(nr, x->hold, x->hold_n);
+    }
+    hold_free(x);
+    tf__clear_error(); /* a recording that could not start is not an error of the take's audio */
+    return rc ? tf__fail(TF_ERR_IO, "the shared session could not be written") : 0;
+  }
+  if (!x->entered) take_enter(s, o, x);
+  x->samples += n;
+  if (rec_encode(o, pcm, n)) return tf__fail(TF_ERR_IO, "the shared session could not be written");
+  return 0;
 }
 
 int tf_sharing_session_push(TfShareSession *x, const float *pcm, int n) {
   if (!x || n < 0 || (n && !pcm)) return tf__fail(TF_ERR_ARGUMENT, "bad arguments");
-  if (x->failed || !n) return 0;
-  /* consent withdrawn mid-session: nothing more is written; finish() deletes what is unsent */
-  if (!tf_client_sharing_state(x->c)) {
-    x->failed = 1;
-    return 0;
-  }
-  x->samples += n;
-  const int rc = x->resample ? tf_rs_process(&x->rs, pcm, n, put_samples, x) : tf_enc_encode(&x->enc, pcm, n, put_packet, x);
-  if (rc) {
-    x->failed = 1;
-    return tf__fail(TF_ERR_IO, "the shared session could not be written");
-  }
-  return 0;
+  Share *s = sh(x->c);
+  if (!s || !n) return 0;
+  tf_mutex_lock(&s->rm);
+  const int rc = push_locked(s, x, pcm, n);
+  tf_mutex_unlock(&s->rm);
+  return rc;
 }
 
-/* the end of the session: the last segment and capture.json; a failed, withdrawn, or cancelled session (completed
- * 0) shorter than 2 s with no segment closed is deleted. Returns the milliseconds shared (0: nothing). */
+/* The end of a take. Its recording stays open for the join window (the next take may continue it) unless nothing
+ * could join it any more: no audio, a window of 0, the app in the background, the cap or the take limit reached,
+ * a take that recorded on its own. Returns the take's milliseconds that went into a recording (0: nothing, also
+ * when the recording was dropped here: sharing off, a failed write, a cancelled take under 2 s with nothing to
+ * join). A cancelled take (completed 0) that waits in the window may still be dropped when its recording closes. */
+static int finish_locked(Share *s, TfShareSession *x, int completed) {
+  Rec *o = x->rec;
+  if (!o) return 0;
+  const int on = tf_client_sharing_state(x->c);
+  if (x->holding) {
+    /* the held take ended within the room under the cap: it joins */
+    x->holding = 0;
+    if (x->hold_n > 0 && on && !o->failed) {
+      take_enter(s, o, x);
+      rec_encode(o, x->hold, x->hold_n);
+    }
+  }
+  const long long now = now_ms();
+  if (x->samples > 0) {
+    o->completed = completed;
+    o->last_end = now;
+  }
+  o->take = NULL;
+  x->rec = NULL;
+  const int take_ms = (int)((double)x->samples / x->input_rate * 1000 + 0.5);
+  if (o->failed || !on) {
+    rec_drop(s, o);
+    return 0;
+  }
+  const int win = join_window(x->c);
+  const long long waited = now - o->last_end;
+  if (!o->standalone && o->samples > 0 && win > 0 && !o->close_at_end && rec_ms(o) < REC_CAP_MS && o->n_takes < MAX_TAKES &&
+      waited <= win) {
+    timer_arm(s, win - (waited > 0 ? waited : 0));
+    return take_ms;
+  }
+  return rec_close(s, o) ? take_ms : 0;
+}
+
 int tf_sharing_session_finish(TfShareSession *x, int completed) {
   if (!x) return 0;
   Share *s = sh(x->c);
   int ms = 0;
-  const double dur = x->input_rate ? (double)x->samples / x->input_rate : 0;
-  const int keep = x->opened && !x->failed && tf_client_sharing_state(x->c) && dur > 0 && (completed || dur >= MIN_PARTIAL_S || x->closed > 0);
-  if (keep) {
-    int rc = x->resample ? tf_rs_flush(&x->rs, put_samples, x) : 0;
-    if (!rc) rc = tf_enc_flush(&x->enc, put_packet, x);
-    if (!rc) rc = tf_ogg_finish(&x->ogg, tf_enc_final_granule(&x->enc));
-    if (!rc) {
-      capture_save(x, 1, completed);
-      ms = (int)(dur * 1000 + 0.5);
-    } else {
-      tf_ogg_abandon(&x->ogg);
-      remove_session(s, x->id);
-    }
-  } else {
-    if (x->opened) tf_ogg_abandon(&x->ogg);
-    if (x->closed > 0 && tf_client_sharing_state(x->c) && !x->failed) {
-      capture_save(x, 1, 0); /* closed segments stay with the outbox */
-    } else {
-      remove_session(s, x->id);
-    }
+  if (s) {
+    tf_mutex_lock(&s->rm);
+    ms = finish_locked(s, x, completed);
+    tf_mutex_unlock(&s->rm);
   }
-  if (x->resample) tf_rs_free(&x->rs);
-  tf_enc_free(&x->enc);
-  set_active(s, x->id, 0);
-  wake(s);
+  free(x->hold);
   free(x);
   return ms;
 }
 
-/* tests: the process "dies" mid-session (files stay as they are, nothing is finished) */
+/* The join window's end, and every other moment something may have ended the wait (the timer's prompt, a new
+ * signed config): the open recording closes once the clock says the window passed, or sharing went off, or the
+ * window is now 0; otherwise the timer is set for the rest. A clock that went backwards since the take ended
+ * closes it too: the wait cannot be measured any more. */
+void tf__share_window_check(TfClient *c) {
+  Share *s = sh(c);
+  if (!s) return;
+  tf_mutex_lock(&s->rm);
+  Rec *o = s->open;
+  if (o && !o->take) {
+    const int win = join_window(c);
+    const long long waited = now_ms() - o->last_end;
+    if (win <= 0 || waited > win || waited < 0 || !tf_client_sharing_state(c) || !tf__sharing_may_upload(c)) rec_close(s, o);
+    else timer_arm(s, win - waited);
+  }
+  tf_mutex_unlock(&s->rm);
+}
+
+/* The open recording ends now instead of at the end of its join window (the app goes to the background, or knows
+ * that no take follows); with a take running, when that take ends. */
+static void recorder_end(Share *s) {
+  tf_mutex_lock(&s->rm);
+  Rec *o = s->open;
+  if (o && o->take) o->close_at_end = 1;
+  else if (o) rec_close(s, o);
+  tf_mutex_unlock(&s->rm);
+}
+void tf__share_background(TfClient *c) {
+  Share *s = sh(c);
+  if (s) recorder_end(s);
+}
+int tf_sharing_recording_close(TfClient *c) {
+  Share *s = sh(c);
+  if (!s) return tf__fail(TF_ERR_ARGUMENT, "no client");
+  recorder_end(s);
+  return 0;
+}
+/* sharing went off, or what was shared was deleted: the open recording ends at once, whatever its take does, and
+ * nothing of it is kept (the take's later pushes record nothing) */
+static void recorder_stop(Share *s) {
+  tf_mutex_lock(&s->rm);
+  if (s->open) {
+    if (s->open->take) hold_free(s->open->take);
+    rec_drop(s, s->open);
+  }
+  tf_mutex_unlock(&s->rm);
+}
+/* the client is closing: the open recording ends as when its window ends; a take still running on it is over for
+ * sharing (and counts as not completed) */
+static void recorder_free(Share *s) {
+  tf_mutex_lock(&s->rm);
+  Rec *o = s->open;
+  if (o) {
+    if (o->take) {
+      if (o->take->samples > 0) o->completed = 0;
+      o->take->c = NULL;
+      hold_free(o->take);
+    }
+    rec_close(s, o);
+  }
+  tf_mutex_unlock(&s->rm);
+}
+
+/* tests: the process "dies" during a take, or between two takes (files stay as they are, nothing is finished) */
 void tf__share_crash(TfShareSession *x) {
   if (!x) return;
-  if (x->ogg.file) fclose(x->ogg.file);
-  x->ogg.file = NULL;
-  for (int i = 0; i < x->ogg.n_q; ++i) free(x->ogg.q[i]);
-  if (x->resample) tf_rs_free(&x->rs);
-  tf_enc_free(&x->enc);
-  set_active(sh(x->c), x->id, 0);
+  Share *s = sh(x->c);
+  if (s) {
+    tf_mutex_lock(&s->rm);
+    if (x->rec) rec_crash(s, x->rec);
+    tf_mutex_unlock(&s->rm);
+  }
+  free(x->hold);
   free(x);
+}
+void tf__share_crash_open(TfClient *c) {
+  Share *s = sh(c);
+  if (!s) return;
+  tf_mutex_lock(&s->rm);
+  if (s->open) rec_crash(s, s->open);
+  tf_mutex_unlock(&s->rm);
+}
+/* tests: the join window in force; the open recording's id, takes and input samples (0 when none is open) */
+int tf__share_join_ms(TfClient *c) { return join_window(c); }
+int tf__share_open(TfClient *c, char id[33], int *takes, long long *samples) {
+  Share *s = sh(c);
+  if (!s) return 0;
+  tf_mutex_lock(&s->rm);
+  const Rec *o = s->open;
+  if (o) {
+    if (id) snprintf(id, 33, "%s", o->id);
+    if (takes) *takes = o->n_takes;
+    if (samples) *samples = o->samples;
+  }
+  tf_mutex_unlock(&s->rm);
+  return o != NULL;
 }
 
 /* ------------------------------------------------------------------ recovery of a session whose capture died */
@@ -596,11 +1154,15 @@ static size_t whole_pages(const uint8_t *d, size_t n, int *audio, long long *las
 static void recover(Share *s, const char *id, const TfJson *cap) {
   const int closed = tf_json_get(cap, "closed") ? (int)tf_json_get(cap, "closed")->num : 0;
   const long long created = tf_json_get(cap, "created") ? (long long)tf_json_get(cap, "created")->num : now_s();
+  /* the stream's pre-skip, as the capture recorded it (a capture.json from before 2.0.3 has none: libopus's) */
+  const TfJson *ps = tf_json_get(cap, "pre_skip");
+  const long long pre_skip = ps && ps->type == TJ_NUM && ps->num > 0 ? (long long)ps->num : PRE_SKIP_DEFAULT;
   char name[32];
   snprintf(name, sizeof name, "seg-%05d.opus", closed + 1);
   char *p = sess_path(s, id, name), *data = NULL;
   size_t n = 0;
   int kept = closed;
+  long long last_granule = -1;
   if (p && !tf_read_file(p, &data, &n)) {
     int audio = 0;
     long long granule = 0;
@@ -608,6 +1170,7 @@ static void recover(Share *s, const char *id, const TfJson *cap) {
     if (audio > 0) {
       tf_write_file(p, data, good);
       kept = closed + 1;
+      last_granule = granule;
       /* the segment closes at its last whole page, with the bitrate its marker recorded when it opened */
       int br = 0;
       marker_read(s, id, kept, &br, NULL);
@@ -622,9 +1185,14 @@ static void recover(Share *s, const char *id, const TfJson *cap) {
     remove_session(s, id);
     return;
   }
-  char t[256];
-  snprintf(t, sizeof t, "{\"v\":1,\"created\":%lld,\"closed\":%d,\"ended\":true,\"completed\":false,\"duration_ms\":0,\"recovered\":true}",
-           created, kept);
+  /* what was kept: up to the last whole page. The take list (2.0.3) keeps the takes that begin before it. */
+  if (last_granule < 0) marker_read(s, id, kept, NULL, &last_granule);
+  const long long duration_ms = last_granule > pre_skip ? (last_granule - pre_skip) / 48 : 0;
+  takes_trim(s, id, duration_ms);
+  char t[320];
+  snprintf(t, sizeof t,
+           "{\"v\":1,\"created\":%lld,\"closed\":%d,\"ended\":true,\"completed\":false,\"duration_ms\":%lld,\"pre_skip\":%lld,\"recovered\":true}",
+           created, kept, duration_ms, pre_skip);
   write_text(s, id, "capture.json", t);
 }
 
@@ -641,6 +1209,11 @@ typedef struct {
   int cap;
   Url *urls;
   char error[160];
+  /* 2.0.3: every segment went up (the session is uploaded and counted); only the take list is still to send. The
+   * folder then holds this file and takes.json alone, so the recording's contributor and age are kept here. */
+  int uploaded;
+  char contributor[33];
+  long long created;
 } Item;
 
 static void item_free(Item *it) {
@@ -697,6 +1270,10 @@ static void item_load(Share *s, const char *id, Item *it) {
   if ((v = tf_json_get(j, "next_at")) && v->type == TJ_NUM) it->next_at = (long long)v->num;
   const char *e = tf_json_str(tf_json_get(j, "error"));
   if (e) snprintf(it->error, sizeof it->error, "%s", e);
+  if ((v = tf_json_get(j, "done")) && v->type == TJ_BOOL) it->uploaded = v->boolean;
+  if ((v = tf_json_get(j, "created")) && v->type == TJ_NUM) it->created = (long long)v->num;
+  const char *ct = tf_json_str(tf_json_get(j, "contributor"));
+  if (ct && is_id(ct)) snprintf(it->contributor, sizeof it->contributor, "%s", ct);
   const TfJson *up = tf_json_get(j, "uploaded");
   for (int i = 0; up && up->type == TJ_ARR && i < up->n; ++i) item_mark(it, (int)up->kids[i].num);
   const TfJson *us = tf_json_get(j, "urls");
@@ -713,6 +1290,7 @@ static void item_save(Share *s, const char *id, const Item *it) {
   tf_buf_printf(&b, "{\"v\":1,\"started\":%s,\"attempts\":%d,\"next_at\":%lld,\"error\":", it->started ? "true" : "false", it->attempts,
                 it->next_at);
   tf_buf_json_str(&b, it->error);
+  if (it->uploaded) tf_buf_printf(&b, ",\"done\":true,\"contributor\":\"%s\",\"created\":%lld", it->contributor, it->created);
   tf_buf_puts(&b, ",\"uploaded\":[");
   int first = 1;
   for (int n = 0; n < it->cap; ++n)
@@ -850,11 +1428,89 @@ static int put_segment(Share *s, const char *id, int n, const char *url, int *st
   return rc;
 }
 
+/* The take list of an uploaded recording (2.0.3): POST /v1/uploads/{id}/takes with the token and the recording's
+ * own contributor, body {"takes":[...]} (takes.json). Idempotent on the server (the list replaces an earlier one),
+ * so every retry sends the same body. 2xx: done. 404 (a server without the route, or one that does not know the
+ * upload): the list is dropped, logged once per client. 400: dropped, and the bad-request issue. 410 (the upload
+ * was deleted): dropped. 401: a new token, then again (at once, a few times). Anything else (429, 5xx, no
+ * connection): again later, with the outbox's backoff. The session itself is uploaded whatever happens here, and
+ * the bitrate ladder never hears of this call. Returns 1 when the pass should stop (no connection). */
+static int step_takes(TfClient *c, Share *s, const char *id, Item *it) {
+  if (now_s() - it->created > MAX_AGE_S) { /* a list that could not be sent for 7 days */
+    remove_session(s, id);
+    return 0;
+  }
+  if (it->next_at > now_s()) return 0;
+  char *body = takes_body(s, id, -1, NULL);
+  if (!body || !it->contributor[0]) {
+    free(body);
+    remove_session(s, id);
+    return 0;
+  }
+  char path[96], hdr[80];
+  snprintf(path, sizeof path, "/v1/uploads/%s/takes", id);
+  snprintf(hdr, sizeof hdr, "x-qlab-contributor: %s", it->contributor);
+  it->attempts++;
+  TfHttpResponse r;
+  memset(&r, 0, sizeof r);
+  const int rc = tf__client_call(c, "POST", path, body, 1, hdr, &r);
+  free(body);
+  if (rc) {
+    retry(it, "takes: offline", 0, 0);
+    item_save(s, id, it);
+    return 1;
+  }
+  const int st = r.status;
+  tf_http_response_free(&r);
+  if ((st >= 200 && st < 300) || st == 404 || st == 400 || st == 410) {
+    if (st == 404 && !s->takes_404) {
+      s->takes_404 = 1;
+      tf__client_log(c, TF_LOG_INFO, "the server has no take list for this upload (HTTP 404): the take boundaries are not sent");
+    }
+    if (st == 400) tf_client_report_issue(c, "other", "bad_request:takes", NULL);
+    remove_session(s, id);
+    return 0;
+  }
+  char why[48];
+  snprintf(why, sizeof why, "takes: HTTP %d", st);
+  if (st == 401) tf__client_token_forget(c);
+  retry(it, why, st == 401 && it->attempts < 3, 0);
+  item_save(s, id, it);
+  return 0;
+}
+/* every file of a session folder but item.json and takes.json */
+static void keep_item_and_takes(const Share *s, const char *id) {
+  char *d = sess_path(s, id, NULL);
+  if (!d) return;
+  char names[256][64];
+  for (int round = 0; round < 64; ++round) {
+    const int n = list_dir(d, names, 256);
+    int removed = 0;
+    for (int i = 0; i < n; ++i) {
+      if (!strcmp(names[i], "item.json") || !strcmp(names[i], "takes.json")) continue;
+      char *f = tf_path_join(d, names[i]);
+      if (f) removed += remove(f) == 0;
+      free(f);
+    }
+    if (!removed) break;
+  }
+  free(d);
+}
+
 /* moves one session on as far as it goes now; 0 continue with the next session, 1 stop the pass (offline) */
 static int step(TfClient *c, Share *s, const char *id) {
   tf_mutex_lock(&s->m);
   const int active = is_active(s, id);
   tf_mutex_unlock(&s->m);
+  {
+    /* an uploaded recording whose take list is still to send (2.0.3) */
+    Item list;
+    item_load(s, id, &list);
+    const int waiting = list.uploaded;
+    const int stop_now = waiting ? step_takes(c, s, id, &list) : 0;
+    item_free(&list);
+    if (waiting) return stop_now;
+  }
   TfJson *cap = read_json(s, id, "capture.json");
   if (!cap && !active) {
     SLEEP_SHORT(); /* a replace in progress on Windows can fail a read for a moment */
@@ -1001,11 +1657,35 @@ static int step(TfClient *c, Share *s, const char *id) {
   {
     int all = 1;
     for (int n = 1; n <= closed; ++n) all = all && item_done(&it, n);
-    if (all) { /* uploaded: nothing is kept */
-      item_free(&it);
-      remove_session(s, id);
+    if (all) { /* uploaded: nothing is kept, except a take list still to send (2.0.3) */
+      char *list = takes_body(s, id, -1, NULL);
+      TfJson *sj = list ? read_json(s, id, "session.json") : NULL;
+      const char *ctr = tf_json_str(tf_json_get(sj, "contributor"));
+      if (!list || !ctr || !is_id(ctr)) { /* one take (or a list that does not read): the folder goes */
+        tf_json_free(sj);
+        free(list);
+        item_free(&it);
+        remove_session(s, id);
+        tf__sharing_uploaded(c);
+        return 0;
+      }
+      free(list);
+      /* the session is uploaded now, whatever becomes of the list: item.json says so first (a crash after this
+       * line sends the list at the next launch), then the session's other files go and it is counted */
+      it.uploaded = 1;
+      it.created = created;
+      snprintf(it.contributor, sizeof it.contributor, "%s", ctr);
+      tf_json_free(sj);
+      it.attempts = 0;
+      it.next_at = 0;
+      it.error[0] = 0;
+      while (it.n_urls) item_drop_url(&it, it.urls[0].n);
+      item_save(s, id, &it);
+      keep_item_and_takes(s, id);
       tf__sharing_uploaded(c);
-      return 0;
+      stop = step_takes(c, s, id, &it);
+      item_free(&it);
+      return stop;
     }
   }
 out:
@@ -1099,13 +1779,41 @@ int tf_sharing_outbox_resume(TfClient *c) {
   return 0;
 }
 
+/* an uploaded recording that only waits for its take list to go (2.0.3) */
+static int list_waiting(const Share *s, const char *id) {
+  TfJson *j = read_json(s, id, "item.json");
+  const TfJson *d = tf_json_get(j, "done");
+  const int v = d && d->type == TJ_BOOL && d->boolean;
+  tf_json_free(j);
+  return v;
+}
+
 int tf_sharing_outbox_pending(TfClient *c) {
   Share *s = sh(c);
   if (!s) return tf__fail(TF_ERR_ARGUMENT, "no client");
   char names[256][64];
   const int n = list_dir(s->outbox, names, 256);
   int k = 0;
-  for (int i = 0; i < n; ++i) k += is_id(names[i]);
+  for (int i = 0; i < n; ++i) k += is_id(names[i]) && !list_waiting(s, names[i]);
+  return k;
+}
+/* tests: upload passes finished so far */
+int tf__share_passes(TfClient *c) {
+  Share *s = sh(c);
+  if (!s) return 0;
+  tf_mutex_lock(&s->m);
+  const int n = s->passes;
+  tf_mutex_unlock(&s->m);
+  return n;
+}
+/* tests: uploaded recordings whose take list is still to send */
+int tf__share_lists_waiting(TfClient *c) {
+  Share *s = sh(c);
+  if (!s) return 0;
+  char names[256][64];
+  const int n = list_dir(s->outbox, names, 256);
+  int k = 0;
+  for (int i = 0; i < n; ++i) k += is_id(names[i]) && list_waiting(s, names[i]);
   return k;
 }
 
@@ -1158,7 +1866,8 @@ int tf_sharing_bitrate(TfClient *c) {
 }
 
 /* the outbox's items, oldest first: [{"id","created","ended","completed","segments","uploaded","segmentBitrates":
- * [...],"error"}] (segmentBitrates: one per closed segment, in segment order) */
+ * [...],"takes","error"}] (segmentBitrates: one per closed segment, in segment order; takes: how many takes the
+ * recording holds so far, 1 for a single take) */
 char *tf_sharing_outbox_json(TfClient *c) {
   Share *s = sh(c);
   if (!s) {
@@ -1204,7 +1913,9 @@ char *tf_sharing_outbox_json(TfClient *c) {
       marker_read(s, id, k, &br, NULL);
       tf_buf_printf(&b, "%s%d", k > 1 ? "," : "", br);
     }
-    tf_buf_puts(&b, "],\"error\":");
+    int n_takes = 1;
+    free(takes_body(s, id, -1, &n_takes));
+    tf_buf_printf(&b, "],\"takes\":%d,\"error\":", n_takes);
     tf_buf_json_str(&b, it.error);
     tf_buf_puts(&b, "}");
     first = 0;
@@ -1215,11 +1926,14 @@ char *tf_sharing_outbox_json(TfClient *c) {
   return tf_buf_take(&b);
 }
 
-/* sharing went off (or what was shared was deleted): the PUT in flight is aborted and every session not being
- * captured is deleted at once (a capture sees consent gone at its next push and deletes its own) */
+/* sharing went off (or what was shared was deleted): the open recording ends at once (also between two takes,
+ * when no push would notice), the PUT in flight is aborted and every session not being captured is deleted, a
+ * take list waiting to be sent with them (a take that records on its own sees consent gone at its next push and
+ * deletes its own) */
 void tf__share_wipe(TfClient *c) {
   Share *s = sh(c);
   if (!s) return;
+  recorder_stop(s);
   tf__http_cancel(&s->cancel);
   char names[256][64];
   const int n = list_dir(s->outbox, names, 256);

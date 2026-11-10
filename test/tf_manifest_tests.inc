@@ -122,7 +122,7 @@ static int manifest_tests(const char *data, const char *work) {
     tf_hex_encode(h, 8, id);
     CHECK(!strcmp(id, "660a07197c4808da"), "pinned key id %s, want 660a07197c4808da", id);
   }
-  CHECK(!strcmp(tf_version(), "2.0.2") && !strcmp(TF_SDK_VERSION, "2.0.2"), "version %s", tf_version());
+  CHECK(!strcmp(tf_version(), "2.0.3") && !strcmp(TF_SDK_VERSION, "2.0.3"), "version %s", tf_version());
   for (int b = 0; b < 2; ++b) {
     const int has_tol = b == 0;
     char *path = tf_path_join(data, kMfBuilds[b]);

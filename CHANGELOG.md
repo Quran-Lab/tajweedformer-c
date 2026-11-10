@@ -1,5 +1,46 @@
 # Changelog
 
+## 2.0.3
+
+Takes in a row share one recording. An app often stops and starts its takes while the learner is still reciting,
+so shared recordings began or ended in the middle of speech. A take (`tf_sharing_session_begin` to `tf_sharing_session_finish`, or one take of a `TfStream` made with a client), your code and what a learner is asked do not
+change.
+
+- The join window. When a take ends while the learner shares, the shared recording (its Ogg stream, its item in the
+  outbox, its upload) stays open for a few seconds: `flags.share_join_ms` of Quran Lab's signed config, a whole number
+  from 0 to 10000 ms; 3000 when the flag is absent; 0 never joins, which is 2.0.2's behaviour. A take that starts
+  within the window at the same input sample rate, with the same contributor, consent and model, continues the same
+  stream: no new headers, the encoder and the resampler keep their state, segments are cut by the same plan counted
+  across the takes, the bitrate ladder applies as before. The pause between the takes gets no audio. The bytes are
+  those of one continuous encode of the same audio.
+- Otherwise the recording closes as a session ended in 2.0.2 and the take starts a new one. It also closes at once
+  when the window passes (a timer thread of the client; the wall clock decides), at `tf_client_background`, at the
+  new `tf_sharing_recording_close(c)`, at `tf_client_destroy`, when sharing is turned off (the queue is deleted,
+  the open recording with it), and at 20 minutes of audio or 256 takes. `completed` is the last take's; the 2 s
+  minimum of a cancelled session counts the whole recording.
+- The 20 minute cap never cuts a take. With 30 s or less of room, a joining take is held in memory until it ends: it
+  joins when it fits, else the recording closes without it and the take starts a new one with all its audio.
+- Take boundaries. A recording of two or more takes keeps where each take starts in the stream and the pause before
+  it (rounded to 100 ms), and sends them once after its last segment: `POST /v1/uploads/{id}/takes`. The recording is
+  uploaded when its segments are, whatever becomes of that list: a server without the route (404) or a deleted
+  upload (410) drops it, a refused list (400) drops it with an issue report, 401 renews the token, and 429, 5xx or
+  no answer keep it for a retry with the same body, also after a restart. A recording of one take sends nothing.
+- A process that died between takes or inside one: the recording is closed at its last whole page, as before, and its take list keeps the takes that
+  start inside what was recovered.
+- API: `tf_sharing_recording_close(c)` (no take follows: close the recording now; with a take running, when it
+  ends); `tf_sharing_session_finish` returns the take's milliseconds that went into a recording;
+  `tf_sharing_outbox_json` adds `takes`; `TF_SHARING_JOIN_MS_DEFAULT`, `TF_SHARING_JOIN_MS_MAX` and
+  `TF_SHARING_RECORDING_MAX_S`. The calls are in `docs/api.md`.
+- Fixed: a session recovered after a crash reported a duration of 0; it now has its real duration.
+- Usable as a CMake subproject: an app can take the repository by tag with `FetchContent` (or `add_subdirectory`)
+  and link `tajweedformer`. Nothing is built unless the app links it, the engine's release configuration is the
+  default there, and the tests and checks stay with builds of the repository itself. Before, the project only
+  configured as the top-level one. The README's install is now that `CMakeLists.txt`, and CI builds it.
+- Unchanged: consent (a yes is never asked again, at most three asks; the ask after a finished take leaves the
+  recording open), one upload at a time and in order, the bitrate ladder, stopping and deleting. Telemetry counts a
+  session per take.
+- `docs/platform-client.md`: the 2.0.3 text.
+
 ## 2.0.2
 
 - Fixed: model manifests with a `golden_tolerance` field did not verify. `tf_model_open` and the model download built the signed text without the
