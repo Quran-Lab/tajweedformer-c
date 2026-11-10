@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.0.2
+
+- Fixed: model manifests with a `golden_tolerance` field did not verify. `tf_model_open` and the model download built the signed text without the
+  `golden_tolerance` lines that the signature covers, so the current V4 build (4.0.0, the build with the CoreML
+  programs and deltas) was refused as unsigned; manifests without the field were not affected. The signed text now
+  has one `golden_tolerance <build> <tokens> <sites> <words>` line per build, sorted by the build key's bytes, after
+  the header lines, exactly as Quran Lab signs it. A manifest whose signature does not cover a tolerance still
+  verifies without it, and the tolerance is then ignored.
+- Fixed: `tf_download_model` refused any build whose `min_sdk_version` is above 2.0.0 (the current V4 build needs
+  2.0.1); it now accepts every build up to this SDK's version, as `tf_model_open` does.
+- Tests on the two real signed V4 manifests (both builds): each verifies with the pinned key, and one changed byte
+  in a header value, a tolerance value or a file line is refused. The same cross-check runs in every
+  TajweedFormer SDK.
+- `docs/platform-client.md`: the 2.0.2 text (the accelerator failover rules of the Android and Apple SDKs; nothing
+  changes for this SDK, which has no accelerator).
+
 ## 2.0.1
 
 - Recitation sharing is offered where Quran Lab decides, per app, in the signed config (the consent ask

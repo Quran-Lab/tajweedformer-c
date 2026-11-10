@@ -35,6 +35,10 @@ F3 = ["model_id", "family", "revision", "min_sdk_version", "engine_format", "cor
 def signed_text3(m):
     nl = chr(10)
     t = "quranlab-model-manifest 3" + nl + "".join(f"{k} {m[k]}" + nl for k in F3) + "contexts " + ",".join(m["contexts"]) + nl
+    # golden_tolerance (signed since SDK 2.0.1): one line per build, sorted by the build key's UTF-8 bytes; none when absent
+    gt = m.get("golden_tolerance") or {}
+    for b in sorted(gt, key=lambda k: k.encode()):
+        t += f"golden_tolerance {b} {gt[b]['token_diffs']} {gt[b]['site_flag_diffs']} {gt[b]['word_flag_diffs']}" + nl
     order = ["android", "apple", "web", "native"]
     for f in sorted(m["files"], key=lambda f: f["path"].encode()):
         pl = "*" if "*" in f["platforms"] else ",".join(x for x in order if x in f["platforms"])

@@ -1020,7 +1020,7 @@ static int telemetry_tests(const char *dir, const char *fx_folder, const char *f
   CHECK(tf_client_background(c) == 0 && events_seen() == 1, "503: %d events", events_seen());
   TfJson *b0 = event_body(0);
   CHECK(b0 && is_hex32(tf_json_str(tf_json_get(b0, "report_id"))) && jnum(b0, "launches") == 1 && !strcmp(tf_json_str(tf_json_get(b0, "day")), "2026-11-09") &&
-            !strcmp(tf_json_str(tf_json_get(b0, "sdk_version")), "2.0.1") && tf_json_get(b0, "cohorts") && tf_json_get(b0, "cohorts")->n == 0,
+            !strcmp(tf_json_str(tf_json_get(b0, "sdk_version")), "2.0.2") && tf_json_get(b0, "cohorts") && tf_json_get(b0, "cohorts")->n == 0,
         "the launch delta: %s", g_ts.bodies[0] ? g_ts.bodies[0] : "NULL");
   CHECK(count_files(d, "report-") == 1, "the delta is kept on disk");
   tf_client_background(c);
@@ -1366,7 +1366,7 @@ static int sdk_latest_tests(const char *configs, const char *dir, const char *fx
   if (!g_sl.fx) return 2;
   tf_mkdirs(dir);
   tf_http_set_transport(sl_stub, NULL);
-  static const char want[] = "Quran Lab SDK 2.0.2 is available (recommended), you have 2.0.1: https://github.com/Quran-Lab/tajweedformer-c/releases";
+  static const char want[] = "Quran Lab SDK 2.0.3 is available (recommended), you have 2.0.2: https://github.com/Quran-Lab/tajweedformer-c/releases";
   char d[1100];
   /* newer: one line at launch; a second newer config (a refresh) adds none */
   snprintf(d, sizeof d, "%s/newer", dir);

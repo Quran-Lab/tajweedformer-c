@@ -136,7 +136,7 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
   wchar_t full[8192];
   _snwprintf(full, 8192, L"%s%s", path, extra);
   full[8191] = 0;
-  ses = WinHttpOpen(L"TajweedFormer-native/2.0.1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+  ses = WinHttpOpen(L"TajweedFormer-native/2.0.2", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
                     WINHTTP_NO_PROXY_BYPASS, 0);
   if (!ses) {
     tf__fail(TF_ERR_NETWORK, "WinHttpOpen failed (%lu)", GetLastError());

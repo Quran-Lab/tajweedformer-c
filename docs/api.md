@@ -1,4 +1,4 @@
-# The C API: `tajweedformer.h` (SDK 2.0.1)
+# The C API: `tajweedformer.h` (SDK 2.0.2)
 
 One library for Windows and Linux apps and for servers: `tajweedformer.dll` / `libtajweedformer.so` (or the static
 library), with `include/tajweedformer.h` and the engine's `zf_tajweed.h`. It runs the V4 TajweedFormer model only
@@ -20,7 +20,7 @@ puts(tf_model_info_json(m));    /* model id, revision, contexts, chunk length, t
 
 `tf_model_open` refuses anything that is not a verified V4 folder: manifest format 3 (layout 3: one shared
 `layers.zfw` and `frontend.zfw`, a `frames.zfw` per context; engine format 3) or format 2 (a folder per context;
-engine format 2), family `tajweedformer`, `min_sdk_version` at most 2.0.1, an Ed25519 signature by Quran Lab's key (key id
+engine format 2), family `tajweedformer`, `min_sdk_version` at most 2.0.2, an Ed25519 signature by Quran Lab's key (key id
 `660a07197c4808da`), and every file it reads matching its size and SHA-256. A file the manifest does not list is
 never opened. Errors: `signature_invalid`, `signature_required`, `checksum_mismatch`, `not_listed`,
 `sdk_too_old`, `unsupported_model`, `calibration_invalid`.

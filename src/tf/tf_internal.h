@@ -114,6 +114,19 @@ const char *tf__model_context(const struct TfModel *m);
 void tf__model_word_effective(const struct TfModel *m, int *enabled, double *threshold, char *preset, size_t preset_n,
                               char *source, size_t source_n);
 
+/* ---- the signed model manifest (tf_model.c; the downloader verifies with the same code) ---- */
+extern const char *const TF_QURANLAB_KEY_HEX;
+/* The text the signature covers; format 3 with with_tolerance carries the golden_tolerance lines. Caller frees. */
+char *tf_manifest_signed_text(const TfJson *m); /* with the golden_tolerance lines */
+char *tf_manifest_signed_text_ex(const TfJson *m, int with_tolerance);
+int tf_manifest_has_tolerance(const TfJson *m);
+/* 1 when the signature verifies with key_hex: with the golden_tolerance lines, or (field present) without them,
+ * when *tolerance_signed (may be NULL) is 0 and the tolerance counts as absent. 0 otherwise. */
+int tf_manifest_verify_signature_ex(const TfJson *m, const char *key_hex, int *tolerance_signed);
+int tf_manifest_verify_signature(const TfJson *m, const char *key_hex);
+/* 1 when dotted version v is min or newer */
+int tf__version_at_least(const char *v, const char *min);
+
 double tf__now_s(void);
 const char *tf__platform_name(void);
 

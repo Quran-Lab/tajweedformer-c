@@ -1,4 +1,4 @@
-/* tajweedformer.h: the TajweedFormer SDK for Windows and Linux (C API, SDK 2.0.1).
+/* tajweedformer.h: the TajweedFormer SDK for Windows and Linux (C API, SDK 2.0.2).
  *
  * The exact engine (bit for bit the reference arithmetic) runs the V4 TajweedFormer model from a
  * verified model folder (sdk/v4.0), and this library gives every layer of what it computes:
@@ -52,7 +52,7 @@ extern "C" {
 #define TF_API
 #endif
 
-#define TF_SDK_VERSION "2.0.1"
+#define TF_SDK_VERSION "2.0.2"
 #define TF_API_VERSION 1
 
 typedef enum {
@@ -77,7 +77,7 @@ typedef enum {
   TF_ERR_CONFIG = -18            /* a remote config failed verification (signature, key id, expiry) */
 } TfError;
 
-TF_API const char *tf_version(void); /* "2.0.1" */
+TF_API const char *tf_version(void); /* "2.0.2" */
 TF_API int tf_api_version(void);
 TF_API const char *tf_error_name(int code); /* "signature_invalid", ... */
 TF_API const char *tf_last_error(void);     /* this thread's last failure, or NULL */

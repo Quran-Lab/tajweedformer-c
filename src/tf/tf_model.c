@@ -102,8 +102,37 @@ static const char *field_str(const TfJson *m, const char *k, TfBuf *num) {
   return "?";
 }
 
-/* The exact text the signature covers (make_manifest.py signed_text, format 2; make_manifest3.py, format 3). */
-char *tf_manifest_signed_text(const TfJson *m) {
+/* cmp for golden_tolerance entries: the build key's UTF-8 bytes (strcmp compares as unsigned char) */
+static int cmp_key(const void *a, const void *b) {
+  return strcmp((*(const TfJson *const *)a)->key, (*(const TfJson *const *)b)->key);
+}
+
+/* One tolerance value as the signed text writes it: a JSON integer as its digits. A malformed value is written as the
+ * JSON has it ("-" when missing or null), as the Android SDK does; the publisher signs only well-formed entries, so
+ * such a manifest verifies only without the lines and its tolerance is ignored. */
+static void tolerance_value(TfBuf *b, const TfJson *v) {
+  if (!v || v->type == TJ_NULL) tf_buf_puts(b, "-");
+  else if (v->type == TJ_NUM) tf_buf_num(b, v->num == 0 ? 0.0 : v->num);
+  else if (v->type == TJ_STR) tf_buf_puts(b, v->str);
+  else if (v->type == TJ_BOOL) tf_buf_puts(b, v->boolean ? "true" : "false");
+  else tf_json_write(b, v);
+}
+
+/* 1 when the manifest has a golden_tolerance field (not null): only then is the text without its lines a fallback */
+int tf_manifest_has_tolerance(const TfJson *m) {
+  const TfJson *gt = tf_json_get(m, "golden_tolerance");
+  return gt && gt->type != TJ_NULL;
+}
+
+/* The exact text the signature covers (make_manifest.py signed_text, format 2; make_manifest3.py signed_text,
+ * format 3). Format 3 with `with_tolerance` and a golden_tolerance object (SDK 2.0.1): after the header lines and
+ * before the first file line, one line per build sorted by the build key's UTF-8 bytes,
+ * `golden_tolerance <build> <token_diffs> <site_flag_diffs> <word_flag_diffs>`; none when the field is absent, so a
+ * manifest without it keeps the 2.0.0 text byte for byte. Before 2.0.2 these lines were never written, so the
+ * signature of a manifest carrying the field (V4 build 519235d0) did not verify. */
+char *tf_manifest_signed_text(const TfJson *m) { return tf_manifest_signed_text_ex(m, 1); }
+
+char *tf_manifest_signed_text_ex(const TfJson *m, int with_tolerance) {
   const TfJson *files = tf_json_get(m, "files");
   const TfJson *fmt = tf_json_get(m, "format");
   if (!files || files->type != TJ_ARR || !fmt || fmt->type != TJ_NUM) return NULL;
@@ -125,6 +154,30 @@ char *tf_manifest_signed_text(const TfJson *m) {
     const TfJson *cx = tf_json_get(m, "contexts");
     for (int i = 0; cx && cx->type == TJ_ARR && i < cx->n; ++i) tf_buf_printf(&b, "%s%s", i ? "," : "", tf_json_str(&cx->kids[i]) ? cx->kids[i].str : "");
     tf_buf_puts(&b, "\n");
+    const TfJson *gt = tf_json_get(m, "golden_tolerance");
+    if (with_tolerance && gt && gt->type == TJ_OBJ && gt->n > 0) {
+      /* entries whose value is an object, as Android's signedMessage keeps them; make_manifest3.py writes only those */
+      const TfJson **keys = (const TfJson **)malloc(sizeof(TfJson *) * (size_t)gt->n);
+      if (!keys) {
+        tf_buf_free(&num);
+        tf_buf_free(&b);
+        return NULL;
+      }
+      int nk = 0;
+      for (int i = 0; i < gt->n; ++i)
+        if (gt->kids[i].type == TJ_OBJ && gt->kids[i].key) keys[nk++] = &gt->kids[i];
+      qsort(keys, (size_t)nk, sizeof *keys, cmp_key);
+      static const char *const tk[] = {"token_diffs", "site_flag_diffs", "word_flag_diffs"};
+      for (int i = 0; i < nk; ++i) {
+        tf_buf_printf(&b, "golden_tolerance %s", keys[i]->key);
+        for (int k = 0; k < 3; ++k) {
+          tf_buf_puts(&b, " ");
+          tolerance_value(&b, tf_json_get(keys[i], tk[k]));
+        }
+        tf_buf_puts(&b, "\n");
+      }
+      free(keys);
+    }
   } else {
     tf_buf_free(&num);
     tf_buf_free(&b);
@@ -206,18 +259,35 @@ static int version_at_least(const char *v, const char *min) {
   return 1;
 }
 
-/* Verify the signature with `key_hex` (64 hex). 1 ok, 0 bad. */
-int tf_manifest_verify_signature(const TfJson *m, const char *key_hex) {
-  const char *sig64 = tf_json_str(tf_json_get(m, "signature"));
-  uint8_t sig[66], pk[32];
-  if (!sig64 || tf_base64_decode(sig64, sig, sizeof sig) != 64) return 0;
-  if (tf_hex_decode(key_hex, pk, 32)) return 0;
-  char *text = tf_manifest_signed_text(m);
+int tf__version_at_least(const char *v, const char *min) { return v && min && version_at_least(v, min); }
+
+static int verify_text(const TfJson *m, int with_tolerance, const uint8_t sig[64], const uint8_t pk[32]) {
+  char *text = tf_manifest_signed_text_ex(m, with_tolerance);
   if (!text) return 0;
   const int ok = tf_ed25519_verify(sig, (const uint8_t *)text, strlen(text), pk);
   free(text);
   return ok;
 }
+
+/* Verify the signature with `key_hex` (64 hex). 1 ok, 0 bad. With a golden_tolerance field the signed text carries
+ * its lines; when that fails, the text without them is tried (as the Android and Swift SDKs do): if it verifies,
+ * the manifest is good and its tolerance is unsigned, so it counts as absent (*tolerance_signed 0, every build
+ * exact). This SDK runs the CPU engine only and never reads the tolerance; the flag is for callers and tests. */
+int tf_manifest_verify_signature_ex(const TfJson *m, const char *key_hex, int *tolerance_signed) {
+  const char *sig64 = tf_json_str(tf_json_get(m, "signature"));
+  uint8_t sig[66], pk[32];
+  if (tolerance_signed) *tolerance_signed = 0;
+  if (!sig64 || tf_base64_decode(sig64, sig, sizeof sig) != 64) return 0;
+  if (tf_hex_decode(key_hex, pk, 32)) return 0;
+  if (!tf_manifest_has_tolerance(m)) return verify_text(m, 0, sig, pk);
+  if (verify_text(m, 1, sig, pk)) {
+    if (tolerance_signed) *tolerance_signed = 1;
+    return 1;
+  }
+  return verify_text(m, 0, sig, pk);
+}
+
+int tf_manifest_verify_signature(const TfJson *m, const char *key_hex) { return tf_manifest_verify_signature_ex(m, key_hex, NULL); }
 
 /* Check the manifest's shape and compatibility. Returns 0 or a TF_ERR_*. */
 static int check_manifest(const TfJson *m, int require_signature, const char *key_hex, int *is_signed) {

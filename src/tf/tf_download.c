@@ -13,8 +13,6 @@
 
 #include "tf_internal.h"
 
-extern const char *const TF_QURANLAB_KEY_HEX;
-int tf_manifest_verify_signature(const TfJson *m, const char *key_hex);
 int tf_gunzip_file(const char *in_path, const char *out_path);
 
 TfDownloadOptions tf_download_default_options(void) {
@@ -251,9 +249,10 @@ int tf_download_model(const TfDownloadOptions *opt) {
   else {
     const TfJson *min = tf_json_get(m, "min_sdk_version"), *fm = tf_json_get(m, "format");
     format = fm && fm->type == TJ_NUM ? (int)fm->num : 0;
-    int a = 0, b = 0, c = 0;
-    if (!tf_json_str(min) || sscanf(min->str, "%d.%d.%d", &a, &b, &c) < 1 || a > 2 || (a == 2 && (b > 0 || c > 0)))
-      rc = tf__fail(TF_ERR_SDK_TOO_OLD, "the model needs a newer SDK");
+    /* the same rule as tf_model_open: min_sdk_version at most this SDK's version (before 2.0.2 the downloader
+     * capped it at 2.0.0, so a build needing 2.0.1 was refused even by a 2.0.1 install) */
+    if (!tf__version_at_least(TF_SDK_VERSION, tf_json_str(min)))
+      rc = tf__fail(TF_ERR_SDK_TOO_OLD, "the model needs SDK %s or newer (this is %s)", tf_json_str(min) ? tf_json_str(min) : "?", TF_SDK_VERSION);
     else if (format != 2 && format != 3)
       rc = tf__fail(TF_ERR_UNSUPPORTED_MODEL, "manifest format %d is not supported", format);
   }
