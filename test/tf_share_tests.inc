@@ -148,12 +148,13 @@ static struct {
   TfMutex m;
   int net_down;
   int fail_403_once_at;  /* a PUT of this segment answers 403 once */
+  int put_status;        /* nonzero: every PUT answers this status (the network failing: 503) */
   int stall_puts;        /* PUTs wait until cancelled */
   volatile int put_waiting, put_cancelled;
   const char *start_error; /* POST /v1/uploads answers 409 with this code */
   StubSession s[8];
   int n_s;
-  int starts, url_calls, puts, put_403;
+  int starts, url_calls, puts, put_403, put_failed;
   int url_from[64];
   int bad_put_headers, bad_session_body;
 } g_st;
@@ -210,6 +211,9 @@ static int stub(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
       tf_mutex_lock(&g_st.m);
       g_st.put_cancelled = q->cancel && *q->cancel;
       rc = tf__fail(TF_ERR_NETWORK, "cancelled");
+    } else if (g_st.put_status) {
+      g_st.put_failed++;
+      reply(r, g_st.put_status, "<Error>unavailable</Error>");
     } else if (n == g_st.fail_403_once_at) {
       g_st.fail_403_once_at = 0;
       g_st.put_403++;
@@ -302,6 +306,7 @@ static int joined_ok(const StubSession *s, int want_eos, int *segments) {
 }
 
 static TfClient *share_client(const char *dir) {
+  seed_config(dir, "{\"contributions\":true}"); /* 2.0.1: offered only where the signed config says so */
   TfClientOptions o = tf_client_default_options();
   o.key = "qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa";
   o.app_id = "org.example.ShareTest";
@@ -413,9 +418,10 @@ static int upload_tests(const char *dir) {
   tf_sharing_session_finish(ss, 0);
   tf_client_destroy(c);
 
-  /* the bitrate is the one constant, and an option */
+  /* 2.0.1: the ladder decides; the old bitrate call checks its argument and changes nothing */
   c = share_client(dd);
-  CHECK(tf_sharing_set_bitrate(c, 24000) == 0 && tf_sharing_set_bitrate(c, 1000) != 0, "bitrate option");
+  CHECK(tf_sharing_set_bitrate(c, 24000) == 0 && tf_sharing_set_bitrate(c, 1000) != 0 && tf_sharing_bitrate(c) == 192000,
+        "bitrate call: %d", tf_sharing_bitrate(c));
   tf_client_destroy(c);
 
   stub_reset();

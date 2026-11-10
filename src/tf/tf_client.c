@@ -31,6 +31,8 @@ void tf__sharing_free(TfClient *c);
 void tf__share_init(TfClient *c);
 void tf__share_free(TfClient *c);
 int tf_sharing_outbox_resume(TfClient *c);
+void tf__telemetry_add(TfClient *c, const char *field, long long n);
+int tf__client_telemetry_on(const TfClient *c);
 
 static int g_contrib_default;
 void zf_platform_set_contributions(int on) { g_contrib_default = on ? 1 : 0; }
@@ -48,10 +50,21 @@ struct TfClient {
   char *config;        /* the last verified config body */
   char etag[80];
   long long config_exp;
-  int registered;
+  char register_day[11]; /* the UTC day of the last register answered 200 (once per day per install) */
   void *sharing;       /* tf_sharing.c's state */
   void *share;         /* tf_share.c's uploader */
   TfMutex lock;        /* the uploader thread and the app's thread share the token and the config */
+  /* telemetry deltas: tlock guards the day's counts and the sealing (disk only), send_lock one sender at a time */
+  TfMutex tlock, send_lock;
+  long long last_seal; /* when the last delta was sealed (the 15-minute send point) */
+  long long next_try;  /* backoff of the timer's sends after a failure (in memory) */
+  int fails;
+  /* the timer: a thread started by tf_client_launch */
+  TfMutex tm;
+  TfCond tcv;
+  TfThread tth;
+  int t_on, t_quit, t_send;
+  int latest_logged;   /* the sdk_latest line was logged (once per client) */
 };
 
 /* ------------------------------------------------------------------ small helpers */
@@ -62,8 +75,10 @@ static char *dupstr(const char *s) {
   return p;
 }
 static char *spath(const TfClient *c, const char *name) { return tf_path_join(c->dir, name); }
+long long tf__now_override; /* tests: a fixed clock */
+static long long now_unix(void) { return tf__now_override ? tf__now_override : (long long)time(NULL); }
 static void day_utc(char out[11], long long offset_s) {
-  time_t t = time(NULL) + (time_t)offset_s;
+  time_t t = (time_t)(now_unix() + offset_s);
   struct tm g;
 #ifdef _WIN32
   gmtime_s(&g, &t);
@@ -72,8 +87,6 @@ static void day_utc(char out[11], long long offset_s) {
 #endif
   strftime(out, 11, "%Y-%m-%d", &g);
 }
-long long tf__now_override; /* tests: a fixed clock */
-static long long now_unix(void) { return tf__now_override ? tf__now_override : (long long)time(NULL); }
 
 const char *tf__client_dir(const TfClient *c) { return c->dir; }
 const char *tf__client_app(const TfClient *c) { return c->app_id; }
@@ -196,11 +209,13 @@ static void save_state(TfClient *c) {
   TfBuf b;
   tf_buf_init(&b);
   tf_buf_printf(&b, "{\"v\":1,\"bucket\":%d,\"installed\":true,\"pending_new_install\":%s,\"token\":", c->bucket,
-                c->new_install && !c->registered ? "true" : "false");
+                c->new_install ? "true" : "false");
   tf_buf_json_str(&b, c->token);
   tf_buf_printf(&b, ",\"token_exp\":%lld,\"etag\":", c->token_exp);
   tf_buf_json_str(&b, c->etag);
-  tf_buf_printf(&b, ",\"config_exp\":%lld}", c->config_exp);
+  tf_buf_printf(&b, ",\"config_exp\":%lld,\"register_day\":", c->config_exp);
+  tf_buf_json_str(&b, c->register_day);
+  tf_buf_puts(&b, "}");
   char *p = spath(c, "client.json");
   if (p && b.p) tf_write_file(p, b.p, b.n);
   free(p);
@@ -225,6 +240,8 @@ static void load_state(TfClient *c) {
     if (tf_json_str(tf_json_get(j, "etag"))) snprintf(c->etag, sizeof c->etag, "%s", tf_json_str(tf_json_get(j, "etag")));
     const TfJson *ce = tf_json_get(j, "config_exp");
     c->config_exp = ce && ce->type == TJ_NUM ? (long long)ce->num : 0;
+    const char *rd = tf_json_str(tf_json_get(j, "register_day"));
+    if (rd && strlen(rd) == 10) snprintf(c->register_day, sizeof c->register_day, "%s", rd);
     tf_json_free(j);
   } else {
     c->bucket = -1;
@@ -263,8 +280,12 @@ TfClient *tf_client_create(const TfClientOptions *opt) {
     return NULL;
   }
   TfClient *c = (TfClient *)calloc(1, sizeof *c);
-  if (c) tf_mutex_init(&c->lock);
   if (!c) return NULL;
+  tf_mutex_init(&c->lock);
+  tf_mutex_init(&c->tlock);
+  tf_mutex_init(&c->send_lock);
+  tf_mutex_init(&c->tm);
+  tf_cond_init(&c->tcv);
   c->o = o;
   c->key = dupstr(o.key);
   c->app_id = dupstr(o.app_id);
@@ -304,11 +325,20 @@ TfClient *tf_client_create(const TfClientOptions *opt) {
   save_state(c);
   tf__sharing_init(c);
   tf__share_init(c);
+  /* telemetry: opening a client is a launch; the 15 minutes run from here */
+  c->last_seal = now_unix();
+  tf__telemetry_add(c, "launches", 1);
   return c;
 }
 
+static void timer_stop(TfClient *c);
+static int telemetry_send_point(TfClient *c);
+
 void tf_client_destroy(TfClient *c) {
   if (!c) return;
+  timer_stop(c);
+  /* closing the client is a send point (what is not sent stays on disk for the next launch) */
+  if (c->key && tf__client_telemetry_on(c)) telemetry_send_point(c);
   tf__share_free(c);
   tf__sharing_free(c);
   free(c->key);
@@ -320,6 +350,10 @@ void tf_client_destroy(TfClient *c) {
   free(c->dir);
   free(c->language);
   free(c->config);
+  tf_cond_destroy(&c->tcv);
+  tf_mutex_destroy(&c->tm);
+  tf_mutex_destroy(&c->send_lock);
+  tf_mutex_destroy(&c->tlock);
   tf_mutex_destroy(&c->lock);
   free(c);
 }
@@ -359,10 +393,14 @@ static int ensure_token(TfClient *c) {
 }
 
 /* ------------------------------------------------------------------ register */
+/* Once per UTC day per install (2.0.1: the server counts daily active installs; launches go in the telemetry): the
+ * day stamp is written only after a 200, so a failed attempt is tried again (and new_install survives it). */
 int tf_client_register(TfClient *c) {
   tf__clear_error();
   if (!c) return tf__fail(TF_ERR_ARGUMENT, "no client");
-  if (c->registered) return 0;
+  char today[11];
+  day_utc(today, 0);
+  if (!strcmp(c->register_day, today)) return 0;
   TfBuf b;
   tf_buf_init(&b);
   tf_buf_puts(&b, "{\"platform\":");
@@ -382,9 +420,11 @@ int tf_client_register(TfClient *c) {
   tf_buf_free(&b);
   if (rc) return rc;
   if (r.status == 200) {
-    c->registered = 1;
+    tf_mutex_lock(&c->lock);
+    snprintf(c->register_day, sizeof c->register_day, "%s", today);
     c->new_install = 0;
     save_state(c);
+    tf_mutex_unlock(&c->lock);
   } else {
     rc = tf__fail(TF_ERR_HTTP, "register: HTTP %d %s", r.status, r.body ? r.body : "");
   }
@@ -412,6 +452,7 @@ int tf__verify_config(const uint8_t pk[32], const char *kid_pinned, const char *
   return rc;
 }
 
+static void check_sdk_latest(TfClient *c);
 int tf_client_refresh_config(TfClient *c) {
   tf__clear_error();
   if (!c) return tf__fail(TF_ERR_ARGUMENT, "no client");
@@ -452,7 +493,68 @@ int tf_client_refresh_config(TfClient *c) {
   save_state(c);
   tf_mutex_unlock(&c->lock);
   tf_http_response_free(&r);
+  check_sdk_latest(c);
   return 0;
+}
+
+/* ------------------------------------------------------------------ the developer's log and sdk_latest */
+/* debug builds only (the app's TfClientOptions.debug_build: the library itself is always a release build, so its
+ * own NDEBUG says nothing about the app); the app's callback, or stderr without one */
+void tf__client_log(TfClient *c, int level, const char *message) {
+  if (!c || !c->o.debug_build || !message) return;
+  if (c->o.on_log) c->o.on_log(c->o.log_user, level, message);
+  else fprintf(stderr, "tajweedformer: %s\n", message);
+}
+/* dotted numbers only ("2", "2.0", "2.0.1", up to 4 parts of up to 9 digits); 0 for anything else */
+static int parse_version(const char *s, long part[4], int *n) {
+  *n = 0;
+  if (!s || !*s) return 0;
+  while (*n < 4) {
+    int digits = 0;
+    long v = 0;
+    while (*s >= '0' && *s <= '9' && digits < 10) v = v * 10 + (*s++ - '0'), digits++;
+    if (!digits || digits > 9) return 0;
+    part[(*n)++] = v;
+    if (!*s) return 1;
+    if (*s != '.') return 0;
+    s++;
+  }
+  return 0;
+}
+/* 1 when a is a newer version than b; junk is never newer */
+static int version_newer(const char *a, const char *b) {
+  long pa[4] = {0}, pb[4] = {0};
+  int na, nb;
+  if (!parse_version(a, pa, &na) || !parse_version(b, pb, &nb)) return 0;
+  for (int i = 0; i < 4; ++i) {
+    const long x = i < na ? pa[i] : 0, y = i < nb ? pb[i] : 0;
+    if (x != y) return x > y;
+  }
+  return 0;
+}
+/* The verified config's optional "sdk_latest": {"version","severity","url"} for the app's platform. A newer version
+ * than this SDK's is logged once per client, at warning level, in debug builds only; a missing or malformed field
+ * (not an object, a version that is not dotted numbers, severity not a short lower-case word, url not https) is
+ * ignored without an error. Tried and rejected: an error code or a callback of its own (the app needs nothing
+ * more than the line in its debug log). */
+static void check_sdk_latest(TfClient *c) {
+  if (c->latest_logged || !c->o.debug_build) return;
+  tf_mutex_lock(&c->lock);
+  TfJson *j = c->config && c->config_exp > now_unix() ? tf_json_parse(c->config, strlen(c->config), NULL) : NULL;
+  tf_mutex_unlock(&c->lock);
+  const TfJson *l = tf_json_get(j, "sdk_latest");
+  const char *v = tf_json_str(tf_json_get(l, "version")), *sev = tf_json_str(tf_json_get(l, "severity"));
+  const char *url = tf_json_str(tf_json_get(l, "url"));
+  int ok = l && l->type == TJ_OBJ && v && sev && url && *sev && strlen(sev) <= 32 && !strncmp(url, "https://", 8) && strlen(url) < 512;
+  for (const char *p = sev; ok && *p; ++p) ok = (*p >= 'a' && *p <= 'z') || *p == '_' || *p == '-';
+  for (const char *p = url; ok && *p; ++p) ok = (unsigned char)*p > 0x20 && (unsigned char)*p < 0x7f;
+  if (ok && version_newer(v, TF_SDK_VERSION)) {
+    char line[700];
+    snprintf(line, sizeof line, "Quran Lab SDK %s is available (%s), you have %s: %s", v, sev, TF_SDK_VERSION, url);
+    tf__client_log(c, TF_LOG_WARNING, line);
+    c->latest_logged = 1;
+  }
+  tf_json_free(j);
 }
 
 const char *tf_client_config_json(TfClient *c) {
@@ -523,11 +625,23 @@ typedef struct {
   long long fb[8], st[2], lat[8], rtf[5], cold[6], load[6], thermal[2], checks[7], cls[8][2], sfp[6], margin[6], conf[6],
       madd[4], words[2];
 } Cohort;
+/* the 2.0.1 rule keys: each site class, then madd, qalqalah, gemination and word */
+static const char *const kRule[] = {"vowel_sub", "vowel_del", "vowel_ins", "short_to_long", "long_to_short", "cons_sub", "cons_del",
+                                    "insertion", "madd", "qalqalah", "gemination", "word"};
+enum { R_MADD = 8, R_QALQALAH = 9, R_GEMINATION = 10, R_WORD = 11, N_RULE = 12 };
 typedef struct {
   Cohort co[16];
   int n;
   long long coverage[115];
+  /* 2.0.1 */
+  long long launches, ayahs, words, surah_ayahs[115], rule[N_RULE][2], share_asked, share_yes, share_no;
 } Day;
+static int day_empty(const Day *d) {
+  long long any = d->n + d->launches + d->ayahs + d->words + d->share_asked + d->share_yes + d->share_no;
+  for (int s = 1; s <= 114; ++s) any += d->coverage[s] + d->surah_ayahs[s];
+  for (int k = 0; k < N_RULE; ++k) any += d->rule[k][0];
+  return any == 0;
+}
 
 static int bucket(double v, const double *lim, int n) {
   for (int i = 0; i < n; ++i)
@@ -554,10 +668,8 @@ static long long num(const TfJson *o, const char *k) {
   return v && v->type == TJ_NUM ? (long long)v->num : 0;
 }
 
-static void day_load(const TfClient *c, const char *day, Day *d) {
+static void day_load_file(const TfClient *c, const char *name, Day *d) {
   memset(d, 0, sizeof *d);
-  char name[64];
-  snprintf(name, sizeof name, "telemetry-%s.json", day);
   char *p = spath(c, name), *text = NULL;
   size_t n;
   if (!p || tf_read_file(p, &text, &n)) {
@@ -610,11 +722,36 @@ static void day_load(const TfClient *c, const char *day, Day *d) {
     const int s = atoi(cov->kids[i].key);
     if (s >= 1 && s <= 114 && cov->kids[i].type == TJ_NUM) d->coverage[s] = (long long)cov->kids[i].num;
   }
+  d->launches = num(j, "launches");
+  d->ayahs = num(j, "ayahs");
+  d->words = num(j, "words");
+  d->share_asked = num(j, "share_asked");
+  d->share_yes = num(j, "share_yes");
+  d->share_no = num(j, "share_no");
+  const TfJson *sa = tf_json_get(j, "surah_ayahs");
+  for (int i = 0; sa && sa->type == TJ_OBJ && i < sa->n; ++i) {
+    const int s = atoi(sa->kids[i].key);
+    if (s >= 1 && s <= 114 && sa->kids[i].type == TJ_NUM) d->surah_ayahs[s] = (long long)sa->kids[i].num;
+  }
+  for (int k = 0; k < N_RULE; ++k) {
+    d->rule[k][0] = num(tf_json_get(j, "rule_checks"), kRule[k]);
+    d->rule[k][1] = num(tf_json_get(j, "rule_flags"), kRule[k]);
+  }
   tf_json_free(j);
 }
 
-/* the v2 body for a day (closed schema: exactly these fields) */
-static char *day_body(const TfClient *c, const char *day, const Day *d) {
+static void day_load(const TfClient *c, const char *day, Day *d) {
+  char name[64];
+  snprintf(name, sizeof name, "telemetry-%s.json", day);
+  day_load_file(c, name, d);
+}
+
+static void write_count(TfBuf *b, const char *key, long long v) {
+  if (v) tf_buf_printf(b, ",\"%s\":%lld", key, v);
+}
+/* the v2 body for a day (closed schema: exactly these fields, the 2.0.1 ones each left out when zero);
+ * report_id NULL: the pending counts on disk, not a delta to send */
+static char *day_body(const TfClient *c, const char *day, const Day *d, const char *report_id) {
   TfBuf b;
   tf_buf_init(&b);
   tf_buf_printf(&b, "{\"v\":2,\"day\":\"%s\",\"product\":\"native\",\"platform\":", day);
@@ -670,14 +807,39 @@ static char *day_body(const TfClient *c, const char *day, const Day *d) {
       tf_buf_printf(&b, "%s\"%d\":%lld", first ? "" : ",", s, d->coverage[s]);
       first = 0;
     }
-  tf_buf_puts(&b, "},\"downloads\":[]}");
+  tf_buf_puts(&b, "},\"downloads\":[]");
+  if (report_id) tf_buf_printf(&b, ",\"report_id\":\"%s\"", report_id);
+  write_count(&b, "launches", d->launches);
+  write_count(&b, "ayahs", d->ayahs);
+  write_count(&b, "words", d->words);
+  first = 1;
+  for (int s = 1; s <= 114; ++s)
+    if (d->surah_ayahs[s]) {
+      tf_buf_printf(&b, "%s\"%d\":%lld", first ? ",\"surah_ayahs\":{" : ",", s, d->surah_ayahs[s]);
+      first = 0;
+    }
+  if (!first) tf_buf_puts(&b, "}");
+  /* every flags key is a checks key with a count no larger (flags are counted only with their check) */
+  for (int f = 0; f < 2; ++f) {
+    first = 1;
+    for (int k = 0; k < N_RULE; ++k)
+      if (d->rule[k][f]) {
+        tf_buf_printf(&b, "%s\"%s\":%lld", first ? (f ? ",\"rule_flags\":{" : ",\"rule_checks\":{") : ",", kRule[k], d->rule[k][f]);
+        first = 0;
+      }
+    if (!first) tf_buf_puts(&b, "}");
+  }
+  write_count(&b, "share_asked", d->share_asked);
+  write_count(&b, "share_yes", d->share_yes);
+  write_count(&b, "share_no", d->share_no);
+  tf_buf_puts(&b, "}");
   return tf_buf_take(&b);
 }
 
 static void day_save(const TfClient *c, const char *day, const Day *d) {
   char name[64];
   snprintf(name, sizeof name, "telemetry-%s.json", day);
-  char *p = spath(c, name), *body = day_body(c, day, d);
+  char *p = spath(c, name), *body = day_body(c, day, d, NULL);
   if (p && body) tf_write_file(p, body, strlen(body));
   free(p);
   free(body);
@@ -685,10 +847,30 @@ static void day_save(const TfClient *c, const char *day, const Day *d) {
 
 int tf__client_telemetry_on(const TfClient *c) { return c->o.telemetry && tf__client_flag(c, "analytics", 1); }
 
+/* +n to one of today's top-level counters: launches, share_asked, share_yes, share_no */
+void tf__telemetry_add(TfClient *c, const char *field, long long n) {
+  if (!c || !tf__client_telemetry_on(c)) return;
+  tf_mutex_lock(&c->tlock);
+  char day[11];
+  day_utc(day, 0);
+  Day d;
+  day_load(c, day, &d);
+  if (!strcmp(field, "launches")) d.launches += n;
+  else if (!strcmp(field, "share_asked")) d.share_asked += n;
+  else if (!strcmp(field, "share_yes")) d.share_yes += n;
+  else if (!strcmp(field, "share_no")) d.share_no += n;
+  day_save(c, day, &d);
+  tf_mutex_unlock(&c->tlock);
+}
+
+#define TF_DELTA_S (15 * 60) /* a delta every 15 minutes while a client is open (Quran Lab, 11-09) */
+static void seal(TfClient *c, int include_today);
+
 void tf_client_session_finished(TfClient *c, const TfSessionStats *st) {
   if (!c || !st) return;
   tf__sharing_session(c, st->feedback_shown, st->audio_s);
   if (!tf__client_telemetry_on(c)) return;
+  tf_mutex_lock(&c->tlock);
   char day[11];
   day_utc(day, 0);
   Day d;
@@ -811,10 +993,59 @@ void tf_client_session_finished(TfClient *c, const TfSessionStats *st) {
     }
     TfJson *rj = tf_json_parse(tf_result_json((TfResult *)st->result), strlen(tf_result_json((TfResult *)st->result)), NULL);
     const TfJson *su = tf_json_get(rj, "surah");
-    if (su && su->type == TJ_NUM && su->num >= 1 && su->num <= 114) d.coverage[(int)su->num]++;
+    if (su && su->type == TJ_NUM && su->num >= 1 && su->num <= 114) {
+      d.coverage[(int)su->num]++;
+      d.surah_ayahs[(int)su->num]++;
+    }
+    /* 2.0.1: one scored ayah, its words, and per rule the verdicts whose check ran (enabled in the settings the
+     * result was scored with) and how many of those were flagged */
+    d.ayahs++;
+    const TfJson *set = tf_json_get(rj, "settings");
+    const TfJson *sites = tf_json_get(set, "sites");
+    for (int i = 0; i < ns; ++i) {
+      if (s[i].cls < 0 || s[i].cls >= 8) continue;
+      const TfJson *en = tf_json_get(tf_json_get(sites, kClasses[s[i].cls]), "enabled");
+      if (!en || en->type != TJ_BOOL || !en->boolean) continue;
+      d.rule[s[i].cls][0]++;
+      d.rule[s[i].cls][1] += s[i].flagged != 0;
+    }
+    const TfJson *me = tf_json_get(tf_json_get(set, "madd"), "enabled"), *le = tf_json_get(tf_json_get(set, "lazim"), "enabled");
+    for (int i = 0; i < nm; ++i) {
+      const TfJson *en = md[i].madd_class == ZF_TJ_MADD_LAZIM ? le : me;
+      if (!en || en->type != TJ_BOOL || !en->boolean) continue;
+      d.rule[R_MADD][0]++;
+      d.rule[R_MADD][1] += md[i].flagged != 0;
+    }
+    static const struct { const char *check; int rule; } letters[] = {{"qalqalah", R_QALQALAH}, {"gemination", R_GEMINATION}};
+    for (int k = 0; k < 2; ++k) {
+      const TfJson *en = tf_json_get(tf_json_get(set, letters[k].check), "enabled");
+      if (!en || en->type != TJ_BOOL || !en->boolean) continue;
+      const ZfTajweedLetter *lt;
+      const int nl = k == 0 ? zf_tajweed_result_qalqalah(r, &lt) : zf_tajweed_result_gemination(r, &lt);
+      for (int i = 0; i < nl; ++i) {
+        d.rule[letters[k].rule][0]++;
+        d.rule[letters[k].rule][1] += lt[i].flagged != 0;
+      }
+    }
+    for (int i = 0; i < nw; ++i) {
+      d.words += w[i].has_score;
+      if (w[i].has_score && w[i].flagged >= 0) { /* -1: the word check off or no word calibration */
+        d.rule[R_WORD][0]++;
+        d.rule[R_WORD][1] += w[i].flagged == 1;
+      }
+    }
     tf_json_free(rj);
   }
   day_save(c, day, &d);
+  tf_mutex_unlock(&c->tlock);
+  /* the next SDK call 15 minutes after the last delta is a send point: seal now; the timer (when running) sends */
+  if (now_unix() - c->last_seal >= TF_DELTA_S) {
+    seal(c, 1);
+    tf_mutex_lock(&c->tm);
+    c->t_send = 1;
+    tf_cond_signal(&c->tcv);
+    tf_mutex_unlock(&c->tm);
+  }
 }
 
 static int list_days(const TfClient *c, char days[][11], int max) {
@@ -849,45 +1080,156 @@ static void drop_day(const TfClient *c, const char *day) {
   free(p);
 }
 
-int tf_client_flush(TfClient *c, int include_today) {
-  tf__clear_error();
-  if (!c) return tf__fail(TF_ERR_ARGUMENT, "no client");
-  char days[64][11];
-  const int n = list_days(c, days, 64);
-  char today[11], oldest[11];
+/* Sealing (2.0.1): the counts of a day since its last delta (telemetry-<day>.json) become a delta with a fresh random
+ * report_id, frozen as the exact body to send (report-<day>-<sealed at>-<report_id>.json), so a retry sends the same
+ * bytes. The pending file is first renamed to sealing-<day>-<sealed at>-<report_id>.json (atomic): a crash between
+ * the two steps finishes the same seal under the same id later, never counting twice. Each day is sealed under its
+ * own day, so no delta spans midnight; a day with nothing counted seals nothing. Tried and rejected: one file per
+ * day rewritten until midnight (2.0.0: a day's counts reached the server only the next day). */
+static int list_prefixed(const TfClient *c, const char *prefix, char names[][96], int max) {
+  int n = 0;
+  const size_t pl = strlen(prefix);
+#ifdef _WIN32
+  char pat[64];
+  snprintf(pat, sizeof pat, "%s*.json", prefix);
+  char *pp = spath(c, pat);
+  WIN32_FIND_DATAA fd;
+  HANDLE h = pp ? FindFirstFileA(pp, &fd) : INVALID_HANDLE_VALUE;
+  free(pp);
+  if (h != INVALID_HANDLE_VALUE) {
+    do {
+      if (n < max && strlen(fd.cFileName) < 96 && !strncmp(fd.cFileName, prefix, pl)) snprintf(names[n++], 96, "%s", fd.cFileName);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+  }
+#else
+  DIR *dd = opendir(c->dir);
+  struct dirent *e;
+  while (dd && (e = readdir(dd)))
+    if (n < max && strlen(e->d_name) < 96 && !strncmp(e->d_name, prefix, pl) && strstr(e->d_name, ".json")) snprintf(names[n++], 96, "%s", e->d_name);
+  if (dd) closedir(dd);
+#endif
+  /* by name: by day, then by the time sealed */
+  for (int i = 1; i < n; ++i)
+    for (int k = i; k > 0 && strcmp(names[k], names[k - 1]) < 0; --k) {
+      char t[96];
+      memcpy(t, names[k], 96);
+      memcpy(names[k], names[k - 1], 96);
+      memcpy(names[k - 1], t, 96);
+    }
+  return n;
+}
+static void remove_named(const TfClient *c, const char *name) {
+  char *p = spath(c, name);
+  if (p) remove(p);
+  free(p);
+}
+/* sealing-<day>-<t10>-<id32>.json: write the report from it, then remove it */
+static void finish_seal(TfClient *c, const char *sealing) {
+  if (strlen(sealing) != 8 + 10 + 1 + 10 + 1 + 32 + 5) {
+    remove_named(c, sealing);
+    return;
+  }
+  char day[11], rid[33], rname[96];
+  snprintf(day, sizeof day, "%.10s", sealing + 8);
+  snprintf(rid, sizeof rid, "%.32s", sealing + 8 + 10 + 1 + 10 + 1);
+  snprintf(rname, sizeof rname, "report-%s", sealing + 8);
+  char *rp = spath(c, rname);
+  int ok = rp && tf_file_exists(rp);
+  if (!ok) {
+    Day d;
+    day_load_file(c, sealing, &d);
+    char *body = day_empty(&d) ? NULL : day_body(c, day, &d, rid);
+    ok = !body || (rp && !tf_write_file(rp, body, strlen(body)));
+    free(body);
+  }
+  if (ok) remove_named(c, sealing);
+  free(rp);
+}
+static void seal(TfClient *c, int include_today) {
+  tf_mutex_lock(&c->tlock);
+  char names[64][96], today[11];
   day_utc(today, 0);
+  int n = list_prefixed(c, "sealing-", names, 64);
+  for (int i = 0; i < n; ++i) finish_seal(c, names[i]);
+  char days[64][11];
+  n = list_days(c, days, 64);
+  for (int i = 0; i < n; ++i) {
+    if (!include_today && !strcmp(days[i], today)) continue;
+    uint8_t r[16];
+    char rid[33], from[64], to[96];
+    tf_random_bytes(r, sizeof r);
+    tf_hex_encode(r, 16, rid);
+    snprintf(from, sizeof from, "telemetry-%s.json", days[i]);
+    snprintf(to, sizeof to, "sealing-%s-%010lld-%s.json", days[i], now_unix() % 10000000000LL, rid);
+    char *pf = spath(c, from), *pt = spath(c, to);
+    int moved = pf && pt && !rename(pf, pt);
+    free(pf);
+    free(pt);
+    if (moved) finish_seal(c, to);
+  }
+  c->last_seal = now_unix();
+  tf_mutex_unlock(&c->tlock);
+}
+/* Sends the sealed deltas, oldest first. 202 (a duplicate too) deletes; 400 and 413 drop (never retry a refused
+ * body; 400 also queues the bad_request issue); 401 renews the token once (in call) and keeps; 429, 5xx, 503 and
+ * the network keep it, same bytes, and end the pass. Deltas older than 7 days are deleted unsent; the kill switch
+ * (flags.analytics false, or the developer's opt-out) drops the whole queue. Returns the deltas accepted. */
+static int send_reports(TfClient *c) {
+  tf_mutex_lock(&c->send_lock);
+  char names[256][96], oldest[11];
+  const int n = list_prefixed(c, "report-", names, 256);
   day_utc(oldest, -7 * 86400);
   const int on = tf__client_telemetry_on(c);
-  int sent = 0;
+  int sent = 0, kept = 0;
   for (int i = 0; i < n; ++i) {
-    if (!on || strcmp(days[i], oldest) < 0) {
-      drop_day(c, days[i]); /* the kill switch drops the queue; the server refuses days older than 7 */
+    if (!on || strncmp(names[i] + 7, oldest, 10) < 0) {
+      remove_named(c, names[i]);
       continue;
     }
-    if (!include_today && !strcmp(days[i], today)) continue;
-    char name[64];
-    snprintf(name, sizeof name, "telemetry-%s.json", days[i]);
-    char *p = spath(c, name), *body = NULL;
+    char *p = spath(c, names[i]), *body = NULL;
     size_t bn;
-    if (!p || tf_read_file(p, &body, &bn)) {
-      free(p);
-      continue;
-    }
+    const int rd = p ? tf_read_file(p, &body, &bn) : -1;
     free(p);
+    if (rd) continue;
     Call k = {"POST", "/v1/events", body, 1, NULL};
     TfHttpResponse r;
     const int rc = call(c, &k, &r);
     free(body);
-    if (rc) return sent;
-    if (r.status == 202) {
-      drop_day(c, days[i]);
-      sent++;
-    } else if (r.status == 400 || r.status == 413) {
-      drop_day(c, days[i]); /* never retry a refused body */
-      tf_client_report_issue(c, "other", "bad_request:events", NULL);
+    if (rc) {
+      kept = 1;
+      break;
     }
+    const int st = r.status;
     tf_http_response_free(&r);
+    if (st == 202) {
+      remove_named(c, names[i]);
+      sent++;
+    } else if (st == 400 || st == 413) {
+      remove_named(c, names[i]);
+      if (st == 400) tf_client_report_issue(c, "other", "bad_request:events", NULL);
+    } else {
+      kept = 1;
+      break;
+    }
   }
+  if (!on) {
+    char days[64][11];
+    const int nd = list_days(c, days, 64);
+    for (int i = 0; i < nd; ++i) drop_day(c, days[i]);
+  }
+  /* the timer's backoff: 1 min, then 10 min (explicit send points ignore it) */
+  c->fails = kept ? c->fails + 1 : 0;
+  c->next_try = kept ? now_unix() + (c->fails <= 1 ? 60 : 600) : 0;
+  tf_mutex_unlock(&c->send_lock);
+  return sent;
+}
+
+int tf_client_flush(TfClient *c, int include_today) {
+  tf__clear_error();
+  if (!c) return tf__fail(TF_ERR_ARGUMENT, "no client");
+  if (tf__client_telemetry_on(c)) seal(c, include_today);
+  const int sent = send_reports(c);
   /* queued issues */
   char *ip = spath(c, "issues.json"), *text = NULL;
   size_t tn;
@@ -935,7 +1277,7 @@ int tf_client_flush(TfClient *c, int include_today) {
 
 /* ------------------------------------------------------------------ issues (no free text; deduped per day) */
 int tf_client_report_issue(TfClient *c, const char *kind, const char *code, const char *message) {
-  (void)message; /* SDK 2.0.0 never sends free text */
+  (void)message; /* the SDK never sends free text */
   static const char *const kinds[] = {"engine_failed", "model_load", "checksum_mismatch", "signature_invalid", "update_failed",
                                       "fallback", "self_test_failed", "audio_input", "other"};
   if (!c || !kind || !code) return tf__fail(TF_ERR_ARGUMENT, "kind and code are required");
@@ -995,13 +1337,80 @@ int tf_client_report_issue(TfClient *c, const char *kind, const char *code, cons
   return 0;
 }
 
+/* ------------------------------------------------------------------ send points and the timer */
+/* seal everything counted, send every sealed delta */
+static int telemetry_send_point(TfClient *c) {
+  seal(c, 1);
+  return send_reports(c);
+}
+
+int tf_client_background(TfClient *c) {
+  tf__clear_error();
+  if (!c) return tf__fail(TF_ERR_ARGUMENT, "no client");
+  if (!tf__client_telemetry_on(c)) {
+    send_reports(c); /* drops the queue */
+    return 0;
+  }
+  return telemetry_send_point(c);
+}
+
+/* The client's timer (started by tf_client_launch): every 15 minutes while the client is open it seals and sends a
+ * delta (and registers once the UTC day changed); a seal by tf_client_session_finished wakes it to send. Failed
+ * sends wait 1, then 10 minutes. */
+static void timer_thread(void *arg) {
+  TfClient *c = (TfClient *)arg;
+  tf_mutex_lock(&c->tm);
+  while (!c->t_quit) {
+    const long long now = now_unix(), due = c->last_seal + TF_DELTA_S;
+    if (c->t_send || now >= due) {
+      c->t_send = 0;
+      tf_mutex_unlock(&c->tm);
+      if (tf__client_telemetry_on(c)) {
+        if (now >= due) seal(c, 1);
+        if (!c->next_try || now_unix() >= c->next_try) send_reports(c);
+      } else {
+        c->last_seal = now;
+      }
+      char today[11];
+      day_utc(today, 0);
+      if (strcmp(c->register_day, today) && c->key) tf_client_register(c);
+      tf_mutex_lock(&c->tm);
+      continue;
+    }
+    long long ms = (due - now) * 1000;
+    if (ms < 1000) ms = 1000;
+    if (ms > TF_DELTA_S * 1000LL) ms = TF_DELTA_S * 1000LL;
+    tf_cond_wait_ms(&c->tcv, &c->tm, (long)ms);
+  }
+  tf_mutex_unlock(&c->tm);
+}
+int tf__client_no_timer; /* tests: no timer thread (the replayed exchanges run on one thread) */
+static void timer_start(TfClient *c) {
+  if (tf__client_no_timer) return;
+  tf_mutex_lock(&c->tm);
+  if (!c->t_on && !tf_thread_start(&c->tth, timer_thread, c)) c->t_on = 1;
+  tf_mutex_unlock(&c->tm);
+}
+static void timer_stop(TfClient *c) {
+  tf_mutex_lock(&c->tm);
+  const int on = c->t_on;
+  c->t_quit = 1;
+  tf_cond_signal(&c->tcv);
+  tf_mutex_unlock(&c->tm);
+  if (on) tf_thread_join(c->tth);
+  c->t_on = 0;
+}
+
 /* ------------------------------------------------------------------ launch */
 int tf_client_launch(TfClient *c) {
   if (!c) return tf__fail(TF_ERR_ARGUMENT, "no client");
   int rc = 0;
   if (tf_client_register(c)) rc = tf_last_error_code();
   if (tf_client_refresh_config(c) && !rc) rc = tf_last_error_code();
-  tf_client_flush(c, 0);
+  check_sdk_latest(c); /* the config in force (a stored one when the refresh failed) */
+  /* launch is a send point: this launch and what earlier runs left */
+  tf_client_flush(c, 1);
+  timer_start(c);
   /* shared sessions a previous run left (crash, restart, offline) go up in the background */
   if (tf_client_sharing_state(c)) tf_sharing_outbox_resume(c);
   return rc;

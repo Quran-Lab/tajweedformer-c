@@ -58,7 +58,7 @@ Copy the setup prompt from [portal.quranlab.ai](https://portal.quranlab.ai) and 
 
 ## At a glance
 
-- **What it is:** the TajweedFormer SDK 2.0.0 for Windows and Linux: `tajweedformer.dll` /
+- **What it is:** the TajweedFormer SDK 2.0.1 for Windows and Linux: `tajweedformer.dll` /
   `libtajweedformer.so` (and a static library) with one C header, [`include/tajweedformer.h`](include/tajweedformer.h),
   over the [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) engine, plus the
   `tajweedformer` command-line tool and server tier. The engine runs on native int8 kernels (AVX-512 VNNI,
@@ -67,7 +67,8 @@ Copy the setup prompt from [portal.quranlab.ai](https://portal.quranlab.ai) and 
   of the network, selectable; the decoded layer (per frame top-1 and runner-up with log-probs and margin, tokens
   with confidence); the tajweed layer (per-site verdicts with per-head and fused LLRs, madd counts, qalqalah
   and gemination evidence, per-word scores); settings resolved app code > portal > calibration.json; the
-  portal client (register, verified config, anonymous telemetry, issues); resumable model downloads.
+  portal client (register, verified config, anonymous telemetry, issues, recitation sharing: see
+  [Recitation sharing](#recitation-sharing) and [Telemetry](#telemetry)); resumable model downloads.
 - **Model:** TajweedFormer V4 only (`Quran-Lab/tajweedformer-v4`, `sdk/v4.0`; contexts `c16_l64`, `c8_l64` from the next V4.0
   revision, `c24_l72`, `c24_l256`). v3.2 stays on the 1.x SDKs (the `zf_decode` harness here still runs it, for conformance).
 - **Who it is for:** desktop apps on Windows and Linux, and servers decoding many recitations.
@@ -84,7 +85,7 @@ One model, one engine, the same bits on every platform. Each SDK compiles the sa
 
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
-| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+, desktop JVM | Maven `ai.quranlab:tajweedformer:2.0.0` |
+| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+, desktop JVM | Maven `ai.quranlab:tajweedformer:2.0.1` |
 | [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+ | SwiftPM, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node | npm `@quran-lab/tajweedformer` |
 | [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake (`add_subdirectory`) |
@@ -360,6 +361,44 @@ cc -O3 -fPIC -shared -Iinclude src/zf_gemm_vnni.c int8_avx512.o int8_avxvnni.o i
 python3 test/validate_against_ort.py libzfvnni.so zipformer_p_arabic_v3.1.int8.onnx
 ```
 
+## Recitation sharing
+
+How the SDK talks to Quran Lab, what it sends and when, is in [docs/platform-client.md](docs/platform-client.md) (the
+same page in every TajweedFormer SDK); the C calls are in [docs/api.md](docs/api.md).
+
+- **Quran Lab decides whether sharing is offered** to an app, in the signed config it downloads
+  (`flags.contributions`); the app's own option is ignored since 2.0.1, and without a config in force nothing is
+  offered. Offered is never consent: nothing is recorded or sent before the learner answers "share".
+- **The sheet is the app's.** This library has no UI (so nothing to theme): the SDK asks at a good moment through
+  the `on_consent` callback (or a pending ask in the status), with the copy deck in the learner's language (deck
+  `2026-11-09.1`, consent `share-2026-11-09`, eight languages), and the app reports the learner's tap with
+  `tf_client_sharing_answer`. The SDK counts the asks and keeps the re-ask rules.
+- **At most three sheets, and a yes is final.** The sheet is shown at most three times per install, ever ("Not
+  now" may lead to a later ask, 7 sessions apart; the count carries over from 2.0.0). A learner who answered
+  "share" is never asked again: the grant keeps the version they agreed to across copy decks, wording changes and
+  upgrades from 2.0.0, and every shared session carries that version. Turning sharing off ends asking too; after
+  that only the app's settings switch (`tf_client_sharing_set`) turns sharing on or off.
+- **Own wording.** `tf_sharing_set_wording` replaces any deck string. A learner who agrees then agrees to that
+  text: the consent version becomes `custom-` plus 24 hex digits of its SHA-256, and every session shared under it
+  carries `consent_text_sha256` so Quran Lab can review the wording (`tf_sharing_consent_text` and
+  `tf_sharing_consent_sha256` give it to the developer). Learners who agreed before keep their version and are
+  not asked again.
+- **Bitrate on bad networks.** Opus starts at 192 kbit/s and steps down to 96, 64 and 32 kbit/s when uploads fail
+  for network reasons or the queue backs up, and back up when uploads succeed; each segment keeps one bitrate,
+  recorded on disk and listed by `tf_sharing_outbox_json`.
+- **Stop and delete** at any time (`tf_client_sharing_set(c, 0)`, `tf_client_sharing_delete`), whatever wording the
+  learner agreed to.
+
+## Telemetry
+
+Anonymous by construction (sums and histograms per UTC day; no audio, text, identifiers or times finer than the
+day), on by default, off with the signed config's `flags.analytics: false` or `TfClientOptions.telemetry =
+ZF_ANALYTICS_OFF`. Since 2.0.1 the SDK sends deltas during the day instead of one report the next day: every 15
+minutes while a client is open, at `tf_client_background`, at `tf_client_destroy` and at `tf_client_launch`, each
+with a random `report_id` so a retry is counted once. New counters: launches, ayahs and words scored, ayahs per
+surah, per rule how many verdicts were checked and flagged, and the sharing sheet's asks and answers.
+`POST /v1/register` goes out once per UTC day per install. Details: [docs/platform-client.md](docs/platform-client.md).
+
 ## Layout
 
 ```
@@ -382,7 +421,9 @@ test/     vnni_check.c        every tier == integer golden, and speed
           dropin_check.c      every tier == the engine's own zf_linear_s8 (972 shapes)
           hooked_check.c      the engine's entry points through the hook == golden; the hook took them
           validate_against_ort.py   the kernel == ONNX Runtime's MatMulInteger on real weights
-docs/     engineering-notes.md
+docs/     api.md               the C API, with examples
+          platform-client.md   how the SDK talks to Quran Lab (the same page in every SDK)
+          engineering-notes.md
 vendor/   tajweedformer-engine       the engine (tajweedformer-engine), pinned as a submodule
 ```
 

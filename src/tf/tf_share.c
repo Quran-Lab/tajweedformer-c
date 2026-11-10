@@ -8,9 +8,20 @@
  *   capture.json   written by the capture: segments closed, ended, completed, duration, created (unix s)
  *   item.json      written by the uploader: started, URLs with expiry, segments uploaded, attempts, next attempt
  *   seg-NNNNN.opus the segment files (each deleted once its PUT succeeded)
+ *   seg-NNNNN.json the segment's marker: {"n", "bitrate"} written when the segment opens, plus "granule" (the
+ *                  granule position of its last page) when it closes; kept until the session is removed
  * A crash or restart leaves the folders; the next launch resumes them (a session whose capture died is closed at
- * its last whole page). Sessions older than 7 days are deleted unsent. Turning sharing off deletes them at once and
- * aborts the PUT in flight.
+ * its last whole page, with the bitrate its marker recorded when it opened). Sessions older than 7 days are
+ * deleted unsent. Turning sharing off deletes them at once and aborts the PUT in flight.
+ *
+ * Bitrate (SDK 2.0.1, the shared vectors' bitrate_ladder.json): one ladder per client, in memory, rungs 192000,
+ * 96000, 64000, 32000 bit/s, starting at the top. A network failure of an upload request (no connection, a
+ * timeout, HTTP 408 or 5xx on POST /v1/uploads, POST /v1/uploads/{id}/urls or a segment PUT) steps down; a closed
+ * segment while 120 s or more of closed audio waits steps down; three segment PUTs in a row answered 2xx while at
+ * most 30 s waits step up. The capture takes the ladder's rung when a segment opens (OPUS_SET_BITRATE before the
+ * segment's first packet), so each segment has one bitrate, recorded in its marker. Tried and rejected: changing
+ * mid-segment (no single bitrate to record), persisting the rung across launches (a stale bad network would cost
+ * quality on a good one), rungs below 32 kbit/s (recitation detail lost for little size saved).
  *
  * Trust: desktop uploads at the `capped` tier (unattested token; per-key and per-contributor
  * caps on the server; sessions marked attested=false there). flags.upload_trust[windows|linux]: absent or "capped"
@@ -46,7 +57,7 @@ int tf__client_call(TfClient *c, const char *method, const char *path, const cha
 int tf__client_os_major(void);
 int tf__sharing_may_upload(const TfClient *c);
 void tf__sharing_uploaded(TfClient *c);
-const char *tf__sharing_consent_version(TfClient *c);
+void tf__sharing_grant(TfClient *c, char version[40], char hash[65]);
 int tf__contributor(const char *dir, int create, char id[33], char contributor_key[90], char recovery_hash[65]);
 void tf__contributor_forget(const char *dir);
 extern long long tf__now_override;
@@ -70,7 +81,7 @@ typedef struct {
   TfThread th;
   int thread_on, quit, wake;
   volatile int cancel;
-  int bitrate;
+  int rung, streak;    /* the bitrate ladder (under m) */
   char active[16][33]; /* sessions being captured in this process */
   int n_active;
   int passes;          /* finished upload passes (tests) */
@@ -86,7 +97,6 @@ void tf__share_init(TfClient *c) {
   if (!s) return;
   tf_mutex_init(&s->m);
   tf_cond_init(&s->cv);
-  s->bitrate = TF_SHARING_BITRATE_DEFAULT;
   char *p = tf_path_join(tf__client_dir(c), "outbox");
   if (p) snprintf(s->outbox, sizeof s->outbox, "%s", p);
   free(p);
@@ -181,11 +191,17 @@ static void remove_session(const Share *s, const char *id) {
   char *d = sess_path(s, id, NULL);
   if (!d) return;
   char names[256][64];
-  const int n = list_dir(d, names, 256);
-  for (int i = 0; i < n; ++i) {
-    char *f = tf_path_join(d, names[i]);
-    if (f) remove(f);
-    free(f);
+  /* in rounds: a long session has more files (segments and their markers) than one listing holds */
+  for (int round = 0; round < 64; ++round) {
+    const int n = list_dir(d, names, 256);
+    if (!n) break;
+    int removed = 0;
+    for (int i = 0; i < n; ++i) {
+      char *f = tf_path_join(d, names[i]);
+      if (f) removed += remove(f) == 0;
+      free(f);
+    }
+    if (!removed) break;
   }
 #ifdef _WIN32
   RemoveDirectoryA(d);
@@ -201,6 +217,101 @@ static int is_id(const char *x) {
   return 1;
 }
 
+/* ------------------------------------------------------------------ the bitrate ladder (make_bitrate_ladder.py) */
+static const int kRungs[4] = {192000, 96000, 64000, 32000};
+#define UP_STREAK 3
+#define UP_MAX_BACKLOG_S 30.0
+#define DOWN_BACKLOG_S 120.0
+
+static int ladder_bitrate(Share *s) {
+  tf_mutex_lock(&s->m);
+  const int b = kRungs[s->rung];
+  tf_mutex_unlock(&s->m);
+  return b;
+}
+static void ladder_failed(Share *s) {
+  tf_mutex_lock(&s->m);
+  if (s->rung < 3) s->rung++;
+  s->streak = 0;
+  tf_mutex_unlock(&s->m);
+}
+static void ladder_ok(Share *s, double backlog_s) {
+  tf_mutex_lock(&s->m);
+  if (s->streak < UP_STREAK) s->streak++;
+  if (s->streak >= UP_STREAK && backlog_s <= UP_MAX_BACKLOG_S && s->rung > 0) {
+    s->rung--;
+    s->streak = 0;
+  }
+  tf_mutex_unlock(&s->m);
+}
+static void ladder_closed(Share *s, double backlog_s) {
+  tf_mutex_lock(&s->m);
+  if (backlog_s >= DOWN_BACKLOG_S) {
+    if (s->rung < 3) s->rung++;
+    s->streak = 0;
+  }
+  tf_mutex_unlock(&s->m);
+}
+
+/* ------------------------------------------------------------------ segment markers and the backlog */
+static void marker_write(const Share *s, const char *id, int n, int bitrate, long long granule) {
+  char name[32], t[128];
+  snprintf(name, sizeof name, "seg-%05d.json", n);
+  if (granule >= 0) snprintf(t, sizeof t, "{\"n\":%d,\"bitrate\":%d,\"granule\":%lld}", n, bitrate, granule);
+  else snprintf(t, sizeof t, "{\"n\":%d,\"bitrate\":%d}", n, bitrate);
+  write_text(s, id, name, t);
+}
+/* a marker's bitrate (0 when unknown) and granule (-1 when the segment has not closed) */
+static int marker_read(const Share *s, const char *id, int n, int *bitrate, long long *granule) {
+  char name[32];
+  snprintf(name, sizeof name, "seg-%05d.json", n);
+  TfJson *j = read_json(s, id, name);
+  const TfJson *b = tf_json_get(j, "bitrate"), *g = tf_json_get(j, "granule");
+  if (bitrate) *bitrate = b && b->type == TJ_NUM ? (int)b->num : 0;
+  if (granule) *granule = g && g->type == TJ_NUM ? (long long)g->num : -1;
+  const int ok = j != NULL;
+  tf_json_free(j);
+  return ok ? 0 : -1;
+}
+/* seconds of segment n: (granule_n - granule_{n-1}) / 48000, segment 1 from 0; the plan's length when a marker
+ * cannot be read */
+static double segment_seconds(const Share *s, const char *id, int n) {
+  long long g1 = -1, g0 = 0;
+  marker_read(s, id, n, NULL, &g1);
+  if (n > 1) marker_read(s, id, n - 1, NULL, &g0);
+  if (g1 >= 0 && g0 >= 0 && g1 >= g0) return (double)(g1 - g0) / 48000.0;
+  return (double)(tf_ogg_segment_start(n + 1) - tf_ogg_segment_start(n)) * 960.0 / 48000.0;
+}
+static int uploaded_list_has(const TfJson *item, int n) {
+  const TfJson *up = tf_json_get(item, "uploaded");
+  for (int i = 0; up && up->type == TJ_ARR && i < up->n; ++i)
+    if (up->kids[i].type == TJ_NUM && (int)up->kids[i].num == n) return 1;
+  return 0;
+}
+/* seconds of audio in closed segments not uploaded yet, over every session in the outbox */
+static double backlog_s(const Share *s) {
+  char names[256][64];
+  const int ns = list_dir(s->outbox, names, 256);
+  double sum = 0;
+  for (int i = 0; i < ns; ++i) {
+    if (!is_id(names[i])) continue;
+    TfJson *cap = read_json(s, names[i], "capture.json"), *item = read_json(s, names[i], "item.json");
+    const TfJson *cl = tf_json_get(cap, "closed");
+    const int closed = cl && cl->type == TJ_NUM ? (int)cl->num : 0;
+    for (int n = 1; n <= closed; ++n) {
+      char name[32];
+      snprintf(name, sizeof name, "seg-%05d.opus", n);
+      char *p = sess_path(s, names[i], name);
+      const int waiting = p && tf_file_exists(p) && !uploaded_list_has(item, n);
+      free(p);
+      if (waiting) sum += segment_seconds(s, names[i], n);
+    }
+    tf_json_free(cap);
+    tf_json_free(item);
+  }
+  return sum;
+}
+
 /* ------------------------------------------------------------------ the capture */
 struct TfShareSession {
   TfClient *c;
@@ -211,6 +322,9 @@ struct TfShareSession {
   TfOgg ogg;
   int opened, failed, closed, finished;
   long long samples, created;
+  int seg_bitrate;      /* the bitrate of the segment being written */
+  int next_seg;         /* the next segment to open */
+  long long next_start; /* its first packet */
 };
 
 static void capture_save(TfShareSession *x, int ended, int completed) {
@@ -219,12 +333,32 @@ static void capture_save(TfShareSession *x, int ended, int completed) {
            ended ? "true" : "false", completed ? "true" : "false", x->samples * 1000 / (x->input_rate ? x->input_rate : 48000));
   write_text(sh(x->c), x->id, "capture.json", t);
 }
+/* a segment closed: its marker gets the granule of its last page, capture.json the count, and the ladder hears
+ * of the backlog (this segment included) */
 static void on_segment(void *user, int n, int last) {
   TfShareSession *x = (TfShareSession *)user;
+  Share *s = sh(x->c);
   (void)last;
+  marker_write(s, x->id, n, x->seg_bitrate, x->ogg.last_granule);
   x->closed = n;
   capture_save(x, 0, 0);
-  wake(sh(x->c));
+  ladder_closed(s, backlog_s(s));
+  wake(s);
+}
+/* before each packet: at a segment boundary the closing segment is paged and closed first (so the ladder hears of
+ * it), then the next segment opens at the ladder's bitrate, recorded in its marker before its first packet */
+static int before_packet(void *user, long long packet) {
+  TfShareSession *x = (TfShareSession *)user;
+  if (packet != x->next_start) return 0;
+  Share *s = sh(x->c);
+  if (tf_ogg_flush(&x->ogg)) return -1;
+  const int br = ladder_bitrate(s);
+  if (tf_enc_set_bitrate(&x->enc, br)) return -1;
+  x->seg_bitrate = br;
+  marker_write(s, x->id, x->next_seg, br, -1);
+  x->next_seg++;
+  x->next_start = tf_ogg_segment_start(x->next_seg);
+  return 0;
 }
 static int put_packet(void *user, const uint8_t *p, int n) { return tf_ogg_packet(&((TfShareSession *)user)->ogg, p, n); }
 static int put_samples(void *user, const float *x, int n) {
@@ -251,8 +385,16 @@ static char *session_json(TfClient *c, const char *contributor, const char *key,
   tf_buf_puts(&b, ",\"input_route\":");
   tf_buf_json_str(&b, route);
   tf_buf_puts(&b, ",\"sample_rate\":48000}");
-  const char *cv = tf__sharing_consent_version(c);
-  if (cv && *cv) {
+  /* the version the learner agreed to; with the app's own wording also the SHA-256 of that text (sorted keys:
+   * consent_text_sha256 before consent_version). Without own wording the field is absent: the 2.0.0 schema is
+   * closed. */
+  char cv[40], ch[65];
+  tf__sharing_grant(c, cv, ch);
+  if (ch[0]) {
+    tf_buf_puts(&b, ",\"consent_text_sha256\":");
+    tf_buf_json_str(&b, ch);
+  }
+  if (cv[0]) {
     tf_buf_puts(&b, ",\"consent_version\":");
     tf_buf_json_str(&b, cv);
   }
@@ -318,10 +460,12 @@ TfShareSession *tf__share_begin(TfClient *c, int input_sample_rate, const char *
   free(body);
   set_active(s, x->id, 1);
   capture_save(x, 0, 0);
-  int bitrate;
-  tf_mutex_lock(&s->m);
-  bitrate = s->bitrate;
-  tf_mutex_unlock(&s->m);
+  /* segment 1 opens with the rung in force when the capture starts */
+  const int bitrate = ladder_bitrate(s);
+  x->seg_bitrate = bitrate;
+  x->next_seg = 2;
+  x->next_start = tf_ogg_segment_start(2);
+  marker_write(s, x->id, 1, bitrate, -1);
   uint32_t serial;
   tf_random_bytes((uint8_t *)&serial, sizeof serial);
   char vendor[96];
@@ -337,6 +481,8 @@ TfShareSession *tf__share_begin(TfClient *c, int input_sample_rate, const char *
   free(dir);
   x->ogg.on_segment = on_segment;
   x->ogg.user = x;
+  x->enc.before = before_packet;
+  x->enc.before_user = x;
   x->opened = 1;
   return x;
 }
@@ -418,10 +564,12 @@ static uint32_t page_crc(const uint8_t *d, size_t n) {
   for (size_t i = 0; i < n; ++i) c = (c << 8) ^ crc_tab[((c >> 24) & 0xff) ^ d[i]];
   return c;
 }
-/* bytes of whole, valid pages at the start of `d`, and how many of them carry audio (granule > 0) */
-static size_t whole_pages(const uint8_t *d, size_t n, int *audio) {
+/* bytes of whole, valid pages at the start of `d`, how many of them carry audio (granule > 0), and the granule of
+ * the last one */
+static size_t whole_pages(const uint8_t *d, size_t n, int *audio, long long *last_granule) {
   size_t at = 0;
   *audio = 0;
+  *last_granule = 0;
   while (at + 27 <= n && !memcmp(d + at, "OggS", 4)) {
     const int ns = d[at + 26];
     if (at + 27 + (size_t)ns > n) break;
@@ -440,6 +588,7 @@ static size_t whole_pages(const uint8_t *d, size_t n, int *audio) {
     long long g = 0;
     for (int i = 7; i >= 0; --i) g = (g << 8) | d[at + 6 + i];
     if (g > 0) (*audio)++;
+    *last_granule = g;
     at += len;
   }
   return at;
@@ -454,10 +603,15 @@ static void recover(Share *s, const char *id, const TfJson *cap) {
   int kept = closed;
   if (p && !tf_read_file(p, &data, &n)) {
     int audio = 0;
-    const size_t good = whole_pages((const uint8_t *)data, n, &audio);
+    long long granule = 0;
+    const size_t good = whole_pages((const uint8_t *)data, n, &audio, &granule);
     if (audio > 0) {
       tf_write_file(p, data, good);
       kept = closed + 1;
+      /* the segment closes at its last whole page, with the bitrate its marker recorded when it opened */
+      int br = 0;
+      marker_read(s, id, kept, &br, NULL);
+      marker_write(s, id, kept, br, granule);
     } else {
       remove(p);
     }
@@ -595,9 +749,12 @@ static void retry(Item *it, const char *why, int immediately, int lng) {
 enum { ANS_URLS = 1, ANS_WAIT = 0, ANS_GONE = -1, ANS_OFFLINE = -2 };
 static int answer(TfClient *c, Share *s, const char *id, Item *it, int call_rc, TfHttpResponse *r) {
   if (call_rc) {
+    /* no connection or a timeout: the bitrate steps down (not when the client stopped its calls or has no key) */
+    if (call_rc == TF_ERR_NETWORK) ladder_failed(s);
     retry(it, "offline", 0, 0);
     return ANS_OFFLINE;
   }
+  if (r->status == 408 || r->status >= 500) ladder_failed(s);
   if (r->status >= 200 && r->status < 300) {
     TfJson *j = tf_json_parse(r->body, r->body_n, NULL);
     const char *rid = tf_json_str(tf_json_get(j, "id"));
@@ -792,6 +949,7 @@ static int step(TfClient *c, Share *s, const char *id) {
     free(url);
     if (s->cancel || !tf_client_sharing_state(c)) goto out; /* sharing went off during the PUT */
     if (rc) {
+      ladder_failed(s); /* no connection, a timeout or a transport error */
       retry(&it, "PUT: offline", 0, 0);
       stop = 1;
       goto out;
@@ -807,8 +965,10 @@ static int step(TfClient *c, Share *s, const char *id) {
       char *p = sess_path(s, id, name);
       if (p) remove(p);
       free(p);
+      ladder_ok(s, backlog_s(s));
       continue;
     }
+    if (status == 408 || status >= 500) ladder_failed(s); /* 403 (an expired URL) and other refusals are not the network */
     it.attempts++;
     char why[64];
     snprintf(why, sizeof why, "PUT seg %d: HTTP %d", n, status);
@@ -963,14 +1123,96 @@ int tf_sharing_outbox_wait(TfClient *c, int timeout_ms) {
   return tf_sharing_outbox_pending(c);
 }
 
+/* Since 2.0.1 the adaptive ladder decides every segment's bitrate (the same in every SDK); the call stays for
+ * binary compatibility, checks its argument and changes nothing. */
 int tf_sharing_set_bitrate(TfClient *c, int bits_per_second) {
   Share *s = sh(c);
   if (!s) return tf__fail(TF_ERR_ARGUMENT, "no client");
   if (bits_per_second < 6000 || bits_per_second > 510000) return tf__fail(TF_ERR_ARGUMENT, "Opus bitrates are 6000 to 510000 bit/s");
-  tf_mutex_lock(&s->m);
-  s->bitrate = bits_per_second;
-  tf_mutex_unlock(&s->m);
   return 0;
+}
+
+/* tests: one ladder event (-1 a fresh ladder, 0 upload_failed, 1 upload_ok, 2 segment_closed); returns the bitrate
+ * the next segment opens with */
+int tf__ladder_event(TfClient *c, int event, double backlog_s) {
+  Share *s = sh(c);
+  if (!s) return -1;
+  if (event == -1) {
+    tf_mutex_lock(&s->m);
+    s->rung = s->streak = 0;
+    tf_mutex_unlock(&s->m);
+  } else if (event == 0) {
+    ladder_failed(s);
+  } else if (event == 1) {
+    ladder_ok(s, backlog_s);
+  } else if (event == 2) {
+    ladder_closed(s, backlog_s);
+  }
+  return ladder_bitrate(s);
+}
+
+int tf_sharing_bitrate(TfClient *c) {
+  Share *s = sh(c);
+  if (!s) return tf__fail(TF_ERR_ARGUMENT, "no client");
+  return ladder_bitrate(s);
+}
+
+/* the outbox's items, oldest first: [{"id","created","ended","completed","segments","uploaded","segmentBitrates":
+ * [...],"error"}] (segmentBitrates: one per closed segment, in segment order) */
+char *tf_sharing_outbox_json(TfClient *c) {
+  Share *s = sh(c);
+  if (!s) {
+    tf__fail(TF_ERR_ARGUMENT, "no client");
+    return NULL;
+  }
+  char names[256][64];
+  const int n = list_dir(s->outbox, names, 256);
+  long long created[256];
+  for (int i = 0; i < n; ++i) {
+    TfJson *cap = is_id(names[i]) ? read_json(s, names[i], "capture.json") : NULL;
+    created[i] = cap && tf_json_get(cap, "created") ? (long long)tf_json_get(cap, "created")->num : 0;
+    tf_json_free(cap);
+  }
+  int order[256];
+  for (int i = 0; i < n; ++i) order[i] = i;
+  for (int i = 1; i < n; ++i)
+    for (int k = i; k > 0 && created[order[k]] < created[order[k - 1]]; --k) {
+      const int t = order[k];
+      order[k] = order[k - 1];
+      order[k - 1] = t;
+    }
+  TfBuf b;
+  tf_buf_init(&b);
+  tf_buf_puts(&b, "[");
+  int first = 1;
+  for (int oi = 0; oi < n; ++oi) {
+    const char *id = names[order[oi]];
+    if (!is_id(id)) continue;
+    TfJson *cap = read_json(s, id, "capture.json");
+    if (!cap) continue;
+    Item it;
+    item_load(s, id, &it);
+    const TfJson *cl = tf_json_get(cap, "closed"), *en = tf_json_get(cap, "ended"), *co = tf_json_get(cap, "completed");
+    const int closed = cl && cl->type == TJ_NUM ? (int)cl->num : 0;
+    int up = 0;
+    for (int k = 1; k <= closed; ++k) up += item_done(&it, k);
+    tf_buf_printf(&b, "%s{\"id\":\"%s\",\"created\":%lld,\"ended\":%s,\"completed\":%s,\"segments\":%d,\"uploaded\":%d,\"segmentBitrates\":[",
+                  first ? "" : ",", id, created[order[oi]], en && en->type == TJ_BOOL && en->boolean ? "true" : "false",
+                  co && co->type == TJ_BOOL && co->boolean ? "true" : "false", closed, up);
+    for (int k = 1; k <= closed; ++k) {
+      int br = 0;
+      marker_read(s, id, k, &br, NULL);
+      tf_buf_printf(&b, "%s%d", k > 1 ? "," : "", br);
+    }
+    tf_buf_puts(&b, "],\"error\":");
+    tf_buf_json_str(&b, it.error);
+    tf_buf_puts(&b, "}");
+    first = 0;
+    item_free(&it);
+    tf_json_free(cap);
+  }
+  tf_buf_puts(&b, "]");
+  return tf_buf_take(&b);
 }
 
 /* sharing went off (or what was shared was deleted): the PUT in flight is aborted and every session not being

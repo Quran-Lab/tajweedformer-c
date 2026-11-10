@@ -6,7 +6,7 @@ typedef struct {
   TfJson *fx;
   const char *config_name; /* which recorded config to answer */
   int tamper, wrong_kid;
-  char last_path[256], last_inm[128];
+  char last_path[256], last_inm[128], config_path[256];
   char *bodies[16]; /* request bodies seen, by route */
 } Replay;
 static Replay g_rp;
@@ -30,6 +30,7 @@ static int replay(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
   for (const char *const *h = q->headers; h && *h; ++h)
     if (!_tf_strnicmp(*h, "if-none-match:", 14)) snprintf(g_rp.last_inm, sizeof g_rp.last_inm, "%s", *h + 15);
   const int rt = path ? route_of(path) : -1;
+  if (rt == 2) snprintf(g_rp.config_path, sizeof g_rp.config_path, "%s", path);
   if (rt >= 0 && q->body) {
     free(g_rp.bodies[rt]);
     g_rp.bodies[rt] = (char *)malloc(q->body_n + 1);
@@ -67,6 +68,30 @@ static void keys_within(const TfJson *got, const TfJson *want, const char *at, i
 }
 static TfJson *parse_or_null(const char *t) { return t ? tf_json_parse(t, strlen(t), NULL) : NULL; }
 
+/* A verified config as the client stores it (config.body, and config_exp in client.json; the stored body was
+ * verified when it arrived). Since 2.0.1 sharing is offered only where the signed config says so, and these tests
+ * have no config server. flags: the "flags" object; NULL removes any stored config. */
+static void seed_config(const char *dir, const char *flags) {
+  tf_mkdirs(dir);
+  char *pb = tf_path_join(dir, "config.body"), *pc = tf_path_join(dir, "client.json");
+  TfBuf b;
+  tf_buf_init(&b);
+  if (flags) {
+    tf_buf_printf(&b, "{\"v\":1,\"app\":\"linux:org.example.test\",\"flags\":%s}", flags);
+    tf_write_file(pb, b.p, b.n);
+  } else {
+    remove(pb);
+  }
+  tf_buf_free(&b);
+  tf_buf_init(&b);
+  tf_buf_printf(&b, "{\"bucket\":7,\"pending_new_install\":false,\"token\":\"\",\"token_exp\":0,\"etag\":\"\",\"config_exp\":%lld}",
+                flags ? (long long)time(NULL) + 86400 : 0LL);
+  tf_write_file(pc, b.p, b.n);
+  tf_buf_free(&b);
+  free(pb);
+  free(pc);
+}
+
 static int client_tests(const char *fx_path, const char *dir, const char *model_dir) {
   char *text = NULL;
   size_t n;
@@ -98,7 +123,7 @@ static int client_tests(const char *fx_path, const char *dir, const char *model_
   CHECK(reg && tf_json_get(reg, "new_install") && tf_json_get(reg, "new_install")->boolean, "register: new_install on the first launch");
   tf_json_free(att);
   tf_json_free(reg);
-  CHECK(strstr(g_rp.last_path, "sdk=2.0.0") && strstr(g_rp.last_path, "bucket="), "config query %s", g_rp.last_path);
+  CHECK(strstr(g_rp.config_path, "sdk=2.0.1") && strstr(g_rp.config_path, "bucket="), "config query %s", g_rp.config_path);
   CHECK(tf_client_refresh_config(c) == 0 && g_rp.last_inm[0] == '"', "304 refresh (If-None-Match %s)", g_rp.last_inm);
   CHECK(tf_client_config_json(c) != NULL, "config lost after 304");
   /* within 1 h of expiry: an unconditional fetch; a tampered body and an unknown key id are refused */
@@ -139,10 +164,27 @@ static int client_tests(const char *fx_path, const char *dir, const char *model_
   CHECK(tf_client_report_issue(c, "model_load", "client_e2e", NULL) == 0, "issue dedupe");
   CHECK(tf_client_report_issue(c, "made_up", "x", NULL) != 0, "an unknown issue kind was accepted");
   const int sent = tf_client_flush(c, 1);
-  CHECK(sent == 1, "events: %d days sent", sent);
+  CHECK(sent == 1, "events: %d deltas sent", sent);
   TfJson *ev = parse_or_null(g_rp.bodies[3]), *is = parse_or_null(g_rp.bodies[4]);
   const TfJson *rec = tf_json_get(tf_json_get(exchange("events v2 (linux)"), "request"), "body");
-  keys_within(ev, rec, "events", 1);
+  /* the recorded 2.0.0 body's fields, and the 2.0.1 ones (each optional on the server; report_id always sent) */
+  {
+    static const char *const added[] = {"report_id", "launches", "ayahs", "surah_ayahs", "words", "rule_checks", "rule_flags",
+                                        "share_asked", "share_yes", "share_no"};
+    TfBuf wb;
+    tf_buf_init(&wb);
+    tf_json_write(&wb, rec);
+    if (wb.n > 1) wb.n--; /* drop the closing brace */
+    for (size_t i = 0; i < sizeof added / sizeof added[0]; ++i) tf_buf_printf(&wb, ",\"%s\":0", added[i]);
+    tf_buf_puts(&wb, "}");
+    TfJson *rec201 = wb.p ? tf_json_parse(wb.p, wb.n, NULL) : NULL;
+    keys_within(ev, rec201, "events", 0);
+    keys_within(rec, ev, "events (recorded fields present)", 0);
+    tf_json_free(rec201);
+    tf_buf_free(&wb);
+    const char *rid = tf_json_str(tf_json_get(ev, "report_id"));
+    CHECK(rid && strlen(rid) == 32 && strspn(rid, "0123456789abcdef") == 32, "report_id %s", rid ? rid : "missing");
+  }
   keys_within(tf_json_get(ev, "device"), tf_json_get(rec, "device"), "events.device", 1);
   const TfJson *co = tf_json_get(ev, "cohorts");
   CHECK(co && co->n == 1, "events: one cohort");
@@ -155,13 +197,43 @@ static int client_tests(const char *fx_path, const char *dir, const char *model_
   tf_client_destroy(c);
   printf("client replay (the portal team fixtures, local key id %s): %s\n", tf_json_str(tf_json_get(g_rp.fx, "local_key_id")), fails ? "FAIL" : "ok");
 
-  /* the sharing state machine: never before a session with feedback; the first ask and two re-asks, 7 sessions apart */
+  /* the sharing state machine: never before a session with feedback; the first ask and two re-asks, 7 sessions apart,
+   * then never again */
   tf_http_set_transport(NULL, NULL);
   tf__now_override = 0;
   char sdir[1024];
   snprintf(sdir, sizeof sdir, "%s/sharing", dir);
   TfClientOptions so = tf_client_default_options();
   so.app_id = "org.example.Sharing";
+  /* 2.0.1: the backend decides whether the sheet is offered; the app's option is ignored either way */
+  {
+    char d0[1100];
+    int asked = 0;
+    struct { const char *flags; int option, want; const char *what; } cases[] = {
+        {NULL, 1, 0, "no config in force: nothing offered, even with the option"},
+        {"{\"contributions\":false}", 1, 0, "the config says no: the option cannot force it"},
+        {"{\"contributions\":\"true\"}", 1, 0, "only a literal true"},
+        {"{\"contributions\":true}", 0, 1, "the config says yes: offered without the option"},
+    };
+    for (int k = 0; k < 4; ++k) {
+      snprintf(d0, sizeof d0, "%s/offer%d", dir, k);
+      seed_config(d0, cases[k].flags);
+      so.storage_dir = d0;
+      so.contributions = cases[k].option;
+      TfClient *oc = tf_client_create(&so);
+      TfSessionStats ss;
+      memset(&ss, 0, sizeof ss);
+      ss.struct_size = sizeof ss;
+      ss.feedback_shown = 1;
+      tf_client_session_finished(oc, &ss);
+      asked = oc && strstr(tf_client_sharing_status_json(oc), "\"pendingAsk\":true") != NULL;
+      CHECK(asked == cases[k].want, "%s: %s", cases[k].what, oc ? tf_client_sharing_status_json(oc) : "no client");
+      /* offered is never consent: not sharing until the learner answers */
+      CHECK(oc && tf_client_sharing_state(oc) == 0, "%s: sharing before any answer", cases[k].what);
+      tf_client_destroy(oc);
+    }
+  }
+  seed_config(sdir, "{\"contributions\":true}");
   so.storage_dir = sdir;
   so.contributions = 1;
   TfClient *sc = tf_client_create(&so);
@@ -184,6 +256,19 @@ static int client_tests(const char *fx_path, const char *dir, const char *model_
   /* desktop uploads at the capped tier when the config names no tier for it */
   CHECK(sc && strstr(tf_client_sharing_status_json(sc), "\"uploadTrust\":\"capped\"") && strstr(tf_client_sharing_status_json(sc), "\"mayUpload\":true"),
         "a desktop install uploads at the capped tier by default: %s", sc ? tf_client_sharing_status_json(sc) : "");
+  /* three sheets per install, ever: none after a restart either, and ask_now asks nothing */
+  tf_client_destroy(sc);
+  sc = tf_client_create(&so);
+  for (int i = 0; i < 30 && sc; ++i) {
+    TfSessionStats ss;
+    memset(&ss, 0, sizeof ss);
+    ss.struct_size = sizeof ss;
+    ss.feedback_shown = 1;
+    tf_client_session_finished(sc, &ss);
+  }
+  CHECK(sc && tf_client_sharing_ask_now(sc) == 0 && strstr(tf_client_sharing_status_json(sc), "\"asks\":3,") &&
+            strstr(tf_client_sharing_status_json(sc), "\"pendingAsk\":false"),
+        "a fourth sheet after a restart: %s", sc ? tf_client_sharing_status_json(sc) : "");
   tf_client_sharing_set(sc, 1);
   CHECK(tf_client_sharing_state(sc) == 1, "the settings switch turns sharing on");
   tf_client_destroy(sc);

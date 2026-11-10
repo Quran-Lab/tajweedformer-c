@@ -1,6 +1,27 @@
-/* Recitation sharing: the consent state machine, the embedded copy decks, the settings calls, and whether this install may upload at all
- * (PLATFORM_CLIENT.md section 9: flags.contributions and flags.upload_trust[windows|linux], default
- * "attested", which no desktop install can satisfy, so a Windows or Linux app shares nothing unless Quran Lab\1opens the "capped" tier). State: sharing.json in the client's storage directory. */
+/* Recitation sharing: the consent state machine (the same rules as the web SDK), the embedded copy decks, the
+ * app's own wording, the settings calls, and whether this install may upload at all (the platform client doc:
+ * flags.contributions and flags.upload_trust[windows|linux]). State: sharing.json in the client's storage
+ * directory.
+ *
+ * Asking (Quran Lab, 11-10): the sheet is shown at most three times per install, ever (asks, persisted, carried
+ * over from 2.0.0's sharing.json). The first ask follows a finished session with feedback; "Not now" (or a sheet
+ * left unanswered) may lead to a re-ask at least 7 sessions later, until the third showing. A yes ends asking for
+ * good, across copy decks, wording and SDK upgrades; so does turning sharing off. After that only the settings
+ * switch (tf_client_sharing_set) turns sharing on or off.
+ *
+ * Consent versions (SDK 2.0.1): the grant records what the learner agreed to at that moment: the copy deck's
+ * consent_version, or with the app's own wording (tf_sharing_set_wording) "custom-" + the first 24 hex digits of
+ * the SHA-256 of the canonical text (the shared vectors' consent_text.json) and that hash. Every shared session
+ * carries the recorded version (and hash), never the one in force later. A grant persists: a new deck or new
+ * wording only changes what a new grant records and what the sheet shows.
+ * Tried and rejected: comparing the recorded version with the one in force and asking again with an update
+ * variant (the recording-fix builds); Quran Lab's rule is that a learner who said yes is never asked again.
+ *
+ * Upgrades: 2.0.0 wrote the same sharing.json ({"v":1,"consent","asks","lastAskSession","sessions","thanked",
+ * "decidedAt","consentVersion","guardian","sharedSessions","pendingAsk"}) and recorded consentVersion with every
+ * grant. A granted state without one gets the version 2.0.0 bundled (kVersion200). A state that said yes and was
+ * then put back to "unknown" by a deck or wording change (2.0.0 did that at start-up, the recording-fix builds
+ * with their update flag) is a grant again. */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -18,6 +39,7 @@
 #endif
 
 #include "tf_internal.h"
+#include "tf_thread.h"
 
 typedef struct {
   const char *lang;
@@ -30,6 +52,7 @@ const TfClientOptions *tf__client_options(const TfClient *c);
 void **tf__client_sharing_slot(TfClient *c);
 int tf__client_flag(const TfClient *c, const char *name, int dflt);
 void tf__client_upload_trust(const TfClient *c, char *out, size_t n);
+void tf__telemetry_add(TfClient *c, const char *field, long long n);
 
 int tf_random_bytes(uint8_t *out, size_t n) {
 #ifdef _WIN32
@@ -61,7 +84,7 @@ const char *tf_sharing_copy_json(const char *language) {
     if (!strcmp(tf__copy_decks[i].lang, "en")) return tf__copy_decks[i].json;
   return NULL;
 }
-static void consent_version(const char *lang, char *out, size_t n) {
+static void deck_consent_version(const char *lang, char *out, size_t n) {
   const char *d = tf_sharing_copy_json(lang);
   TfJson *j = d ? tf_json_parse(d, strlen(d), NULL) : NULL;
   const char *v = tf_json_str(tf_json_get(j, "consent_version"));
@@ -70,11 +93,25 @@ static void consent_version(const char *lang, char *out, size_t n) {
 }
 
 /* ------------------------------------------------------------------ state */
+#define MAX_ASKS 3           /* sheets shown per install, ever */
+#define REASK_SESSIONS 7     /* sessions between a "Not now" and the next ask */
+/* the consent_version of the decks 2.0.0 bundled (every language: 2026-11-07.1) */
+static const char kVersion200[] = "share-2026-11-07";
+
 typedef struct {
   char consent[12]; /* unknown, granted, declined, final */
   int asks, last_ask_session, sessions, thanked, guardian, shared_sessions, pending_ask;
   long long decided_at;
-  char consent_version[40];
+  char consent_version[40];   /* the version the learner agreed to */
+  char consent_hash[65];      /* with the app's own wording: the SHA-256 of the text agreed to */
+  /* the app's wording (tf_sharing_set_wording) and what follows from it */
+  TfMutex lock;
+  char **keys, **texts;
+  int n_words;
+  char effective[40];         /* the version in force: the deck's, or custom-<24 hex> */
+  char effective_hash[65];    /* "" without overrides */
+  char *canonical;            /* the canonical text, NULL without overrides */
+  char *copy;                 /* the client's copy deck with the overrides, NULL without overrides */
 } Share;
 
 static char *state_path(const TfClient *c) { return tf_path_join(tf__client_dir(c), "sharing.json"); }
@@ -89,6 +126,9 @@ static void share_save(const TfClient *c, const Share *s) {
   tf_buf_puts(&b, ",\"consentVersion\":");
   if (s->consent_version[0]) tf_buf_json_str(&b, s->consent_version);
   else tf_buf_puts(&b, "null");
+  tf_buf_puts(&b, ",\"consentTextSha256\":");
+  if (s->consent_hash[0]) tf_buf_json_str(&b, s->consent_hash);
+  else tf_buf_puts(&b, "null");
   tf_buf_printf(&b, ",\"guardian\":%s,\"sharedSessions\":%d,\"pendingAsk\":%d}", s->guardian ? "true" : "false", s->shared_sessions,
                 s->pending_ask);
   char *p = state_path(c);
@@ -100,6 +140,7 @@ static void share_save(const TfClient *c, const Share *s) {
 void tf__sharing_init(TfClient *c) {
   Share *s = (Share *)calloc(1, sizeof *s);
   if (!s) return;
+  tf_mutex_init(&s->lock);
   snprintf(s->consent, sizeof s->consent, "unknown");
   char *p = state_path(c), *text = NULL;
   size_t n;
@@ -126,38 +167,315 @@ void tf__sharing_init(TfClient *c) {
     if (d && d->type == TJ_NUM) s->decided_at = (long long)d->num;
     const char *cv = tf_json_str(tf_json_get(j, "consentVersion"));
     if (cv) snprintf(s->consent_version, sizeof s->consent_version, "%s", cv);
+    const char *ch = tf_json_str(tf_json_get(j, "consentTextSha256"));
+    if (ch) snprintf(s->consent_hash, sizeof s->consent_hash, "%s", ch);
     tf_json_free(j);
+    /* upgrades (see the top): a grant keeps the version it was given to, or 2.0.0's when none was written; a yes
+     * that a deck or wording change put back to "unknown" is a grant again, without a sheet */
+    int migrated = 0;
+    if (!strcmp(s->consent, "unknown") && s->consent_version[0]) {
+      snprintf(s->consent, sizeof s->consent, "granted");
+      s->pending_ask = 0;
+      migrated = 1;
+    }
+    if (!strcmp(s->consent, "granted") && !s->consent_version[0]) {
+      snprintf(s->consent_version, sizeof s->consent_version, "%s", kVersion200);
+      s->consent_hash[0] = 0;
+      migrated = 1;
+    }
+    if (migrated) share_save(c, s);
   }
   free(text);
   free(p);
-  /* a new consent_version (new disclosure) asks again, once */
-  char cv[40];
-  consent_version(tf__client_options(c)->language, cv, sizeof cv);
-  if (!strcmp(s->consent, "granted") && s->consent_version[0] && strcmp(s->consent_version, cv)) {
-    snprintf(s->consent, sizeof s->consent, "unknown");
-    s->asks = 0;
-  }
+  deck_consent_version(tf__client_options(c)->language, s->effective, sizeof s->effective);
   *tf__client_sharing_slot(c) = s;
 }
+static void words_clear(Share *s) {
+  for (int i = 0; i < s->n_words; ++i) {
+    free(s->keys[i]);
+    free(s->texts[i]);
+  }
+  free(s->keys);
+  free(s->texts);
+  free(s->canonical);
+  free(s->copy);
+  s->keys = s->texts = NULL;
+  s->canonical = s->copy = NULL;
+  s->n_words = 0;
+  s->effective_hash[0] = 0;
+}
 void tf__sharing_free(TfClient *c) {
-  free(*tf__client_sharing_slot(c));
+  Share *s = (Share *)*tf__client_sharing_slot(c);
+  if (s) {
+    words_clear(s);
+    tf_mutex_destroy(&s->lock);
+  }
+  free(s);
   *tf__client_sharing_slot(c) = NULL;
 }
 static Share *share(TfClient *c) { return (Share *)*tf__client_sharing_slot(c); }
 
-/* enabled = the app's contributions option AND the signed config's flags.contributions not false */
-static int sharing_enabled(const TfClient *c) { return tf__client_options(c)->contributions && tf__client_flag(c, "contributions", 1); }
+/* granted, to whatever version was in force then */
+static int granted(Share *s) {
+  tf_mutex_lock(&s->lock);
+  const int ok = !strcmp(s->consent, "granted");
+  tf_mutex_unlock(&s->lock);
+  return ok;
+}
+/* asking is over: a yes (granted, or a version recorded by a yes, whatever came after it), sharing turned off
+ * ("final", also after the third "Not now"), or three sheets shown */
+static int asking_ended(Share *s) {
+  tf_mutex_lock(&s->lock);
+  const int ended = !strcmp(s->consent, "granted") || !strcmp(s->consent, "final") || s->consent_version[0] || s->asks >= MAX_ASKS;
+  tf_mutex_unlock(&s->lock);
+  return ended;
+}
 
-/* may this install upload (web and desktop upload at the lower trust tier): flags.upload_trust
- * [windows|linux] absent or "capped" = yes (unattested token, per-key and per-contributor caps, sessions marked
- * attested=false by the server); "off", or "attested" (which no desktop install can satisfy) = no */
+/* ------------------------------------------------------------------ the app's own wording */
+/* the deck's string keys (impact.minutes by plural category) */
+static const char *const kPlural[] = {"zero", "one", "two", "few", "many", "other"};
+static int known_key(const char *key) {
+  const char *en = tf_sharing_copy_json("en");
+  TfJson *j = en ? tf_json_parse(en, strlen(en), NULL) : NULL;
+  const TfJson *strs = tf_json_get(j, "strings");
+  int ok = 0;
+  const TfJson *v = tf_json_get(strs, key);
+  if (v && v->type == TJ_STR) ok = 1;
+  if (!ok && !strncmp(key, "impact.minutes.", 15) && tf_json_get(strs, "impact.minutes"))
+    for (size_t i = 0; i < sizeof kPlural / sizeof kPlural[0]; ++i) ok |= !strcmp(key + 15, kPlural[i]);
+  tf_json_free(j);
+  return ok;
+}
+/* well-formed UTF-8 */
+static int utf8_ok(const unsigned char *p) {
+  while (*p) {
+    int k = *p < 0x80 ? 0 : (*p & 0xe0) == 0xc0 ? 1 : (*p & 0xf0) == 0xe0 ? 2 : (*p & 0xf8) == 0xf0 ? 3 : -1;
+    if (k < 0 || (k == 1 && *p < 0xc2) || (k == 3 && *p > 0xf4)) return 0;
+    for (int i = 1; i <= k; ++i)
+      if ((p[i] & 0xc0) != 0x80) return 0;
+    p += k + 1;
+  }
+  return 1;
+}
+/* only white space (Unicode White_Space, the BOM too), or empty */
+static int blank(const char *t) {
+  const unsigned char *p = (const unsigned char *)t;
+  while (*p) {
+    if (*p == ' ' || (*p >= 0x09 && *p <= 0x0d)) {
+      p++;
+      continue;
+    }
+    unsigned cp = 0;
+    int k = 0;
+    if ((*p & 0xe0) == 0xc0) cp = *p & 0x1f, k = 1;
+    else if ((*p & 0xf0) == 0xe0) cp = *p & 0x0f, k = 2;
+    else if ((*p & 0xf8) == 0xf0) cp = *p & 0x07, k = 3;
+    else return 0;
+    for (int i = 1; i <= k; ++i) cp = (cp << 6) | (p[i] & 0x3f);
+    const int ws = cp == 0x85 || cp == 0xa0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200a) || cp == 0x2028 || cp == 0x2029 ||
+                   cp == 0x202f || cp == 0x205f || cp == 0x3000 || cp == 0xfeff;
+    if (!ws) return 0;
+    p += k + 1;
+  }
+  return 1;
+}
+static char *dup_s(const char *s) {
+  const size_t n = strlen(s) + 1;
+  char *p = (char *)malloc(n);
+  if (p) memcpy(p, s, n);
+  return p;
+}
+/* the canonical text of the shared vectors (make_consent_text.py) */
+static char *canonical_text(const char *base, char **keys, char **texts, int n) {
+  int *order = (int *)malloc(sizeof(int) * (size_t)(n ? n : 1));
+  if (!order) return NULL;
+  /* keys by their UTF-8 bytes (strcmp compares as unsigned char) */
+  for (int i = 0; i < n; ++i) {
+    int k = i;
+    while (k > 0 && strcmp(keys[order[k - 1]], keys[i]) > 0) {
+      order[k] = order[k - 1];
+      k--;
+    }
+    order[k] = i;
+  }
+  TfBuf b;
+  tf_buf_init(&b);
+  tf_buf_printf(&b, "quranlab.consent-text/1\nbase %s\n", base);
+  for (int i = 0; i < n; ++i) {
+    tf_buf_puts(&b, keys[order[i]]);
+    tf_buf_puts(&b, "\t");
+    for (const char *p = texts[order[i]]; *p; ++p) {
+      if (*p == '\\') tf_buf_puts(&b, "\\\\");
+      else if (*p == '\n') tf_buf_puts(&b, "\\n");
+      else if (*p == '\r') tf_buf_puts(&b, "\\r");
+      else if (*p == '\t') tf_buf_puts(&b, "\\t");
+      else tf_buf_put(&b, p, 1);
+    }
+    tf_buf_puts(&b, "\n");
+  }
+  free(order);
+  return tf_buf_take(&b);
+}
+static const char *override_of(char **keys, char **texts, int n, const char *key) {
+  for (int i = 0; i < n; ++i)
+    if (!strcmp(keys[i], key)) return texts[i];
+  return NULL;
+}
+/* the deck with the overrides put in (impact.minutes by category) and the effective consent_version */
+static char *merged_copy(const char *deck, const char *version, char **keys, char **texts, int n) {
+  TfJson *j = deck ? tf_json_parse(deck, strlen(deck), NULL) : NULL;
+  if (!j || j->type != TJ_OBJ) {
+    tf_json_free(j);
+    return NULL;
+  }
+  TfBuf b;
+  tf_buf_init(&b);
+  tf_buf_puts(&b, "{");
+  for (int i = 0; i < j->n; ++i) {
+    const TfJson *k = &j->kids[i];
+    if (i) tf_buf_puts(&b, ",");
+    tf_buf_json_str(&b, k->key);
+    tf_buf_puts(&b, ":");
+    if (!strcmp(k->key, "consent_version")) {
+      tf_buf_json_str(&b, version);
+    } else if (!strcmp(k->key, "strings") && k->type == TJ_OBJ) {
+      tf_buf_puts(&b, "{");
+      for (int m = 0; m < k->n; ++m) {
+        const TfJson *v = &k->kids[m];
+        if (m) tf_buf_puts(&b, ",");
+        tf_buf_json_str(&b, v->key);
+        tf_buf_puts(&b, ":");
+        const char *o = v->type == TJ_STR ? override_of(keys, texts, n, v->key) : NULL;
+        if (o) {
+          tf_buf_json_str(&b, o);
+        } else if (!strcmp(v->key, "impact.minutes") && v->type == TJ_OBJ) {
+          tf_buf_puts(&b, "{");
+          int w = 0;
+          char pk[64];
+          for (int q = 0; q < v->n; ++q) {
+            snprintf(pk, sizeof pk, "impact.minutes.%s", v->kids[q].key);
+            const char *po = override_of(keys, texts, n, pk);
+            tf_buf_puts(&b, w++ ? "," : "");
+            tf_buf_json_str(&b, v->kids[q].key);
+            tf_buf_puts(&b, ":");
+            if (po) tf_buf_json_str(&b, po);
+            else tf_json_write(&b, &v->kids[q]);
+          }
+          /* a category the app worded that this language's deck lacks */
+          for (int q = 0; q < n; ++q)
+            if (!strncmp(keys[q], "impact.minutes.", 15) && !tf_json_get(v, keys[q] + 15)) {
+              tf_buf_puts(&b, w++ ? "," : "");
+              tf_buf_json_str(&b, keys[q] + 15);
+              tf_buf_puts(&b, ":");
+              tf_buf_json_str(&b, texts[q]);
+            }
+          tf_buf_puts(&b, "}");
+        } else {
+          tf_json_write(&b, v);
+        }
+      }
+      tf_buf_puts(&b, "}");
+    } else {
+      tf_json_write(&b, k);
+    }
+  }
+  tf_buf_puts(&b, "}");
+  tf_json_free(j);
+  return tf_buf_take(&b);
+}
+
+int tf_sharing_set_wording(TfClient *c, const char *const *keys, const char *const *texts, int n) {
+  tf__clear_error();
+  Share *s = c ? share(c) : NULL;
+  if (!s) return tf__fail(TF_ERR_ARGUMENT, "no client");
+  if (n < 0 || (n > 0 && (!keys || !texts))) return tf__fail(TF_ERR_ARGUMENT, "keys and texts are required");
+  if (!keys) n = 0;
+  for (int i = 0; i < n; ++i) {
+    if (!keys[i] || !known_key(keys[i])) return tf__fail(TF_ERR_ARGUMENT, "wording: unknown key %s", keys[i] ? keys[i] : "(null)");
+    if (!texts[i] || !utf8_ok((const unsigned char *)texts[i])) return tf__fail(TF_ERR_ARGUMENT, "wording: %s is not UTF-8 text", keys[i]);
+    if (blank(texts[i])) return tf__fail(TF_ERR_ARGUMENT, "wording: %s is empty or blank", keys[i]);
+    for (int k = 0; k < i; ++k)
+      if (!strcmp(keys[k], keys[i])) return tf__fail(TF_ERR_ARGUMENT, "wording: %s is given twice", keys[i]);
+  }
+  char base[40];
+  deck_consent_version(tf__client_options(c)->language, base, sizeof base);
+  char **nk = NULL, **nt = NULL, *canon = NULL, *copy = NULL;
+  char eff[40], hash[65] = "";
+  snprintf(eff, sizeof eff, "%s", base);
+  if (n > 0) {
+    nk = (char **)calloc((size_t)n, sizeof(char *));
+    nt = (char **)calloc((size_t)n, sizeof(char *));
+    int oom = !nk || !nt;
+    for (int i = 0; !oom && i < n; ++i) {
+      nk[i] = dup_s(keys[i]);
+      nt[i] = dup_s(texts[i]);
+      oom = !nk[i] || !nt[i];
+    }
+    canon = oom ? NULL : canonical_text(base, nk, nt, n);
+    if (canon) {
+      uint8_t h[32];
+      tf_sha256(canon, strlen(canon), h);
+      tf_hex_encode(h, 32, hash);
+      snprintf(eff, sizeof eff, "custom-%.24s", hash);
+      copy = merged_copy(tf_sharing_copy_json(tf__client_options(c)->language), eff, nk, nt, n);
+    }
+    if (!canon || !copy) {
+      for (int i = 0; i < n; ++i) {
+        if (nk) free(nk[i]);
+        if (nt) free(nt[i]);
+      }
+      free(nk);
+      free(nt);
+      free(canon);
+      free(copy);
+      return tf__fail(TF_ERR_NO_MEMORY, "out of memory");
+    }
+  }
+  tf_mutex_lock(&s->lock);
+  words_clear(s);
+  s->keys = nk;
+  s->texts = nt;
+  s->n_words = n;
+  s->canonical = canon;
+  s->copy = copy;
+  snprintf(s->effective, sizeof s->effective, "%s", eff);
+  snprintf(s->effective_hash, sizeof s->effective_hash, "%s", hash);
+  tf_mutex_unlock(&s->lock);
+  return 0;
+}
+const char *tf_sharing_consent_version(TfClient *c) { return c && share(c) ? share(c)->effective : NULL; }
+const char *tf_sharing_consent_sha256(TfClient *c) { return c && share(c) && share(c)->effective_hash[0] ? share(c)->effective_hash : NULL; }
+const char *tf_sharing_consent_text(TfClient *c) { return c && share(c) ? share(c)->canonical : NULL; }
+const char *tf_client_sharing_copy_json(TfClient *c) {
+  if (!c || !share(c)) return NULL;
+  return share(c)->copy ? share(c)->copy : tf_sharing_copy_json(tf__client_options(c)->language);
+}
+
+/* enabled = the signed config in force offers sharing to this app: flags.contributions literally true. Quran Lab
+ * decides this per app (11-09); since 2.0.1 the app's contributions option is ignored, and without a config in
+ * force nothing is offered (2.0.0 defaulted to on when the config was missing). Enabled is never consent:
+ * tf_client_sharing_state and every capture and upload also need the learner's "granted". */
+static int sharing_enabled(const TfClient *c) { return tf__client_flag(c, "contributions", 0); }
+
+/* may this install upload (web and desktop upload at the lower trust tier): flags.upload_trust[windows|linux]
+ * absent or "capped" = yes (unattested token, per-key and per-contributor caps, sessions marked attested=false by
+ * the server); "off", or "attested" (which no desktop install can satisfy) = no */
 int tf__sharing_may_upload(const TfClient *c) {
   char t[16];
   tf__client_upload_trust(c, t, sizeof t);
   return sharing_enabled(c) && (!t[0] || !strcmp(t, "capped"));
 }
-/* the copy deck version the learner agreed to (the upload's consent_version) */
-const char *tf__sharing_consent_version(TfClient *c) { return share(c) ? share(c)->consent_version : NULL; }
+/* what the learner agreed to (the upload's consent_version, and consent_text_sha256 for the app's own wording;
+ * hash "" without it) */
+void tf__sharing_grant(TfClient *c, char version[40], char hash[65]) {
+  Share *s = share(c);
+  version[0] = hash[0] = 0;
+  if (!s) return;
+  tf_mutex_lock(&s->lock);
+  snprintf(version, 40, "%s", s->consent_version);
+  snprintf(hash, 65, "%s", s->consent_hash);
+  tf_mutex_unlock(&s->lock);
+}
 /* a session went up completely: counted for the status (the thank-you after the first) */
 void tf__sharing_uploaded(TfClient *c) {
   Share *s = share(c);
@@ -167,21 +485,24 @@ void tf__sharing_uploaded(TfClient *c) {
 }
 void tf__share_wipe(TfClient *c);
 
+/* the SDK asks: the app's callback (its own UI or a sheet it shows) or, without one, a pending ask the app reads
+ * from the status. Either way it is one of the three showings (asks, telemetry share_asked). */
 static void ask(TfClient *c, int reask) {
   Share *s = share(c);
   const TfClientOptions *o = tf__client_options(c);
   s->asks++;
   s->last_ask_session = s->sessions;
+  s->pending_ask = o->on_consent ? 0 : 1;
   share_save(c, s);
+  tf__telemetry_add(c, "share_asked", 1);
   if (o->on_consent) {
     TfConsentRequest r;
+    memset(&r, 0, sizeof r); /* r.update stays 0 since 2.0.1 */
     r.reask = reask ? s->asks - 1 : 0;
     r.guardian = o->children;
-    r.copy_json = tf_sharing_copy_json(o->language);
+    r.copy_json = tf_client_sharing_copy_json(c);
+    r.consent_version = s->effective;
     o->on_consent(o->user, &r);
-  } else {
-    s->pending_ask = 1; /* the app can read it from the status and show the sheet itself */
-    share_save(c, s);
   }
 }
 
@@ -191,63 +512,91 @@ void tf__sharing_session(TfClient *c, int feedback, double audio_s) {
   (void)audio_s;
   s->sessions++;
   share_save(c, s);
-  if (!sharing_enabled(c) || !feedback) return;
-  if (!strcmp(s->consent, "unknown")) ask(c, 0);
-  else if (!strcmp(s->consent, "declined") && s->asks < 3 && s->sessions - s->last_ask_session >= 7) ask(c, 1);
+  if (!sharing_enabled(c) || !feedback || asking_ended(s)) return;
+  /* the first ask; after a "Not now" (or a sheet left unanswered) a re-ask, 7 sessions later at the earliest */
+  if (s->asks == 0 && !strcmp(s->consent, "unknown")) ask(c, 0);
+  else if (s->sessions - s->last_ask_session >= REASK_SESSIONS) ask(c, 1);
 }
 
 int tf_client_sharing_ask_now(TfClient *c) {
   if (!c || !share(c)) return tf__fail(TF_ERR_ARGUMENT, "no client");
-  if (!sharing_enabled(c)) return tf__fail(TF_ERR_NOT_AVAILABLE, "sharing is not enabled (contributions option or flags.contributions)");
-  if (!strcmp(share(c)->consent, "granted") || !strcmp(share(c)->consent, "final")) return 0;
-  ask(c, share(c)->asks > 0);
+  Share *s = share(c);
+  if (!sharing_enabled(c)) return tf__fail(TF_ERR_NOT_AVAILABLE, "sharing is not offered to this app (the signed config's flags.contributions)");
+  if (asking_ended(s)) return 0; /* a yes, sharing turned off, or three sheets shown: nothing to ask */
+  ask(c, s->asks > 0);
   return 0;
 }
 
+/* the learner agreed (a sheet's answer, or the settings switch): records the version in force now, kept for good */
+static void grant(TfClient *c, Share *s) {
+  tf_mutex_lock(&s->lock);
+  snprintf(s->consent, sizeof s->consent, "granted");
+  snprintf(s->consent_version, sizeof s->consent_version, "%s", s->effective);
+  snprintf(s->consent_hash, sizeof s->consent_hash, "%s", s->effective_hash);
+  tf_mutex_unlock(&s->lock);
+  s->decided_at = (long long)time(NULL);
+  s->guardian = tf__client_options(c)->children;
+}
+
+/* the learner's answer to a sheet: the SDK's ask through the app's callback or its own UI, only from the learner's
+ * own tap (counted: share_yes, share_no) */
 int tf_client_sharing_answer(TfClient *c, int yes) {
   Share *s = c ? share(c) : NULL;
   if (!s) return tf__fail(TF_ERR_ARGUMENT, "no client");
   s->pending_ask = 0;
   if (yes) {
-    snprintf(s->consent, sizeof s->consent, "granted");
-    s->decided_at = (long long)time(NULL);
-    s->guardian = tf__client_options(c)->children;
-    consent_version(tf__client_options(c)->language, s->consent_version, sizeof s->consent_version);
+    grant(c, s);
   } else {
-    snprintf(s->consent, sizeof s->consent, "%s", s->asks >= 3 ? "final" : "declined");
+    tf_mutex_lock(&s->lock);
+    snprintf(s->consent, sizeof s->consent, "%s", s->asks >= MAX_ASKS ? "final" : "declined");
+    tf_mutex_unlock(&s->lock);
   }
   share_save(c, s);
+  tf__telemetry_add(c, yes ? "share_yes" : "share_no", 1);
   return 0;
 }
 
+/* the settings switch (not a sheet answer: not counted as share_yes / share_no) */
 int tf_client_sharing_set(TfClient *c, int on) {
   Share *s = c ? share(c) : NULL;
   if (!s) return tf__fail(TF_ERR_ARGUMENT, "no client");
-  if (on) return tf_client_sharing_answer(c, 1);
-  snprintf(s->consent, sizeof s->consent, "final");
   s->pending_ask = 0;
+  if (on) {
+    grant(c, s);
+    share_save(c, s);
+    return 0;
+  }
+  tf_mutex_lock(&s->lock);
+  snprintf(s->consent, sizeof s->consent, "final");
+  tf_mutex_unlock(&s->lock);
   share_save(c, s);
   /* off stops uploads at once: the PUT in flight is aborted, the unsent queue is deleted */
   tf__share_wipe(c);
   return 0;
 }
 
-int tf_client_sharing_state(TfClient *c) { return c && share(c) && !strcmp(share(c)->consent, "granted") && sharing_enabled(c); }
+int tf_client_sharing_state(TfClient *c) { return c && share(c) && granted(share(c)) && sharing_enabled(c); }
 
+/* "updateNeeded" stays in the JSON for apps that read it, always false since 2.0.1 */
 const char *tf_client_sharing_status_json(TfClient *c) {
-  static _Thread_local char buf[640];
+  static _Thread_local char buf[1024];
   Share *s = c ? share(c) : NULL;
   if (!s) return NULL;
   char trust[16];
   tf__client_upload_trust(c, trust, sizeof trust);
+  tf_mutex_lock(&s->lock);
   snprintf(buf, sizeof buf,
            "{\"consent\":\"%s\",\"enabled\":%s,\"asks\":%d,\"sessions\":%d,\"pendingAsk\":%s,\"thanked\":%s,\"guardian\":%s,"
-           "\"sharedSessions\":%d,\"uploadTrust\":\"%s\",\"mayUpload\":%s,\"consentVersion\":\"%s\"}",
+           "\"sharedSessions\":%d,\"uploadTrust\":\"%s\",\"mayUpload\":%s,\"consentVersion\":\"%s\",\"consentTextSha256\":%s%s%s,"
+           "\"effectiveConsentVersion\":\"%s\",\"updateNeeded\":false}",
            s->consent, sharing_enabled(c) ? "true" : "false", s->asks, s->sessions, s->pending_ask ? "true" : "false",
            s->thanked ? "true" : "false", s->guardian ? "true" : "false", s->shared_sessions, trust[0] ? trust : "capped",
-           tf__sharing_may_upload(c) ? "true" : "false", s->consent_version);
+           tf__sharing_may_upload(c) ? "true" : "false", s->consent_version, s->consent_hash[0] ? "\"" : "null", s->consent_hash,
+           s->consent_hash[0] ? "\"" : "", s->effective);
+  tf_mutex_unlock(&s->lock);
   return buf;
 }
+
 
 int tf__client_call(TfClient *c, const char *method, const char *path, const char *body, int auth, const char *extra,
                     TfHttpResponse *r);

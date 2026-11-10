@@ -264,7 +264,7 @@ static int check_manifest(const TfJson *m, int require_signature, const char *ke
     return tf__fail(TF_ERR_SIGNATURE_REQUIRED, "the manifest is not signed and a signature is required");
   }
   if (strcmp(tf_json_str(tf_json_get(m, "family")), "tajweedformer"))
-    return tf__fail(TF_ERR_UNSUPPORTED_MODEL, "family %s: SDK 2.0.0 runs TajweedFormer V4 only", tf_json_str(tf_json_get(m, "family")));
+    return tf__fail(TF_ERR_UNSUPPORTED_MODEL, "family %s: this SDK runs TajweedFormer V4 only", tf_json_str(tf_json_get(m, "family")));
   if (!version_at_least(TF_SDK_VERSION, tf_json_str(tf_json_get(m, "min_sdk_version"))))
     return tf__fail(TF_ERR_SDK_TOO_OLD, "%s needs SDK %s or newer (this is %s)", tf_json_str(tf_json_get(m, "model_id")),
                     tf_json_str(tf_json_get(m, "min_sdk_version")), TF_SDK_VERSION);

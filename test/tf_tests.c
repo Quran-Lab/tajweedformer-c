@@ -6,7 +6,9 @@
  *   tf_tests conformance <folder> <key_hex|-> <clips.txt> <out.jsonl> [heads_mask [context]]
  *   tf_tests vectors <fixture_dir> <c16 folder> <c24 folder> <out.jsonl>     CAL vectors: engine JSON + words + decoded
  *   tf_tests settings <config_vectors.json> <folder> <out.jsonl>
- *   tf_tests folder <folder> <key_hex|->        open a folder, print the info JSON or the error code name */
+ *   tf_tests folder <folder> <key_hex|->        open a folder, print the info JSON or the error code name
+ *   tf_tests ogg | codec | sharing | upload | stream_share | client | download   (tf_client_tests.inc, tf_share_tests.inc)
+ *   tf_tests bitrate | consent | telemetry | sdk_latest                          (2.0.1: tf_201_tests.inc) */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -18,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "tajweedformer.h"
 #include "tf_internal.h"
@@ -502,6 +505,7 @@ static int settings(const char *vp, const char *dir, const char *outp) {
 
 #include "tf_client_tests.inc"
 #include "tf_share_tests.inc"
+#include "tf_201_tests.inc"
 
 static int folder(const char *dir, const char *key) {
   TfModel *m = open_folder(dir, key, 0, NULL);
@@ -660,6 +664,7 @@ static int pin_tests(const char *dir, const char *key, const char *list, int thr
 }
 
 int main(int argc, char **argv) {
+  tf__client_no_timer = 1; /* the replayed exchanges and stubs run on the test's thread; the telemetry test starts the timer itself */
   if (argc >= 2 && !strcmp(argv[1], "crypto")) return crypto_tests();
   if (argc >= 5 && !strcmp(argv[1], "pin"))
     return pin_tests(argv[2], argv[3], argv[4], argc > 5 ? atoi(argv[5]) : 4, argc > 6 ? atoi(argv[6]) : 6);
@@ -676,6 +681,10 @@ int main(int argc, char **argv) {
   if (argc >= 3 && !strcmp(argv[1], "upload")) return upload_tests(argv[2]);
   if (argc >= 6 && !strcmp(argv[1], "stream_share")) return stream_share_tests(argv[2], argv[3], argv[4], argv[5]);
   if (argc >= 4 && !strcmp(argv[1], "client")) return client_tests(argv[2], argv[3], argc > 4 ? argv[4] : NULL);
+  if (argc >= 4 && !strcmp(argv[1], "bitrate")) return bitrate_tests(argv[2], argv[3]);
+  if (argc >= 5 && !strcmp(argv[1], "consent")) return consent_tests(argv[2], argv[3], argv[4]);
+  if (argc >= 4 && !strcmp(argv[1], "sdk_latest")) return sdk_latest_tests(argv[2], argv[3], argc > 4 ? argv[4] : NULL);
+  if (argc >= 3 && !strcmp(argv[1], "telemetry")) return telemetry_tests(argv[2], argc > 4 ? argv[3] : NULL, argc > 4 ? argv[4] : NULL);
   fprintf(stderr, "usage: see the comment at the top of test/tf_tests.c\n");
   return 2;
 }

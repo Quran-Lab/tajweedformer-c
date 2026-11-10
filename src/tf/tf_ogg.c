@@ -127,8 +127,15 @@ int tf_ogg_open(TfOgg *o, const char *dir, uint32_t serial, int pre_skip, int in
   return rc;
 }
 
-/* page the queued packets; `final`: everything, the last page EOS with `final_granule` (RFC 7845 end trim) */
-static int write_pages(TfOgg *o, int final, long long final_granule) {
+long long tf_ogg_segment_start(int n) {
+  long long at = 0;
+  for (int k = 1; k < n; ++k) at += seg_limit(k);
+  return at;
+}
+
+/* page the queued packets; `final`: everything, the last page EOS with `final_granule` (RFC 7845 end trim);
+ * `more`: everything too, because the caller knows more packets follow (a segment boundary) */
+static int write_pages(TfOgg *o, int final, long long final_granule, int more) {
   while (o->n_q > 0) {
     const int next = o->file ? o->segment : o->segment + 1;
     const int used = o->file ? o->segment_packets : 0;
@@ -143,7 +150,7 @@ static int write_pages(TfOgg *o, int final, long long final_granule) {
     }
     /* a page is written before the end only when packets follow it, so the last page is always the EOS page
      * (the same bytes as muxing the whole session at once, as the vector's generator does) */
-    if (!final && take >= o->n_q) return 0;
+    if (!final && !more && take >= o->n_q) return 0;
     const int last = final && take == o->n_q;
     long long granule = (o->paged + take) * 960LL;
     if (last) {
@@ -167,11 +174,16 @@ int tf_ogg_packet(TfOgg *o, const uint8_t *data, int n) {
   memcpy(p, data, (size_t)n);
   o->q[o->n_q] = p;
   o->q_len[o->n_q++] = n;
-  return o->n_q > 50 ? write_pages(o, 0, 0) : 0;
+  return o->n_q > 50 ? write_pages(o, 0, 0, 0) : 0;
 }
 
+/* Called when the next packet is the first of a new segment (so packets follow): the queued packets, all of
+ * the closing segment, are paged now and the segment closes (on_segment) before the next one's first packet is
+ * encoded. The pages are the same bytes as without the call: the segment's room already ends a page there. */
+int tf_ogg_flush(TfOgg *o) { return write_pages(o, 0, 0, 1); }
+
 int tf_ogg_finish(TfOgg *o, long long final_granule) {
-  const int rc = write_pages(o, 1, final_granule);
+  const int rc = write_pages(o, 1, final_granule, 0);
   if (o->file) {
     fclose(o->file);
     o->file = NULL;

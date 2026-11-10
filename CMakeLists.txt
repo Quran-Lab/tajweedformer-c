@@ -148,6 +148,25 @@ foreach(t vnni_check dropin_check hooked_check cpu_detect)
   target_include_directories(${t} PRIVATE include "${SDK}/engine/include")
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
+# the library's tests that need no model data (only test/data): the Ogg muxer and Opus encoder vectors, the deletion
+# crypto, the shared-session upload against a stub server, the platform client against recorded exchanges, and the
+# 2.0.1 bitrate ladder, consent wording and telemetry deltas. Each run starts from an empty work directory (the
+# fixture below). The model tests (conformance, scorer vectors, settings) need the release data: test/run_tests.sh.
+set(TF_WORK "${CMAKE_BINARY_DIR}/tf_test_work")
+set(TF_VEC "${CMAKE_SOURCE_DIR}/test/data/sharing_vectors")
+add_test(NAME tf_work_clean COMMAND ${CMAKE_COMMAND} -E rm -rf "${TF_WORK}")
+set_tests_properties(tf_work_clean PROPERTIES FIXTURES_SETUP tf_work)
+add_test(NAME tf_ogg COMMAND tf_tests ogg "${TF_VEC}/ogg" "${TF_WORK}/ogg")
+add_test(NAME tf_codec COMMAND tf_tests codec "${TF_VEC}" "${TF_WORK}/codec")
+add_test(NAME tf_sharing COMMAND tf_tests sharing "${TF_VEC}" "${CMAKE_SOURCE_DIR}/test/data/client-fixtures.json" "${TF_WORK}/sharing")
+add_test(NAME tf_upload COMMAND tf_tests upload "${TF_WORK}/upload")
+add_test(NAME tf_client COMMAND tf_tests client "${CMAKE_SOURCE_DIR}/test/data/client-fixtures.json" "${TF_WORK}/client")
+add_test(NAME tf_bitrate COMMAND tf_tests bitrate "${TF_VEC}" "${TF_WORK}/bitrate")
+add_test(NAME tf_consent COMMAND tf_tests consent "${TF_VEC}" "${CMAKE_SOURCE_DIR}/test/data/client-fixtures.json" "${TF_WORK}/consent")
+add_test(NAME tf_telemetry COMMAND tf_tests telemetry "${TF_WORK}/telemetry")
+add_test(NAME tf_sdk_latest COMMAND tf_tests sdk_latest "${CMAKE_SOURCE_DIR}/test/data/sdk_latest_configs.json" "${TF_WORK}/sdk_latest")
+set_tests_properties(tf_ogg tf_codec tf_sharing tf_upload tf_client tf_bitrate tf_consent tf_telemetry tf_sdk_latest PROPERTIES
+                     FIXTURES_REQUIRED tf_work LABELS library TIMEOUT 600)
 target_link_libraries(vnni_check PRIVATE zf_gemm_vnni)
 target_link_libraries(cpu_detect PRIVATE zf_gemm_vnni)
 # dropin compares the native kernels to the engine's OWN kernel, so it links the engine WITHOUT the hook

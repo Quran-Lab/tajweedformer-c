@@ -6,7 +6,8 @@
  * beta 9), silence assumed before the first sample (no leading delay), output exactly ceil(n * 48000 / rate)
  * once flushed. Arithmetic in double, the web port's order, so both write the same samples.
  *
- * Encoder: libopus, application AUDIO (2049), the bitrate given (TF_SHARING_BITRATE_DEFAULT 192000), complexity 10,
+ * Encoder: libopus, application AUDIO (2049), the bitrate given (the adaptive ladder's rung: 192000, 96000, 64000 or
+ * 32000; the capture changes it with tf_enc_set_bitrate before the first packet of a segment), complexity 10,
  * VBR unconstrained, fullband, signal auto, lsb depth 24, no FEC, no DTX, 20 ms frames (960 samples at 48 kHz).
  * Pre-skip = the encoder's lookahead (312 at 48 kHz); the flush encodes the buffered samples and the lookahead,
  * padded with silence to whole packets; the final granule = pre-skip + the samples encoded. */
@@ -166,6 +167,14 @@ int tf_enc_init(TfEncoder *e, int bitrate) {
   opus_encoder_ctl(enc, OPUS_GET_LOOKAHEAD(&look));
   e->enc = enc;
   e->pre_skip = (int)look; /* 48 kHz in, so already in 48 kHz samples */
+  e->bitrate = bitrate;
+  return 0;
+}
+int tf_enc_set_bitrate(TfEncoder *e, int bitrate) {
+  if (!e->enc) return -1;
+  if (bitrate == e->bitrate) return 0;
+  if (opus_encoder_ctl((OpusEncoder *)e->enc, OPUS_SET_BITRATE_REQUEST, (opus_int32)bitrate) != OPUS_OK) return -1;
+  e->bitrate = bitrate;
   return 0;
 }
 void tf_enc_free(TfEncoder *e) {
@@ -174,6 +183,8 @@ void tf_enc_free(TfEncoder *e) {
 }
 static int enc_frame(TfEncoder *e, TfPacketSink sink, void *user) {
   unsigned char out[4000];
+  if (e->before && e->before(e->before_user, e->packets)) return -1;
+  e->packets++;
   const int n = opus_encode_float((OpusEncoder *)e->enc, e->frame, TF_SHARE_FRAME, out, (opus_int32)sizeof out);
   e->filled = 0;
   if (n <= 0) return -1;

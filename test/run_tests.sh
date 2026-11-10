@@ -108,6 +108,12 @@ run "Opus encoder vs the web vector (byte for byte) and the 48 kHz resampler" "$
 run "shared-session upload (batches, 403, crash recovery, sharing off, key mismatch)" "$T" upload "$W/upload"
 run "the stream hook: a take shared through tf_stream (16 kHz, resampled), heads unchanged" "$T" stream_share "$W/v4" "$KEY" "$W/clips.txt" "$W/stream_share"
 run "platform client (replayed) and sharing state machine" "$T" client "$HERE/data/client-fixtures.json" "$W/client" "$W/fx_c16_l64"
+# 2.0.1: the bitrate ladder (shared vector, a real 150 s stream across rungs, the outbox's wiring), the app's own
+# consent wording (shared vector and the grant flow), telemetry deltas and register once a day
+run "bitrate ladder vector, a 150 s stream at 192/96/32/64/192 kbit/s (pages, decode, ffmpeg when present), outbox wiring" "$T" bitrate "$HERE/data/sharing_vectors" "$W/bitrate"
+run "consent wording vector, pause and update ask, session JSON, withdrawal, deletion; copy decks 2026-11-09.1" "$T" consent "$HERE/data/sharing_vectors" "$HERE/data/client-fixtures.json" "$W/consent"
+run "sdk_latest in the signed config: one debug warning per client when newer, silent otherwise and in release builds" "$T" sdk_latest "$HERE/data/sdk_latest_configs.json" "$W/sdk_latest" "$W/fx_c16_l64"
+run "telemetry deltas (report_id, retries, midnight, send points, timer, scored-result fields, share counters, daily register)" "$T" telemetry "$W/telemetry" "$W/fx_c16_l64" "$D/fixture"
 
 rm -rf "$W"
 echo "$fails failing"

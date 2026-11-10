@@ -1,4 +1,4 @@
-/* tajweedformer.h: the TajweedFormer SDK for Windows and Linux (C API, SDK 2.0.0).
+/* tajweedformer.h: the TajweedFormer SDK for Windows and Linux (C API, SDK 2.0.1).
  *
  * The exact engine (bit for bit the reference arithmetic) runs the V4 TajweedFormer model from a
  * verified model folder (sdk/v4.0), and this library gives every layer of what it computes:
@@ -52,7 +52,7 @@ extern "C" {
 #define TF_API
 #endif
 
-#define TF_SDK_VERSION "2.0.0"
+#define TF_SDK_VERSION "2.0.1"
 #define TF_API_VERSION 1
 
 typedef enum {
@@ -64,7 +64,7 @@ typedef enum {
   TF_ERR_SIGNATURE_REQUIRED = -5,/* unsigned, and a signature is required */
   TF_ERR_CHECKSUM = -6,          /* a file's size or SHA-256 differs from the manifest */
   TF_ERR_NOT_LISTED = -7,        /* a file the folder needs is not listed */
-  TF_ERR_SDK_TOO_OLD = -8,       /* min_sdk_version above 2.0.0 */
+  TF_ERR_SDK_TOO_OLD = -8,       /* min_sdk_version above this SDK's version */
   TF_ERR_UNSUPPORTED_MODEL = -9, /* not a V4 TajweedFormer folder (format, family, engine_format) */
   TF_ERR_CALIBRATION = -10,
   TF_ERR_ENGINE = -11,
@@ -77,7 +77,7 @@ typedef enum {
   TF_ERR_CONFIG = -18            /* a remote config failed verification (signature, key id, expiry) */
 } TfError;
 
-TF_API const char *tf_version(void); /* "2.0.0" */
+TF_API const char *tf_version(void); /* "2.0.1" */
 TF_API int tf_api_version(void);
 TF_API const char *tf_error_name(int code); /* "signature_invalid", ... */
 TF_API const char *tf_last_error(void);     /* this thread's last failure, or NULL */
@@ -147,7 +147,7 @@ typedef struct {
 } TfModelOptions;
 
 TF_API TfModelOptions tf_model_default_options(void);
-/* Opens a V4 folder: manifest format 2, family tajweedformer, engine_format 2, min_sdk_version <= 2.0.0,
+/* Opens a V4 folder: manifest format 2, family tajweedformer, engine_format 2, min_sdk_version <= TF_SDK_VERSION,
  * signature (by default required), every listed file's size and SHA-256; never opens an unlisted file. */
 TF_API TfModel *tf_model_open(const char *folder, const TfModelOptions *options);
 TF_API void tf_model_close(TfModel *m);
@@ -338,15 +338,28 @@ TF_API int tf_download_model(const TfDownloadOptions *o);
 
 /* ============================================================================ portal (platform client) */
 
-/* Consent: the SDK asks at the right moment (after a finished session with feedback, never on first launch;
- * "not now" re-asks at most twice, >= 7 sessions apart). The app shows the sheet (copy from
- * tf_sharing_copy_json) and answers through tf_client_sharing_answer, now or later. */
+/* Consent: Quran Lab's signed config decides whether sharing is offered to the app (flags.contributions); the
+ * learner decides on the sheet. The SDK asks at the right moment (after a finished session with feedback, never on
+ * first launch) and shows the sheet at most three times per install, ever: "not now" may lead to a re-ask >= 7
+ * sessions later until the third showing; a "share" answer or turning sharing off ends asking for good, across copy
+ * decks, wording and SDK upgrades (a grant keeps the version it was given to). This library has no UI of its own
+ * (so there is nothing to theme): the app shows its own sheet with the SDK's strings (copy_json below, or
+ * tf_client_sharing_copy_json, with the app's own wording applied) and reports the learner's tap through
+ * tf_client_sharing_answer, now or later. Every ask is counted (the status' asks, telemetry share_asked) and the
+ * re-ask rules are the SDK's. Nothing is recorded or sent before a "share" answer. */
 typedef struct {
   int reask;                /* 0: the first ask, 1 or 2: a gentle re-ask */
   int guardian;             /* the app's audience is children: address the parent or guardian */
-  const char *copy_json;    /* the copy deck for the language asked for */
+  const char *copy_json;    /* the copy deck for the client's language, with the app's own wording applied */
+  /* 2.0.1 (read only by apps built against 2.0.1 or later): */
+  int update;               /* deprecated: always 0 since 2.0.1 (a grant persists across decks and wording) */
+  const char *consent_version; /* the version a "share" answer grants (the deck's, or custom-<24 hex>) */
 } TfConsentRequest;
 typedef void (*TfConsentCallback)(void *user, const TfConsentRequest *req);
+
+/* The client's log (2.0.1): messages for the developer, never for the learner, never sent anywhere. */
+typedef enum { TF_LOG_DEBUG = 0, TF_LOG_INFO = 1, TF_LOG_WARNING = 2, TF_LOG_ERROR = 3 } TfLogLevel;
+typedef void (*TfLogCallback)(void *user, int level, const char *message);
 
 typedef struct {
   size_t struct_size;
@@ -357,28 +370,45 @@ typedef struct {
   const char *api_url;        /* default https://api.quranlab.ai */
   const char *storage_dir;    /* where the SDK keeps its state (config cache, counters, outbox, consent) */
   const char *trusted_key_hex;/* config signing key; NULL = Quran Lab's */
-  int telemetry;              /* 1 (default): anonymous daily aggregates; the signed config's flags.analytics can stop them */
-  int contributions;          /* 1: recording sharing offered (with consent); 0 (default): never */
+  int telemetry;              /* 1 (default): anonymous telemetry (deltas of the day's sums); flags.analytics can stop it */
+  int contributions;          /* ignored since 2.0.1: Quran Lab's signed config decides per app whether sharing is
+                               offered (flags.contributions); the learner still decides on the sheet */
   int children;               /* the app's audience is children (consent addressed to a guardian) */
   const char *language;       /* copy deck language, BCP 47; NULL = "en" */
   TfConsentCallback on_consent;
   void *user;
+  /* 2.0.1 (apps built against 2.0.0 leave these 0 through struct_size): */
+  int debug_build;            /* 1 in the app's debug builds (as TfModelOptions.debug_build), for example
+                                 #ifndef NDEBUG co.debug_build = 1; #endif. The library is always built as a release,
+                                 so the app says which build it is. 0: the client logs nothing */
+  TfLogCallback on_log;       /* where the log goes in debug builds; NULL: stderr */
+  void *log_user;
 } TfClientOptions;
 
 TF_API TfClientOptions tf_client_default_options(void);
 TF_API TfClient *tf_client_create(const TfClientOptions *o);
 TF_API void tf_client_destroy(TfClient *c);
-/* Launch sequence: token, register, config, due uploads. Each step independent; never blocks recognition. */
+/* Launch sequence: token, register (once per UTC day), config, telemetry left from earlier runs, due uploads. Each
+ * step independent; never blocks recognition. Opening a client counts one launch in the telemetry. */
 TF_API int tf_client_launch(TfClient *c);
+/* POST /v1/register at most once per UTC day per install (a day stamp in the storage directory, written after a
+ * 200); a second call the same day returns 0 without a request. */
 TF_API int tf_client_register(TfClient *c);
 /* GET /v1/config, verified (Ed25519 over the exact body, key id, expiry); kept on disk. */
 TF_API int tf_client_refresh_config(TfClient *c);
 TF_API const char *tf_client_config_json(TfClient *c); /* the last verified config, or NULL */
+/* The verified config may carry "sdk_latest": {"version","severity","url"} for the app's platform (2.0.1). When that
+ * version is newer than this SDK's (dotted numbers; anything else is not newer), a debug build (debug_build 1) logs
+ * once per client, at TF_LOG_WARNING: "Quran Lab SDK X is available (severity), you have Y: URL". Release builds
+ * stay silent; a missing or malformed field is ignored. Unknown top-level fields of the config are ignored. */
 /* Puts the verified config's tajweed block into the model's portal layer. */
 TF_API int tf_client_apply_config(TfClient *c, TfModel *m);
-/* Telemetry (anonymous daily aggregates, PLATFORM_CLIENT.md section 6): one call per finished session.
- * The SDK reads the numbers it needs from the session's model, decoded layer and result (no audio, no text,
- * no ids leave the device: only sums and histograms per UTC day). */
+/* Telemetry (anonymous, docs/platform-client.md): one call per finished session. The SDK reads the numbers it needs
+ * from the session's model, decoded layer and result (no audio, no text, no ids leave the device: only sums and
+ * histograms per UTC day). It sends deltas: what was counted since the previous delta of the same UTC day, sealed
+ * with a random report_id and kept on disk until the server takes it (a retry sends the same bytes). Send points:
+ * every 15 minutes while a client is open (its own timer once tf_client_launch ran, or the next
+ * tf_client_session_finished), tf_client_background, tf_client_destroy, and tf_client_launch (leftovers). */
 typedef struct {
   size_t struct_size;
   const TfModel *model;       /* the session's model (revision, context, preset, word level, checks) */
@@ -397,16 +427,43 @@ enum { TF_FALLBACK_NONE = 0, TF_FALLBACK_NON_FINITE, TF_FALLBACK_DEADLINE, TF_FA
 /* The developer opt-out in code (never a prompt): TfClientOptions.telemetry = ZF_ANALYTICS_OFF. */
 #define ZF_ANALYTICS_OFF 0
 TF_API void tf_client_session_finished(TfClient *c, const TfSessionStats *st);
-TF_API int tf_client_flush(TfClient *c, int include_today); /* uploads complete days; returns rows accepted */
+/* Seals what was counted (include_today: also today's counts; 0: only earlier days) and sends every sealed delta,
+ * oldest first. Returns the deltas accepted. */
+TF_API int tf_client_flush(TfClient *c, int include_today);
+/* The app goes to the background or idle (a window minimized, the app about to sleep): seals and sends a delta now.
+ * Returns the deltas accepted, or < 0. */
+TF_API int tf_client_background(TfClient *c);
 TF_API int tf_client_report_issue(TfClient *c, const char *kind, const char *code, const char *message);
 /* Sharing. */
-TF_API const char *tf_sharing_copy_json(const char *language); /* the consent sheet, settings and thank-you strings */
-TF_API int tf_client_sharing_answer(TfClient *c, int share);  /* 1 share, 0 not now */
-TF_API int tf_client_sharing_set(TfClient *c, int on);        /* the settings switch; off stops uploads at once */
-TF_API int tf_client_sharing_state(TfClient *c);              /* 1 on, 0 off/not asked */
-TF_API const char *tf_client_sharing_status_json(TfClient *c);/* state, asks, contributor id, sessions shared */
+TF_API const char *tf_sharing_copy_json(const char *language); /* the bundled deck (consent sheet, settings, thank-you) */
+/* The learner's answer to a sheet (the SDK's ask through on_consent or a pending ask, shown in the app's own UI):
+ * 1 share, 0 not now. Only from the learner's own tap. Counted as share_yes / share_no. */
+TF_API int tf_client_sharing_answer(TfClient *c, int share);
+TF_API int tf_client_sharing_set(TfClient *c, int on);        /* the settings switch (not a sheet answer); off stops uploads at once */
+TF_API int tf_client_sharing_state(TfClient *c);              /* 1 on (granted, to any version), 0 off or not granted */
+/* {"consent","enabled","asks","sessions","pendingAsk","thanked","guardian","sharedSessions","uploadTrust","mayUpload",
+ *  "consentVersion" (agreed to, what shared sessions carry),"consentTextSha256","effectiveConsentVersion" (what a new
+ *  grant would record),"updateNeeded" (deprecated: always false since 2.0.1)} */
+TF_API const char *tf_client_sharing_status_json(TfClient *c);
 TF_API int tf_client_sharing_delete(TfClient *c);             /* "Delete what I shared" (device-key deletion) */
-TF_API int tf_client_sharing_ask_now(TfClient *c);            /* the app chooses the moment (timing only) */
+/* The app chooses the moment (timing only): no ask once asking ended (a yes, sharing off, three sheets shown). */
+TF_API int tf_client_sharing_ask_now(TfClient *c);
+/* The app's own wording (2.0.1): replaces deck strings by key ("sheet.what", "impact.minutes.other", ...: the deck's
+ * keys, impact.minutes by plural category). An unknown key, an empty or blank text, text that is not UTF-8 or a key
+ * given twice is TF_ERR_ARGUMENT and nothing changes; n = 0 (or keys NULL) clears. With overrides the learner agrees
+ * to that text: the consent version becomes custom-<the first 24 hex digits of its SHA-256> (the canonical text of
+ * docs/platform-client.md) and every session shared under a grant to it carries consent_text_sha256. A learner
+ * who agreed earlier keeps the version recorded then and is not asked again; new grants record the new version.
+ * Set it right after tf_client_create, before tf_client_launch, at every start. Disclosure lines must stay honest (the doc). */
+TF_API int tf_sharing_set_wording(TfClient *c, const char *const *keys, const char *const *texts, int n);
+/* Read only, for the developer to send to Quran Lab: the effective consent version, the canonical text and its
+ * SHA-256 (64 hex). The text and hash are NULL without overrides. Valid until the next tf_sharing_set_wording. */
+TF_API const char *tf_sharing_consent_version(TfClient *c);
+TF_API const char *tf_sharing_consent_text(TfClient *c);
+TF_API const char *tf_sharing_consent_sha256(TfClient *c);
+/* The client's copy deck (its language) with the app's own wording applied and the effective consent_version: what
+ * the app's own sheet shows. Without overrides, the bundled deck itself. */
+TF_API const char *tf_client_sharing_copy_json(TfClient *c);
 /* "Show my recovery code" (26 Crockford characters in groups of 4): for the learner only, behind the app's own
  * confirmation; used at portal.quranlab.ai/delete when the device is lost. TF_ERR_NOT_AVAILABLE before the first
  * shared session. */
@@ -421,7 +478,11 @@ TF_API const char *tf_client_sharing_summary_json(TfClient *c);
  * or "attested" = none. Turning sharing off (tf_client_sharing_set 0) aborts the PUT in flight and deletes the
  * unsent sessions at once. Streams created with TfStreamOptions.client do all of this by themselves; the calls
  * below are for apps that capture audio outside a TfStream. */
-#define TF_SHARING_BITRATE_DEFAULT 192000 /* bit/s (the reference's; about 86 MB an hour); owner decision pending */
+/* Bitrate (2.0.1): an adaptive ladder of 192000, 96000, 64000 and 32000 bit/s, starting at the top for each client.
+ * An upload's network failure (no connection, a timeout, HTTP 408 or 5xx) steps down; a closed segment while 120 s
+ * or more of closed audio waits steps down; three segment uploads in a row while at most 30 s waits step up. The
+ * rung in force when a segment opens is that segment's bitrate (tf_sharing_outbox_json "segmentBitrates"). */
+#define TF_SHARING_BITRATE_DEFAULT 192000 /* bit/s: the ladder's top and start */
 typedef struct TfShareSession TfShareSession;
 /* NULL (TF_ERR_NOT_AVAILABLE) when sharing is off: no consent, the option, flags.contributions or upload_trust. */
 TF_API TfShareSession *tf_sharing_session_begin(TfClient *c, int input_sample_rate, const char *input_route);
@@ -429,14 +490,19 @@ TF_API int tf_sharing_session_push(TfShareSession *s, const float *samples, int 
 /* The end of the session (completed 1), or a cancelled one (0: kept only from 2 s). Frees the session; returns
  * the milliseconds shared (0: nothing). */
 TF_API int tf_sharing_session_finish(TfShareSession *s, int completed);
-TF_API int tf_sharing_set_bitrate(TfClient *c, int bits_per_second); /* 6000 to 510000; for sessions begun later */
+/* No effect since 2.0.1 (the ladder decides, the same in every SDK); kept for compatibility: 0, or TF_ERR_ARGUMENT
+ * outside 6000 to 510000. */
+TF_API int tf_sharing_set_bitrate(TfClient *c, int bits_per_second);
+TF_API int tf_sharing_bitrate(TfClient *c); /* the bitrate the next segment opens with (bit/s) */
+/* The outbox's sessions, oldest first: [{"id","created","ended","completed","segments" (closed),"uploaded",
+ * "segmentBitrates":[bit/s per closed segment, in order],"error"}]. Free with tf_free; NULL on error. */
+TF_API char *tf_sharing_outbox_json(TfClient *c);
 TF_API int tf_sharing_outbox_pending(TfClient *c);                     /* sessions not uploaded yet */
 TF_API int tf_sharing_outbox_resume(TfClient *c);                      /* start or wake the uploader */
 /* Wakes the uploader and waits (at most timeout_ms) for a full pass; returns the sessions still pending. */
 TF_API int tf_sharing_outbox_wait(TfClient *c, int timeout_ms);
 
-/* PLATFORM_CLIENT.md's C name for the ONE sharing flag: the default of TfClientOptions.contributions for clients
- * created after the call. */
+/* PLATFORM_CLIENT.md's C name for the old sharing option. No effect since 2.0.1: the signed config decides. */
 TF_API void zf_platform_set_contributions(int on);
 
 #ifdef __cplusplus

@@ -2,6 +2,7 @@ LIBRARY tajweedformer
 EXPORTS
   tf_api_version
   tf_client_apply_config
+  tf_client_background
   tf_client_config_json
   tf_client_create
   tf_client_default_options
@@ -14,6 +15,7 @@ EXPORTS
   tf_client_session_finished
   tf_client_sharing_answer
   tf_client_sharing_ask_now
+  tf_client_sharing_copy_json
   tf_client_sharing_delete
   tf_client_sharing_recovery_code
   tf_client_sharing_set
@@ -21,16 +23,11 @@ EXPORTS
   tf_client_sharing_status_json
   tf_client_sharing_summary_json
   tf_decode
+  tf_decode_k
   tf_decoded_frames
   tf_decoded_free
   tf_decoded_json
-  tf_decode_k
-  tf_stream_decode_k
   tf_decoded_ranked
-  tf_topk
-  tf_stream_topk
-  tf_topk_free
-  tf_topk_json
   tf_decoded_segments
   tf_decoded_tokens
   tf_download_default_options
@@ -60,16 +57,23 @@ EXPORTS
   tf_settings_set_app_json
   tf_settings_set_backend
   tf_settings_set_remote_json
+  tf_sharing_bitrate
+  tf_sharing_consent_sha256
+  tf_sharing_consent_text
+  tf_sharing_consent_version
   tf_sharing_copy_json
-  tf_sharing_outbox_wait
-  tf_sharing_outbox_resume
+  tf_sharing_outbox_json
   tf_sharing_outbox_pending
-  tf_sharing_set_bitrate
+  tf_sharing_outbox_resume
+  tf_sharing_outbox_wait
+  tf_sharing_session_begin
   tf_sharing_session_finish
   tf_sharing_session_push
-  tf_sharing_session_begin
+  tf_sharing_set_bitrate
+  tf_sharing_set_wording
   tf_stream_create
   tf_stream_decode
+  tf_stream_decode_k
   tf_stream_default_options
   tf_stream_destroy
   tf_stream_finish
@@ -78,16 +82,13 @@ EXPORTS
   tf_stream_push_audio
   tf_stream_reset
   tf_stream_score
+  tf_stream_topk
+  tf_topk
+  tf_topk_free
+  tf_topk_json
   tf_version
   zf_platform_set_contributions
   zf_tajweed_api_version
-  zf_tajweed_head_info
-  zf_tajweed_stream_get_heads
-  zf_tajweed_stream_set_heads
-  zf_tajweed_stream_top2
-  zf_tajweed_stream_topk
-  zf_tajweed_top2
-  zf_tajweed_topk
   zf_tajweed_ayah_count
   zf_tajweed_check_from_name
   zf_tajweed_check_name
@@ -114,6 +115,7 @@ EXPORTS
   zf_tajweed_config_word
   zf_tajweed_expected_tokens
   zf_tajweed_expected_words
+  zf_tajweed_head_info
   zf_tajweed_madd_class_name
   zf_tajweed_model_chunk_ms
   zf_tajweed_model_close
@@ -138,13 +140,19 @@ EXPORTS
   zf_tajweed_stream_create
   zf_tajweed_stream_destroy
   zf_tajweed_stream_finish
+  zf_tajweed_stream_get_heads
   zf_tajweed_stream_greedy
   zf_tajweed_stream_heads
   zf_tajweed_stream_last_error
   zf_tajweed_stream_push_audio
   zf_tajweed_stream_reset
   zf_tajweed_stream_set_callback
+  zf_tajweed_stream_set_heads
+  zf_tajweed_stream_top2
+  zf_tajweed_stream_topk
   zf_tajweed_token_name
+  zf_tajweed_top2
+  zf_tajweed_topk
   zf_tajweed_version
   zf_tajweed_word_preset_from_name
   zf_tajweed_word_preset_name
