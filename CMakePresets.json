@@ -40,8 +40,8 @@
     }
   ],
   "buildPresets": [
-    {"name": "windows-clang", "configurePreset": "windows-clang", "targets": ["tajweedformer", "tajweedformer_static", "tajweedformer_cli", "tf_tests", "vnni_check", "dropin_check", "hooked_check", "cpu_detect"]},
-    {"name": "windows-mingw", "configurePreset": "windows-mingw", "targets": ["tajweedformer", "tajweedformer_static", "tajweedformer_cli", "tf_tests", "vnni_check", "dropin_check", "hooked_check", "cpu_detect"]},
-    {"name": "linux", "configurePreset": "linux", "targets": ["tajweedformer", "tajweedformer_static", "tajweedformer_cli", "tf_tests", "vnni_check", "dropin_check", "hooked_check", "cpu_detect"]}
+    {"name": "windows-clang", "configurePreset": "windows-clang", "targets": ["tajweedformer", "tajweedformer_static", "tajweedformer_cli", "quickstart", "tf_tests", "vnni_check", "dropin_check", "hooked_check", "cpu_detect"]},
+    {"name": "windows-mingw", "configurePreset": "windows-mingw", "targets": ["tajweedformer", "tajweedformer_static", "tajweedformer_cli", "quickstart", "tf_tests", "vnni_check", "dropin_check", "hooked_check", "cpu_detect"]},
+    {"name": "linux", "configurePreset": "linux", "targets": ["tajweedformer", "tajweedformer_static", "tajweedformer_cli", "quickstart", "tf_tests", "vnni_check", "dropin_check", "hooked_check", "cpu_detect"]}
   ]
 }

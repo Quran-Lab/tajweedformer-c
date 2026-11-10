@@ -8,12 +8,12 @@ Everything an assistant needs to integrate this SDK correctly: use only the name
 <tr>
 <td width="33%" valign="top">
 
-**Hears every word**<br>Streaming recognition of Quranic recitation while the learner recites. Results arrive as often as every 160 ms (320 ms by default, 480 ms for longer context).
+**Hears the recitation**<br>Streaming recognition of Quranic recitation: audio in, and what the model heard comes out as often as every 160 ms (320 ms by default, 480 ms for longer context).
 
 </td>
 <td width="33%" valign="top">
 
-**Points to the word to fix**<br>Wrong letters and vowels, madd held too short or too long, and a score for every word. Qalqalah checks are experimental.
+**Every output of the model**<br>The sounds it heard with confidence and timing, and every head of the network per chunk (lengthening, gemination, ghunna, qalqalah and more): yours to build on.
 
 </td>
 <td width="33%" valign="top">
@@ -30,26 +30,26 @@ Everything an assistant needs to integrate this SDK correctly: use only the name
 </td>
 <td valign="top">
 
-**Nothing to host**<br>The SDK downloads the model (about 59 MB) from our CDN in six regions, verifies it and keeps it up to date.
+**Nothing to host**<br>The SDK downloads the model (56.5 MB for the default context) from our CDN in six regions and verifies it.
 
 </td>
 <td valign="top">
 
-**Tuned in the portal**<br>Four presets and three word levels. Change them at any time; your app picks them up without a new build.
+**Tajweed scoring in SDK 2.x**<br>For a known ayah, SDK 2.x also scores the take: letters and vowels, madd held too short or too long, a score for every word. Qalqalah checks are experimental.
 
 </td>
 </tr>
 </table>
 
-### Strict or gentle: you choose
+### Tajweed scoring in SDK 2.x
 
-**Strict** almost never flags a correct recitation. **Balanced** is the default. **Sensitive** catches more, and **Very sensitive** catches the most, for a teacher who reviews every flag first. The word level follows your learners: **strict** for huffaz and advanced students, **general** for most apps, **beginner** for children and classes.
+Scoring has four presets. **Strict** almost never flags a correct recitation. **Balanced** is the default. **Sensitive** catches more, and **Very sensitive** catches the most, for a teacher who reviews every flag first. The word level follows your learners: **strict** for huffaz and advanced students, **general** for most apps, **beginner** for children and classes. You set them in the portal and your app picks them up without a new build. Scoring is part of SDK 2.x; SDK 3.0 is inference only, so build new judging on the model's output.
 
 ## Why TajweedFormer
 
-- **Made for the Quran.** Your app names the ayah; TajweedFormer checks the recitation against it, sound by sound, and gives every word its own verdict.
-- **Feedback in the moment.** Results stream while the learner recites, so your app can respond on the word itself, not after the take.
-- **One engine on every platform.** The same engine runs the [Windows and Linux](https://github.com/Quran-Lab/tajweedformer-c), [iOS and macOS](https://github.com/Quran-Lab/tajweedformer-apple), [Android](https://github.com/Quran-Lab/tajweedformer-android) and [web](https://github.com/Quran-Lab/tajweedformer-web) SDKs, all set from one portal.
+- **Made for the Quran.** Trained on Quranic recitation, with its own sound units and heads for what tajweed is about.
+- **Feedback in the moment.** Output streams while the learner recites, so your app can respond on the word itself, not after the take.
+- **One engine on every platform.** The same engine runs the [Windows and Linux](https://github.com/Quran-Lab/tajweedformer-c), [Android](https://github.com/Quran-Lab/tajweedformer-android), [iOS and macOS](https://github.com/Quran-Lab/tajweedformer-apple) and [web](https://github.com/Quran-Lab/tajweedformer-web) SDKs, all set from one portal.
 - **Free, and it stays free.** Quran Lab is a non-profit waqf: the SDKs and models are never sold. The licence, NPL-1.2, asks three things: no paywall on model features, no results presented as rulings, and show the notice.
 
 ## Built for AI developers
@@ -58,19 +58,20 @@ Copy the setup prompt from [portal.quranlab.ai](https://portal.quranlab.ai) and 
 
 ## At a glance
 
-- **What it is:** the TajweedFormer SDK 2.0.2 for Windows and Linux: `tajweedformer.dll` /
+- **What it is:** the TajweedFormer SDK for Windows and Linux: `tajweedformer.dll` /
   `libtajweedformer.so` (and a static library) with one C header, [`include/tajweedformer.h`](include/tajweedformer.h),
   over the [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) engine, plus the
   `tajweedformer` command-line tool and server tier. The engine runs on native int8 kernels (AVX-512 VNNI,
   AVX-VNNI, AVX2, picked at run time).
-- **What it gives:** a verified V4 model folder (signed manifest, every file hashed); streams with every head
-  of the network, selectable; the decoded layer (per frame top-1 and runner-up with log-probs and margin, tokens
-  with confidence); the tajweed layer (per-site verdicts with per-head and fused LLRs, madd counts, qalqalah
-  and gemination evidence, per-word scores); settings resolved app code > portal > calibration.json; the
+- **What it gives:** audio in, the model's output out: a verified V4 model folder (signed manifest, every file
+  hashed); streams with every head of the network, selectable; the decoded layer (per frame top-1 and runner-up
+  with log-probs and margin, tokens with confidence). In SDK 2.x also the tajweed layer for a known ayah (per-site
+  verdicts with per-head and fused LLRs, madd counts, qalqalah and gemination evidence, per-word scores) with
+  settings resolved app code > portal > calibration.json. And the
   portal client (register, verified config, anonymous telemetry, issues, recitation sharing: see
   [Recitation sharing](#recitation-sharing) and [Telemetry](#telemetry)); resumable model downloads.
-- **Model:** TajweedFormer V4 only (`Quran-Lab/tajweedformer-v4`, `sdk/v4.0`; contexts `c16_l64`, `c8_l64` from the next V4.0
-  revision, `c24_l72`, `c24_l256`). v3.2 stays on the 1.x SDKs (the `zf_decode` harness here still runs it, for conformance).
+- **Model:** TajweedFormer V4 only (`Quran-Lab/tajweedformer-v4`, `sdk/v4.0`; contexts `c16_l64`, `c8_l64`,
+  `c24_l72`, `c24_l256`). v3.2 stays on the 1.x SDKs (the `zf_decode` harness here still runs it, for conformance).
 - **Who it is for:** desktop apps on Windows and Linux, and servers decoding many recitations.
 - **Status:** preview. Through the library's own API on Windows x86-64 (clang on the Microsoft runtime): V4
   conformance 35/35 at all three contexts (all twelve outputs of every chunk, bit for bit), the reference's scorer vectors
@@ -85,47 +86,152 @@ One model, one engine, the same bits on every platform. Each SDK compiles the sa
 
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
-| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+, desktop JVM | Maven `ai.quranlab:tajweedformer:2.0.2` |
-| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+ | SwiftPM, product `TajweedFormer` |
-| [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node | npm `@quran-lab/tajweedformer` |
-| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake (`add_subdirectory`) |
+| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+ on arm64-v8a and armeabi-v7a, desktop JVM | Maven Central `ai.quranlab:tajweedformer:2.0.2` |
+| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "2.0.2"`, product `TajweedFormer` |
+| [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node 20+ | `npm install @quran-lab/tajweedformer` |
+| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | Build tag 2.0.2 with CMake |
 | [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) | The engine: exact C runtime, tajweed scorer, conformance suite | everything above | Git submodule |
 
 The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), hosted by Quran Lab and served by
-`cdn.quranlab.ai/models` to approved app keys (request access at
-[portal.quranlab.ai/access](https://portal.quranlab.ai/access)). SDK 2.0.0 runs V4 only.
-Every release's binaries (the AAR and POM, the XCFramework zips, the npm package, the native archives) are
-also on `https://cdn.quranlab.ai/sdk/<product>/<version>/`, with a `SHA256SUMS` file, served from six regions.
+`cdn.quranlab.ai/models` to app keys from [portal.quranlab.ai](https://portal.quranlab.ai).
+SDK 2.x runs V4 only.
 [portal.quranlab.ai](https://portal.quranlab.ai) is where you create an app, get its developer key,
-choose which model revision your users get, and set the tajweed checks (presets, per-class
-thresholds) your users see, without shipping a new build.
+choose which model revision your users get, and, for SDK 2.x scoring, set the tajweed checks (presets,
+per-class thresholds) your users see, without shipping a new build.
+
+## Install
+
+There are no prebuilt binaries: build the release tag with CMake.
+
+```sh
+git clone --recurse-submodules --branch 2.0.2 https://github.com/Quran-Lab/tajweedformer-c
+cd tajweedformer-c
+cmake --preset linux && cmake --build --preset linux                    # Linux
+cmake --preset windows-clang && cmake --build --preset windows-clang    # Windows
+```
+
+The build leaves the library (`libtajweedformer.so`, or `tajweedformer.dll` with `tajweedformer.lib`) and the `tajweedformer` command-line tool in `build/linux` or `build/windows-clang`. Your program includes `include/tajweedformer.h` and links the library. From the repository's root:
+
+```sh
+cc quickstart.c -I include -I vendor/zipformer-sdk/tajweed/include -L build/linux -ltajweedformer -o quickstart                    # Linux
+clang quickstart.c -I include -I vendor/zipformer-sdk/tajweed/include -L build/windows-clang -ltajweedformer -o quickstart.exe    # Windows
+```
+
+At run time the program needs the library: `LD_LIBRARY_PATH=build/linux` on Linux; on Windows keep `tajweedformer.dll` beside the program or on `PATH`.
+
+## Before you start
+
+| | |
+| - | - |
+| **Key** | A desktop key from [portal.quranlab.ai](https://portal.quranlab.ai), for your app's id (a reverse-DNS id on Linux, the package family name on Windows). |
+| **Systems** | Windows and Linux on x86-64. |
+| **Compilers** | Linux: gcc or clang. Windows: LLVM clang on the Microsoft runtime, or MinGW-w64 GCC. Microsoft's `cl.exe` cannot build the engine. CMake 3.24 or later, and Ninja. |
+| **Libraries** | Linux: the development files of libcurl and OpenSSL 3 (`libcurl4-openssl-dev libssl-dev` on Debian and Ubuntu). Windows: none. The build downloads libopus 1.6.1 once and checks its hash. |
+| **Microphone** | The library takes samples; capturing them is your program's part. The quick start pipes the system's recorder in. |
+| **Download** | The model is 56.5 MB for the default context (73.5 MB on disk), downloaded once into a folder you choose; every context together is 58.9 MB. |
+| **Streams** | One live stream per process at a time. A server runs one worker process per stream. |
 
 ## Quick start
 
-```bash
-git clone --recurse-submodules https://github.com/Quran-Lab/tajweedformer-c
-cd tajweedformer-c
-cmake --preset windows-clang && cmake --build --preset windows-clang    # Windows (LLVM clang + Ninja)
-cmake --preset linux && cmake --build --preset linux                    # Linux (gcc or clang, libcurl)
-
-tajweedformer info   models/sdk/v4.0
-tajweedformer decode models/sdk/v4.0 take.wav --ayah 1:2 --heads all > take.json
-```
+From your key to what the model hears from the microphone. Save this as `quickstart.c` (it is
+[`examples/quickstart.c`](examples/quickstart.c), which every build compiles):
 
 ```c
+#include <stdio.h>
+#include <string.h>
 #include "tajweedformer.h"
-TfModel *m = tf_model_open("models/sdk/v4.0", NULL);       /* verified: signature and every file's hash */
-TfStream *s = tf_stream_create(m, NULL);
-tf_stream_push_audio(s, pcm, n);                             /* 16 kHz mono float; other rates via the options */
-tf_stream_finish(s);
-TfDecoded *d = tf_stream_decode(s);                          /* what was heard, with runner-ups and confidence */
-TfResult *r = tf_stream_score(s, 1, 2);                      /* tajweed verdicts for 1:2, per site and per word */
-puts(tf_result_json(r));
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
+
+typedef struct {
+  TfModel *model;
+  TfStream *stream;
+} Take;
+
+static void on_chunk(void *user, const TfChunk *chunk) {   /* every 320 ms of audio: what the model heard so far */
+  const Take *take = user;
+  TfDecoded *heard = tf_stream_decode(take->stream);
+  const TfToken *t;
+  const int n = tf_decoded_tokens(heard, &t);
+  printf("%6d ms:", chunk->end_ms);
+  for (int i = 0; i < n; ++i) printf(" %s", tf_model_token_name(take->model, t[i].id));
+  printf("\n");
+  fflush(stdout);
+  tf_decoded_free(heard);
+}
+
+int main(int argc, char **argv) {
+  if (argc < 2) return fprintf(stderr, "usage: quickstart qlk_v1_... < mono float samples at 16 kHz\n"), 2;
+
+  /* 1. the key: Quran Lab's signed config names the model revision this app gets */
+  TfClientOptions co = tf_client_default_options();
+  co.key = argv[1];
+  co.app_id = "com.example.quickstart";      /* your app's id, as registered for the key */
+  co.app_version = "1.0";
+  co.storage_dir = "quranlab";               /* the SDK's own state */
+  TfClient *client = tf_client_create(&co);
+  if (!client || tf_client_launch(client)) return fprintf(stderr, "portal: %s\n", tf_last_error()), 1;
+  const char *config = tf_client_config_json(client);   /* verified; "recommended":{...,"revision":"..."} */
+  const char *at = config ? strstr(config, "\"recommended\"") : NULL;
+  char revision[80] = "";
+  if (at && (at = strstr(at, "\"revision\"")) && (at = strchr(at + 10, '"'))) {
+    const size_t len = strcspn(at + 1, "\"");
+    if (len < sizeof revision) memcpy(revision, at + 1, len);
+  }
+  if (!revision[0]) return fprintf(stderr, "the config recommends no model for this key\n"), 1;
+
+  /* 2. the model: downloaded once (56.5 MB), resumed if interrupted, every file checked */
+  TfDownloadOptions dl = tf_download_default_options();
+  dl.key = argv[1];
+  dl.revision = revision;
+  dl.dest = "model";
+  dl.contexts = "c16_l64";                   /* the default context: 320 ms chunks */
+  if (tf_download_model(&dl)) return fprintf(stderr, "download: %s\n", tf_last_error()), 1;
+  TfModel *model = tf_model_open("model", NULL);
+  if (!model) return fprintf(stderr, "model: %s\n", tf_last_error()), 1;
+
+  /* 3. audio in, model output out */
+  Take take = {model, NULL};
+  TfStreamOptions so = tf_stream_default_options();
+  so.on_chunk = on_chunk;
+  so.user = &take;
+  take.stream = tf_stream_create(model, &so);
+  if (!take.stream) return fprintf(stderr, "stream: %s\n", tf_last_error()), 1;
+#ifdef _WIN32
+  _setmode(_fileno(stdin), _O_BINARY);
+#endif
+  float samples[1600];                       /* 100 ms at 16 kHz */
+  size_t n;
+  while ((n = fread(samples, sizeof *samples, 1600, stdin)) > 0) tf_stream_push_audio(take.stream, samples, (int)n);
+  tf_stream_finish(take.stream);             /* the end of the take: the last chunks arrive */
+
+  tf_stream_destroy(take.stream);
+  tf_model_close(model);
+  tf_client_destroy(client);
+  return 0;
+}
 ```
 
+Compile it against the library you built (the two lines under Install), then pipe the microphone in as raw mono
+float samples at 16 kHz. Capture is the system's recorder, because it is a platform API this library does not wrap:
+
+```sh
+arecord -q -f FLOAT_LE -r 16000 -c 1 -t raw | LD_LIBRARY_PATH=build/linux ./quickstart qlk_v1_...                                  # Linux
+ffmpeg -loglevel error -f dshow -i audio="<your microphone>" -ac 1 -ar 16000 -f f32le - | quickstart.exe qlk_v1_...              # Windows
+```
+
+(`ffmpeg -list_devices true -f dshow -i dummy` lists the Windows microphones.) The first run downloads the model
+into `model/`; later runs only check it. Each line printed is what the model heard so far; `tf_stream_decode` also
+gives every token's confidence, runner-up and times, and the chunk carries every head of the network you selected.
+
+In SDK 2.x a finished take of a known ayah can also be scored: `tf_stream_score(stream, surah, ayah)` gives verdicts
+per site and per word.
+
 Everything is in [docs/api.md](docs/api.md): settings, head selection, the decoded and tajweed layers, the portal
-client, recitation sharing, downloads and the server tier. Prebuilt binaries (Windows x64 DLL, Linux x64 shared
-library, the CLI) are the CI workflow's artifacts.
+client, recitation sharing, downloads and the server tier. There are no prebuilt binaries: the library is built
+from source.
 
 ## How it works
 
@@ -300,7 +406,7 @@ the scorer) together with the `zf_vnni_hook` object and `zf_gemm_vnni`, as `zf_d
 
 ## Build from source
 
-The engine sources are pinned as the submodule `vendor/tajweedformer-engine` (tajweedformer-engine; the
+The engine sources are pinned as the submodule `vendor/zipformer-sdk` (tajweedformer-engine; the
 directory keeps its name).
 
 ```bash
@@ -344,9 +450,9 @@ ctest --test-dir build --output-on-failure      # vnni_check, dropin_check, hook
 
 # the whole decode on the native kernels against the engine's expected outputs
 # (data: the conformance-data-2 release of tajweedformer-engine; on Windows from Git Bash)
-vendor/tajweedformer-engine/bench/v4_conformance.sh build/engine <sdk/v4.0 folder> <data>
-vendor/tajweedformer-engine/bench/conformance.sh build/engine build-rel/engine <data>
-ZF_NATIVE_INT8=avx2 vendor/tajweedformer-engine/bench/v4_conformance.sh build/engine <sdk/v4.0 folder> <data>
+vendor/zipformer-sdk/bench/v4_conformance.sh build/engine <sdk/v4.0 folder> <data>
+vendor/zipformer-sdk/bench/conformance.sh build/engine build-rel/engine <data>
+ZF_NATIVE_INT8=avx2 vendor/zipformer-sdk/bench/v4_conformance.sh build/engine <sdk/v4.0 folder> <data>
 ```
 
 Against ONNX Runtime's `MatMulInteger` on the real weights (v3.1; needs the gated model):
@@ -424,7 +530,7 @@ test/     vnni_check.c        every tier == integer golden, and speed
 docs/     api.md               the C API, with examples
           platform-client.md   how the SDK talks to Quran Lab (the same page in every SDK)
           engineering-notes.md
-vendor/   tajweedformer-engine       the engine (tajweedformer-engine), pinned as a submodule
+vendor/   zipformer-sdk       the engine (tajweedformer-engine), pinned as a submodule
 ```
 
 ## Status and roadmap
@@ -446,10 +552,11 @@ Next:
 
 ## Download size
 
-A desktop app or server keeps the full CPU set of the model folder (`sdk/v4.0`, manifest format 3): the shared
-weights, every context's graph and the common files (calibration, tokens, the expected table): **58.2 MB** gzip
-on the wire (60.0 MB with the optional ONNX Runtime graphs), resumable, every file checked against the signed
-manifest.
+`tf_download_model` fetches the CPU files of the model folder (`sdk/v4.0`, manifest format 3), gzip on the wire,
+resumable, every file checked against the signed manifest. Model revision v4.0-2026-11-10: **56.5 MB**
+for the default context `c16_l64` alone (`contexts = "c16_l64"`; 73.5 MB on disk), or 58.9 MB
+for every context (77.2 MB on disk), which is what a server usually keeps. The optional ONNX Runtime
+graphs are not downloaded.
 
 ## Licence
 
@@ -459,7 +566,7 @@ The source code in this repository and the TajweedFormer model weights are relea
 Quran-Lab No-Profit License 1.2 ([NPL-1.2](LICENSE)): use, copy, modify and build on them freely,
 but never charge for them, for access to them, or for any feature they power. The weights are not
 stored in this repository; Quran Lab hosts them itself and serves them to apps by
-`cdn.quranlab.ai/models` under the same licence. Request access at
-[portal.quranlab.ai/access](https://portal.quranlab.ai/access).
+`cdn.quranlab.ai/models` under the same licence. Get access at
+[portal.quranlab.ai](https://portal.quranlab.ai).
 
 Third-party components keep their own licences, listed in their folders under `third_party/`.

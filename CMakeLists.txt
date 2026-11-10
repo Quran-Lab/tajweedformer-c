@@ -130,6 +130,18 @@ if(WIN32)
   target_compile_definitions(tajweedformer_cli PRIVATE TF_USE_DLL=1 _CRT_SECURE_NO_WARNINGS)
 endif()
 
+# the README's quick start, built with everything else so the code in the README always compiles
+# (test/quickstart_check.py keeps the two texts equal). Only in a build of this repository itself: an app that
+# takes it as a subproject has its own program, which may well be called quickstart too.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  add_executable(quickstart examples/quickstart.c)
+  target_compile_options(quickstart PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(quickstart PRIVATE tajweedformer)
+  if(WIN32)
+    target_compile_definitions(quickstart PRIVATE TF_USE_DLL=1 _CRT_SECURE_NO_WARNINGS)
+  endif()
+endif()
+
 # the library's own tests (through the public API only; tf_tests also reads its internal JSON helpers)
 add_executable(tf_tests test/tf_tests.c)
 target_include_directories(tf_tests PRIVATE src/tf)
