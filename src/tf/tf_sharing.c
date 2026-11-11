@@ -7,7 +7,7 @@
  * over from 2.0.0's sharing.json). The first ask follows a finished session with feedback; "Not now" (or a sheet
  * left unanswered) may lead to a re-ask at least 7 sessions later, until the third showing. A yes ends asking for
  * good, across copy decks, wording and SDK upgrades; so does turning sharing off. After that only the settings
- * switch (tf_client_sharing_set) turns sharing on or off.
+ * switch (tf__client_sharing_set) turns sharing on or off.
  *
  * Consent versions (SDK 2.0.1): the grant records what the learner agreed to at that moment: the copy deck's
  * consent_version, or with the app's own wording (tf_sharing_set_wording) "custom-" + the first 24 hex digits of
@@ -48,7 +48,7 @@ typedef struct {
 extern const TfCopyDeck tf__copy_decks[];
 
 const char *tf__client_dir(const TfClient *c);
-const TfClientOptions *tf__client_options(const TfClient *c);
+const TfClientConfig *tf__client_options(const TfClient *c);
 void **tf__client_sharing_slot(TfClient *c);
 int tf__client_flag(const TfClient *c, const char *name, int dflt);
 void tf__client_upload_trust(const TfClient *c, char *out, size_t n);
@@ -75,7 +75,7 @@ int tf_random_bytes(uint8_t *out, size_t n) {
 }
 
 /* ------------------------------------------------------------------ copy */
-const char *tf_sharing_copy_json(const char *language) {
+const char *tf__sharing_deck_json(const char *language) {
   const char *want = language && *language ? language : "en";
   for (int i = 0; tf__copy_decks[i].lang; ++i)
     if (!_tf_strnicmp(tf__copy_decks[i].lang, want, 2) && (want[2] == 0 || want[2] == '-' || want[2] == '_'))
@@ -85,7 +85,7 @@ const char *tf_sharing_copy_json(const char *language) {
   return NULL;
 }
 static void deck_consent_version(const char *lang, char *out, size_t n) {
-  const char *d = tf_sharing_copy_json(lang);
+  const char *d = tf__sharing_deck_json(lang);
   TfJson *j = d ? tf_json_parse(d, strlen(d), NULL) : NULL;
   const char *v = tf_json_str(tf_json_get(j, "consent_version"));
   snprintf(out, n, "%s", v ? v : "");
@@ -235,7 +235,7 @@ static int asking_ended(Share *s) {
 /* the deck's string keys (impact.minutes by plural category) */
 static const char *const kPlural[] = {"zero", "one", "two", "few", "many", "other"};
 static int known_key(const char *key) {
-  const char *en = tf_sharing_copy_json("en");
+  const char *en = tf__sharing_deck_json("en");
   TfJson *j = en ? tf_json_parse(en, strlen(en), NULL) : NULL;
   const TfJson *strs = tf_json_get(j, "strings");
   int ok = 0;
@@ -387,15 +387,15 @@ static char *merged_copy(const char *deck, const char *version, char **keys, cha
 int tf_sharing_set_wording(TfClient *c, const char *const *keys, const char *const *texts, int n) {
   tf__clear_error();
   Share *s = c ? share(c) : NULL;
-  if (!s) return tf__fail(TF_ERR_ARGUMENT, "no client");
-  if (n < 0 || (n > 0 && (!keys || !texts))) return tf__fail(TF_ERR_ARGUMENT, "keys and texts are required");
+  if (!s) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
+  if (n < 0 || (n > 0 && (!keys || !texts))) return tf__fail(TF_ERR_INVALID_ARGUMENT, "keys and texts are required");
   if (!keys) n = 0;
   for (int i = 0; i < n; ++i) {
-    if (!keys[i] || !known_key(keys[i])) return tf__fail(TF_ERR_ARGUMENT, "wording: unknown key %s", keys[i] ? keys[i] : "(null)");
-    if (!texts[i] || !utf8_ok((const unsigned char *)texts[i])) return tf__fail(TF_ERR_ARGUMENT, "wording: %s is not UTF-8 text", keys[i]);
-    if (blank(texts[i])) return tf__fail(TF_ERR_ARGUMENT, "wording: %s is empty or blank", keys[i]);
+    if (!keys[i] || !known_key(keys[i])) return tf__fail(TF_ERR_INVALID_ARGUMENT, "wording: unknown key %s", keys[i] ? keys[i] : "(null)");
+    if (!texts[i] || !utf8_ok((const unsigned char *)texts[i])) return tf__fail(TF_ERR_INVALID_ARGUMENT, "wording: %s is not UTF-8 text", keys[i]);
+    if (blank(texts[i])) return tf__fail(TF_ERR_INVALID_ARGUMENT, "wording: %s is empty or blank", keys[i]);
     for (int k = 0; k < i; ++k)
-      if (!strcmp(keys[k], keys[i])) return tf__fail(TF_ERR_ARGUMENT, "wording: %s is given twice", keys[i]);
+      if (!strcmp(keys[k], keys[i])) return tf__fail(TF_ERR_INVALID_ARGUMENT, "wording: %s is given twice", keys[i]);
   }
   char base[40];
   deck_consent_version(tf__client_options(c)->language, base, sizeof base);
@@ -417,7 +417,7 @@ int tf_sharing_set_wording(TfClient *c, const char *const *keys, const char *con
       tf_sha256(canon, strlen(canon), h);
       tf_hex_encode(h, 32, hash);
       snprintf(eff, sizeof eff, "custom-%.24s", hash);
-      copy = merged_copy(tf_sharing_copy_json(tf__client_options(c)->language), eff, nk, nt, n);
+      copy = merged_copy(tf__sharing_deck_json(tf__client_options(c)->language), eff, nk, nt, n);
     }
     if (!canon || !copy) {
       for (int i = 0; i < n; ++i) {
@@ -428,7 +428,7 @@ int tf_sharing_set_wording(TfClient *c, const char *const *keys, const char *con
       free(nt);
       free(canon);
       free(copy);
-      return tf__fail(TF_ERR_NO_MEMORY, "out of memory");
+      return tf__fail(TF__ERR_NO_MEMORY, "out of memory");
     }
   }
   tf_mutex_lock(&s->lock);
@@ -443,18 +443,18 @@ int tf_sharing_set_wording(TfClient *c, const char *const *keys, const char *con
   tf_mutex_unlock(&s->lock);
   return 0;
 }
-const char *tf_sharing_consent_version(TfClient *c) { return c && share(c) ? share(c)->effective : NULL; }
-const char *tf_sharing_consent_sha256(TfClient *c) { return c && share(c) && share(c)->effective_hash[0] ? share(c)->effective_hash : NULL; }
-const char *tf_sharing_consent_text(TfClient *c) { return c && share(c) ? share(c)->canonical : NULL; }
-const char *tf_client_sharing_copy_json(TfClient *c) {
+const char *tf__sharing_consent_version(TfClient *c) { return c && share(c) ? share(c)->effective : NULL; }
+const char *tf__sharing_consent_sha256(TfClient *c) { return c && share(c) && share(c)->effective_hash[0] ? share(c)->effective_hash : NULL; }
+const char *tf__sharing_consent_text(TfClient *c) { return c && share(c) ? share(c)->canonical : NULL; }
+const char *tf__client_sharing_copy_json(TfClient *c) {
   if (!c || !share(c)) return NULL;
-  return share(c)->copy ? share(c)->copy : tf_sharing_copy_json(tf__client_options(c)->language);
+  return share(c)->copy ? share(c)->copy : tf__sharing_deck_json(tf__client_options(c)->language);
 }
 
 /* enabled = the signed config in force offers sharing to this app: flags.contributions literally true. Quran Lab
  * decides this per app (11-09); since 2.0.1 the app's contributions option is ignored, and without a config in
  * force nothing is offered (2.0.0 defaulted to on when the config was missing). Enabled is never consent:
- * tf_client_sharing_state and every capture and upload also need the learner's "granted". */
+ * tf__client_sharing_state and every capture and upload also need the learner's "granted". */
 static int sharing_enabled(const TfClient *c) { return tf__client_flag(c, "contributions", 0); }
 
 /* may this install upload (web and desktop upload at the lower trust tier): flags.upload_trust[windows|linux]
@@ -484,12 +484,13 @@ void tf__sharing_uploaded(TfClient *c) {
   share_save(c, s);
 }
 void tf__share_wipe(TfClient *c);
+void tf__share_forget_seq(TfClient *c);
 
 /* the SDK asks: the app's callback (its own UI or a sheet it shows) or, without one, a pending ask the app reads
  * from the status. Either way it is one of the three showings (asks, telemetry share_asked). */
 static void ask(TfClient *c, int reask) {
   Share *s = share(c);
-  const TfClientOptions *o = tf__client_options(c);
+  const TfClientConfig *o = tf__client_options(c);
   s->asks++;
   s->last_ask_session = s->sessions;
   s->pending_ask = o->on_consent ? 0 : 1;
@@ -497,10 +498,10 @@ static void ask(TfClient *c, int reask) {
   tf__telemetry_add(c, "share_asked", 1);
   if (o->on_consent) {
     TfConsentRequest r;
-    memset(&r, 0, sizeof r); /* r.update stays 0 since 2.0.1 */
+    memset(&r, 0, sizeof r);
     r.reask = reask ? s->asks - 1 : 0;
     r.guardian = o->children;
-    r.copy_json = tf_client_sharing_copy_json(c);
+    r.copy_json = tf__client_sharing_copy_json(c);
     r.consent_version = s->effective;
     o->on_consent(o->user, &r);
   }
@@ -518,10 +519,10 @@ void tf__sharing_session(TfClient *c, int feedback, double audio_s) {
   else if (s->sessions - s->last_ask_session >= REASK_SESSIONS) ask(c, 1);
 }
 
-int tf_client_sharing_ask_now(TfClient *c) {
-  if (!c || !share(c)) return tf__fail(TF_ERR_ARGUMENT, "no client");
+int tf__client_sharing_ask_now(TfClient *c) {
+  if (!c || !share(c)) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
   Share *s = share(c);
-  if (!sharing_enabled(c)) return tf__fail(TF_ERR_NOT_AVAILABLE, "sharing is not offered to this app (the signed config's flags.contributions)");
+  if (!sharing_enabled(c)) return tf__fail(TF__ERR_NOT_AVAILABLE, "sharing is not offered to this app (the signed config's flags.contributions)");
   if (asking_ended(s)) return 0; /* a yes, sharing turned off, or three sheets shown: nothing to ask */
   ask(c, s->asks > 0);
   return 0;
@@ -540,9 +541,9 @@ static void grant(TfClient *c, Share *s) {
 
 /* the learner's answer to a sheet: the SDK's ask through the app's callback or its own UI, only from the learner's
  * own tap (counted: share_yes, share_no) */
-int tf_client_sharing_answer(TfClient *c, int yes) {
+int tf__client_sharing_answer(TfClient *c, int yes) {
   Share *s = c ? share(c) : NULL;
-  if (!s) return tf__fail(TF_ERR_ARGUMENT, "no client");
+  if (!s) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
   s->pending_ask = 0;
   if (yes) {
     grant(c, s);
@@ -557,9 +558,9 @@ int tf_client_sharing_answer(TfClient *c, int yes) {
 }
 
 /* the settings switch (not a sheet answer: not counted as share_yes / share_no) */
-int tf_client_sharing_set(TfClient *c, int on) {
+int tf__client_sharing_set(TfClient *c, int on) {
   Share *s = c ? share(c) : NULL;
-  if (!s) return tf__fail(TF_ERR_ARGUMENT, "no client");
+  if (!s) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
   s->pending_ask = 0;
   if (on) {
     grant(c, s);
@@ -575,10 +576,10 @@ int tf_client_sharing_set(TfClient *c, int on) {
   return 0;
 }
 
-int tf_client_sharing_state(TfClient *c) { return c && share(c) && granted(share(c)) && sharing_enabled(c); }
+int tf__client_sharing_state(TfClient *c) { return c && share(c) && granted(share(c)) && sharing_enabled(c); }
 
 /* "updateNeeded" stays in the JSON for apps that read it, always false since 2.0.1 */
-const char *tf_client_sharing_status_json(TfClient *c) {
+const char *tf__client_sharing_status_json(TfClient *c) {
   static _Thread_local char buf[1024];
   Share *s = c ? share(c) : NULL;
   if (!s) return NULL;
@@ -609,9 +610,9 @@ int tf__contributor_sign(const char *dir, const char *app, const char *nonce, lo
 void tf__contributor_forget(const char *dir);
 extern long long tf__now_override;
 
-int tf_client_sharing_recovery_code(TfClient *c, char out[33]) {
-  if (!c) return tf__fail(TF_ERR_ARGUMENT, "no client");
-  return tf__contributor_recovery(tf__client_dir(c), out) ? tf__fail(TF_ERR_NOT_AVAILABLE, "nothing was shared from this install yet") : 0;
+int tf__client_sharing_recovery_code(TfClient *c, char out[33]) {
+  if (!c) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
+  return tf__contributor_recovery(tf__client_dir(c), out) ? tf__fail(TF__ERR_NOT_AVAILABLE, "nothing was shared from this install yet") : 0;
 }
 
 /* deletion routes take NO app key or token (403 credential_not_accepted): plain JSON POSTs */
@@ -632,9 +633,21 @@ static int post_plain(TfClient *c, const char *path, const char *body, TfHttpRes
 
 /* "Delete what I shared": challenge, the device key's signature, delete (PLATFORM_CLIENT.md 9.1). On 202 the local
  * key, contributor id, recovery code and unsent queue are forgotten. */
-int tf_client_sharing_delete(TfClient *c) {
+/* The server confirmed "Delete what I shared": the contributor id and its key are forgotten (the next shared
+ * recording gets a new one), the count shown to the learner starts again, the unsent queue and the open
+ * recording are deleted, the feed's ring is emptied, and the count of shared recordings (take_seq) and the end
+ * of the previous one are forgotten. */
+void tf__sharing_deleted(TfClient *c) {
+  tf__contributor_forget(tf__client_dir(c));
+  share(c)->shared_sessions = 0;
+  share_save(c, share(c));
+  tf__share_wipe(c);
+  tf__share_forget_seq(c);
+}
+
+int tf__client_sharing_delete(TfClient *c) {
   tf__clear_error();
-  if (!c) return tf__fail(TF_ERR_ARGUMENT, "no client");
+  if (!c) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
   char id[33];
   if (tf__contributor(tf__client_dir(c), 0, id, NULL, NULL)) return 0; /* nothing was ever shared from this install */
   char app[600];
@@ -656,10 +669,10 @@ int tf_client_sharing_delete(TfClient *c) {
     tf_json_free(j);
     const int st = r.status;
     tf_http_response_free(&r);
-    if (!*nonce) return tf__fail(TF_ERR_HTTP, "deletion challenge: HTTP %d", st);
+    if (!*nonce) return tf__fail(TF__ERR_HTTP, "deletion challenge: HTTP %d", st);
     const long long ts = tf__now_override ? tf__now_override : (long long)time(NULL);
     char sig[90];
-    if (tf__contributor_sign(tf__client_dir(c), app, nonce, ts, sig)) return tf__fail(TF_ERR_NOT_AVAILABLE, "the device key cannot sign");
+    if (tf__contributor_sign(tf__client_dir(c), app, nonce, ts, sig)) return tf__fail(TF__ERR_NOT_AVAILABLE, "the device key cannot sign");
     tf_buf_init(&b);
     tf_buf_puts(&b, "{\"app\":");
     tf_buf_json_str(&b, app);
@@ -673,18 +686,15 @@ int tf_client_sharing_delete(TfClient *c) {
     const int retry = ds == 401 && r.body && (strstr(r.body, "nonce_invalid") || strstr(r.body, "timestamp_invalid"));
     tf_http_response_free(&r);
     if (ds == 202) {
-      tf__contributor_forget(tf__client_dir(c));
-      share(c)->shared_sessions = 0;
-      share_save(c, share(c));
-      tf__share_wipe(c);
+      tf__sharing_deleted(c);
       return 0;
     }
-    if (!retry) return tf__fail(TF_ERR_HTTP, "deletion: HTTP %d", ds);
+    if (!retry) return tf__fail(TF__ERR_HTTP, "deletion: HTTP %d", ds);
   }
-  return tf__fail(TF_ERR_HTTP, "deletion: the challenge was refused twice");
+  return tf__fail(TF__ERR_HTTP, "deletion: the challenge was refused twice");
 }
 
-const char *tf_client_sharing_summary_json(TfClient *c) {
+const char *tf__client_sharing_summary_json(TfClient *c) {
   static _Thread_local char out[1024];
   char id[33], hdr[64];
   if (!c || tf__contributor(tf__client_dir(c), 0, id, NULL, NULL)) return NULL;
@@ -695,4 +705,72 @@ const char *tf_client_sharing_summary_json(TfClient *c) {
   if (ok) memcpy(out, r.body, r.body_n + 1);
   tf_http_response_free(&r);
   return ok ? out : NULL;
+}
+
+/* ------------------------------------------------------------------ the public calls (include/tajweedformer.h) */
+
+int tf_sharing_status(TfClient *c, TfSharing *out) {
+  tf__clear_error();
+  Share *s = c ? share(c) : NULL;
+  if (!s || !out) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
+  memset(out, 0, sizeof *out);
+  out->is_available = sharing_enabled(c);
+  out->is_on = tf__client_sharing_state(c);
+  tf_mutex_lock(&s->lock);
+  out->asks = s->asks;
+  out->pending_ask = s->pending_ask;
+  out->guardian = s->guardian;
+  out->shared = s->shared_sessions;
+  out->consent_version = s->effective;
+  out->consent_text = s->canonical;
+  out->consent_sha256 = s->effective_hash[0] ? s->effective_hash : NULL;
+  tf_mutex_unlock(&s->lock);
+  return 0;
+}
+int tf_sharing_is_available(TfClient *c) { return c && share(c) && sharing_enabled(c); }
+int tf_sharing_is_on(TfClient *c) { return tf__client_sharing_state(c); }
+
+int tf_sharing_set_on(TfClient *c, int on) {
+  tf__clear_error();
+  if (!c || !share(c)) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
+  /* off always works (it stops uploads and deletes the unsent queue); on needs Quran Lab's config to offer sharing */
+  if (on && !sharing_enabled(c)) return tf__fail(TF_ERR_SHARING_UNAVAILABLE, NULL);
+  return tf__client_sharing_set(c, on);
+}
+int tf_sharing_ask(TfClient *c) {
+  tf__clear_error();
+  if (!c || !share(c)) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
+  if (!sharing_enabled(c)) return tf__fail(TF_ERR_SHARING_UNAVAILABLE, NULL);
+  return tf__client_sharing_ask_now(c);
+}
+int tf_sharing_answer(TfClient *c, int share_it) {
+  tf__clear_error();
+  return tf__client_sharing_answer(c, share_it);
+}
+const char *tf_sharing_copy_json(TfClient *c) { return tf__client_sharing_copy_json(c); }
+const char *tf_sharing_summary_json(TfClient *c) {
+  const char *s = tf__client_sharing_summary_json(c);
+  tf__clear_error(); /* no summary (not shared yet, no network) is not an error: nothing is shown */
+  return s;
+}
+int tf_sharing_delete(TfClient *c) {
+  tf__clear_error();
+  if (!c || !share(c)) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
+  const int rc = tf__client_sharing_delete(c);
+  if (!rc) return 0;
+  /* the learner must hear that nothing was deleted. The catalogue has no code for a request other than a download
+   * that got no answer: the nearest is the server's refusal, with what happened as its detail. */
+  if (tf__error_code() == TF__ERR_NOT_AVAILABLE) return tf__error_as(TF_ERR_STORAGE_FAILED);
+  if (tf__error_code() == TF__ERR_NETWORK) return tf__fail(TF_ERR_SERVER_REJECTED, "the deletion request got no answer (no connection); nothing was deleted");
+  return tf__error_as(TF_ERR_SERVER_REJECTED);
+}
+int tf_sharing_recovery_code(TfClient *c, char out[33]) {
+  tf__clear_error();
+  if (!c || !out) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
+  out[0] = 0;
+  if (tf__client_sharing_recovery_code(c, out)) {
+    out[0] = 0; /* nothing was shared from this install yet: no code, and no error */
+    tf__clear_error();
+  }
+  return 0;
 }

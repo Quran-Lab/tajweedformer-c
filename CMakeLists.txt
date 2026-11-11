@@ -19,7 +19,15 @@ if(WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
   add_compile_options($<$<COMPILE_LANGUAGE:C>:-Wa,-muse-unaligned-vector-move>)
 endif()
 
-option(ZF_NATIVE_RELEASE "The engine's release configuration (ZF_RELEASE: exact only, ZF_* environment ignored)" OFF)
+# As a subproject (FetchContent or add_subdirectory in an app's own CMake project): nothing here is built unless
+# the app links it, and the engine's release configuration is the default, since the app ships what it builds.
+# A top-level build (the presets, CI) builds everything and sets the configuration itself.
+set(_tf_release_default OFF)
+if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  set_property(DIRECTORY PROPERTY EXCLUDE_FROM_ALL ON)
+  set(_tf_release_default ON)
+endif()
+option(ZF_NATIVE_RELEASE "The engine's release configuration (ZF_RELEASE: exact only, ZF_* environment ignored)" ${_tf_release_default})
 set(ZF_NEON_EMU ON CACHE BOOL "Emulate ARMv7 NEON in portable C (required on x86)")
 if(ZF_NATIVE_RELEASE)
   set(ZF_RELEASE ON CACHE BOOL "" FORCE)
@@ -27,9 +35,15 @@ else()
   add_compile_definitions(ZF_QUANT_DIVIDE=1)
 endif()
 
-set(SDK "${CMAKE_SOURCE_DIR}/vendor/zipformer-sdk")
-if(NOT EXISTS "${SDK}/engine/src/kernels.c")
-  execute_process(COMMAND git submodule update --init WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+# The engine's source tree: the vendor/zipformer-sdk submodule, or another checkout of the engine (TF_ENGINE_DIR).
+set(TF_ENGINE_DIR "" CACHE PATH "The engine's source tree; empty: the vendor/zipformer-sdk submodule")
+if(TF_ENGINE_DIR)
+  set(SDK "${TF_ENGINE_DIR}")
+else()
+  set(SDK "${CMAKE_CURRENT_SOURCE_DIR}/vendor/zipformer-sdk")
+  if(NOT EXISTS "${SDK}/engine/src/kernels.c")
+    execute_process(COMMAND git submodule update --init WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+  endif()
 endif()
 # The engine looks for the ONNX Runtime C API headers in its own third_party, then in ours.
 # EXCLUDE_FROM_ALL: only the engine targets this project uses are built (its many development
@@ -66,7 +80,6 @@ target_link_libraries(zf_vnni_hook PUBLIC zf_gemm_vnni)
 
 # The engine's own harnesses, with the hook: bench/conformance.sh (v3.2) and bench/v4_conformance.sh
 # (V4) then run the whole decode on the native kernels against the engine's expected files.
-# zf_tajweed_check is the engine's MinGW / Unix harness; it is not built against the Microsoft runtime.
 add_custom_target(zf_harnesses ALL)
 foreach(t zf_set_rt zf_stream_check zf_stream_concurrent zf_tajweed_check zf_state_check zf_info_check)
   if(TARGET ${t})
@@ -81,26 +94,25 @@ target_compile_options(zf_decode PRIVATE -O2 -Wall -Wextra)
 target_link_libraries(zf_decode PRIVATE zf_stream zf_vnni_hook zf_gemm_vnni)
 
 
-# --- the TajweedFormer library: include/tajweedformer.h (tf_*) over the engine's zf_tajweed.h ---
-# One shared library (tajweedformer.dll / libtajweedformer.so) exporting exactly tf_* and zf_tajweed_*
-# (a .def file on Windows, a version script on Linux), and the same as a static library.
-if(TARGET zf_tajweed_engine)
-  # the engine's glue uses fopen/snprintf; the Microsoft runtime's deprecation notes are not errors here
-  if(WIN32)
-    target_compile_definitions(zf_tajweed_engine PRIVATE _CRT_SECURE_NO_WARNINGS)
-  endif()
-  set_property(TARGET zf_tajweed_engine zf_stream zf_rt zf_ort_ops zf_engine PROPERTY POSITION_INDEPENDENT_CODE ON)
+# --- the TajweedFormer library: include/tajweedformer.h (tf_*) over the engine's inference library ---
+# One shared library (tajweedformer.dll / libtajweedformer.so) exporting exactly the functions of
+# include/tajweedformer.h (a .def file on Windows, a version script on Linux; test/api_scan.py keeps the three
+# equal), and the same as a static library. The engine's header is not part of the public interface: an app
+# includes tajweedformer.h and nothing else.
+if(TARGET zf_tajweed_inference)
+  set_property(TARGET zf_tajweed_inference zf_stream zf_rt zf_ort_ops zf_engine PROPERTY POSITION_INDEPENDENT_CODE ON)
 endif()
-set(TF_SOURCES src/tf/tf_util.c src/tf/tf_crypto.c src/tf/tf_model.c src/tf/tf_stream.c src/tf/tf_decode.c src/tf/tf_topk.c
-    src/tf/tf_score.c src/tf/tf_http.c src/tf/tf_download.c src/tf/tf_client.c src/tf/tf_sharing.c
-    src/tf/tf_copy_deck.c src/tf/tf_ogg.c src/tf/tf_devicekey.c src/tf/tf_inflate.c src/tf/tf_share.c src/tf/tf_share_audio.c)
+set(TF_SOURCES src/tf/tf_util.c src/tf/tf_crypto.c src/tf/tf_model.c src/tf/tf_heads.c src/tf/tf_session.c src/tf/tf_speech.c
+    src/tf/tf_decode.c src/tf/tf_topk.c src/tf/tf_reference.c src/tf/tf_http.c src/tf/tf_download.c src/tf/tf_store.c
+    src/tf/tf_client.c src/tf/tf_api.c src/tf/tf_sharing.c src/tf/tf_copy_deck.c src/tf/tf_ogg.c src/tf/tf_devicekey.c
+    src/tf/tf_inflate.c src/tf/tf_share.c src/tf/tf_share_audio.c)
 # libopus for the shared-session upload (cmake/opus.cmake: the pinned 1.6.1 release, float, plain C)
 include(cmake/opus.cmake)
 function(tf_library name kind)
   add_library(${name} ${kind} ${TF_SOURCES} $<TARGET_OBJECTS:zf_vnni_hook>)
-  target_include_directories(${name} PUBLIC include "${SDK}/tajweed/include" PRIVATE src/tf "${SDK}/engine/include")
+  target_include_directories(${name} PUBLIC include PRIVATE src/tf "${SDK}/tajweed/include" "${SDK}/engine/include")
   target_compile_options(${name} PRIVATE -O2 -Wall -Wextra)
-  target_link_libraries(${name} PRIVATE zf_tajweed_engine zf_gemm_vnni tf_opus)
+  target_link_libraries(${name} PRIVATE zf_tajweed_inference zf_gemm_vnni tf_opus)
   set_target_properties(${name} PROPERTIES C_VISIBILITY_PRESET hidden POSITION_INDEPENDENT_CODE ON)
   if(WIN32)
     target_compile_definitions(${name} PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -117,7 +129,7 @@ if(WIN32)
   target_sources(tajweedformer PRIVATE src/tf/tajweedformer.def)
   set_target_properties(tajweedformer PROPERTIES PREFIX "")
 else()
-  target_link_options(tajweedformer PRIVATE "-Wl,--version-script=${CMAKE_SOURCE_DIR}/src/tf/tajweedformer.map")
+  target_link_options(tajweedformer PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/tf/tajweedformer.map")
 endif()
 tf_library(tajweedformer_static STATIC)
 
@@ -130,9 +142,10 @@ if(WIN32)
   target_compile_definitions(tajweedformer_cli PRIVATE TF_USE_DLL=1 _CRT_SECURE_NO_WARNINGS)
 endif()
 
-# the README's quick start, built with everything else so the code in the README always compiles
-# (test/quickstart_check.py keeps the two texts equal). Only in a build of this repository itself: an app that
-# takes it as a subproject has its own program, which may well be called quickstart too.
+# the example app, whose marked region is the README's quick start: built with everything else so the code in the
+# README always compiles (test/quickstart_check.py keeps the two texts equal). Only in a build of this repository
+# itself: an app that takes it as a subproject has its own program, which may well be called quickstart too
+# (examples/CMakeLists.txt is that app's project file).
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   add_executable(quickstart examples/quickstart.c)
   target_compile_options(quickstart PRIVATE -O2 -Wall -Wextra)
@@ -142,11 +155,17 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   endif()
 endif()
 
-# the library's own tests (through the public API only; tf_tests also reads its internal JSON helpers)
+# An app that takes this as a subproject gets the libraries and the command-line tool. What follows is this
+# repository's own: its tests, the kernel checks and the optional CUDA tier.
+if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  return()
+endif()
+
+# the library's own tests: the public API, and the internals through src/tf/tf_internal.h and the static library
 add_executable(tf_tests test/tf_tests.c)
-target_include_directories(tf_tests PRIVATE src/tf)
+target_include_directories(tf_tests PRIVATE src/tf "${SDK}/tajweed/include" "${SDK}/engine/include")
 target_compile_options(tf_tests PRIVATE -O2 -Wall -Wextra)
-target_link_libraries(tf_tests PRIVATE tajweedformer_static zf_tajweed_engine zf_gemm_vnni tf_opus)
+target_link_libraries(tf_tests PRIVATE tajweedformer_static zf_tajweed_inference zf_gemm_vnni tf_opus)
 if(WIN32)
   target_compile_definitions(tf_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
   target_link_libraries(tf_tests PRIVATE winhttp bcrypt crypt32)
@@ -159,27 +178,47 @@ foreach(t vnni_check dropin_check hooked_check cpu_detect)
   add_executable(${t} test/${t}.c)
   target_include_directories(${t} PRIVATE include "${SDK}/engine/include")
   add_test(NAME ${t} COMMAND ${t})
+  # every test has a time limit: a test that hangs or runs away is stopped, not left to eat the machine
+  set_tests_properties(${t} PROPERTIES TIMEOUT 300)
 endforeach()
 # the library's tests that need no model data (only test/data): the Ogg muxer and Opus encoder vectors, the deletion
-# crypto, the shared-session upload against a stub server, the platform client against recorded exchanges, and the
-# 2.0.1 bitrate ladder, consent wording and telemetry deltas, and (2.0.2) the real signed V4 manifests. Each run
-# starts from an empty work directory (the fixture below). The model tests (conformance, scorer vectors, settings) need the release data: test/run_tests.sh.
-set(TF_WORK "${CMAKE_BINARY_DIR}/tf_test_work")
-set(TF_VEC "${CMAKE_SOURCE_DIR}/test/data/sharing_vectors")
+# crypto, the shared-session upload against a stub server, the platform client against recorded exchanges, the
+# bitrate ladder, consent wording and telemetry deltas, the real signed V4 manifests, takes in a row sharing one
+# recording, and (3.0) the error catalogue, the shared 3.0 vectors and the public API. Each run starts from an
+# empty work directory (the fixture below). The model tests (conformance, sessions, the decoded layer on real
+# heads) need the release data: test/run_tests.sh.
+set(TF_WORK "${CMAKE_CURRENT_BINARY_DIR}/tf_test_work")
+set(TF_DATA "${CMAKE_CURRENT_SOURCE_DIR}/test/data")
+set(TF_VEC "${TF_DATA}/sharing_vectors")
+find_package(Python3 COMPONENTS Interpreter)
 add_test(NAME tf_work_clean COMMAND ${CMAKE_COMMAND} -E rm -rf "${TF_WORK}")
-set_tests_properties(tf_work_clean PROPERTIES FIXTURES_SETUP tf_work)
+set_tests_properties(tf_work_clean PROPERTIES FIXTURES_SETUP tf_work TIMEOUT 120)
 add_test(NAME tf_ogg COMMAND tf_tests ogg "${TF_VEC}/ogg" "${TF_WORK}/ogg")
 add_test(NAME tf_codec COMMAND tf_tests codec "${TF_VEC}" "${TF_WORK}/codec")
-add_test(NAME tf_sharing COMMAND tf_tests sharing "${TF_VEC}" "${CMAKE_SOURCE_DIR}/test/data/client-fixtures.json" "${TF_WORK}/sharing")
+add_test(NAME tf_sharing COMMAND tf_tests sharing "${TF_VEC}" "${TF_DATA}/client-fixtures.json" "${TF_WORK}/sharing")
 add_test(NAME tf_upload COMMAND tf_tests upload "${TF_WORK}/upload")
-add_test(NAME tf_client COMMAND tf_tests client "${CMAKE_SOURCE_DIR}/test/data/client-fixtures.json" "${TF_WORK}/client")
+add_test(NAME tf_client COMMAND tf_tests client "${TF_DATA}/client-fixtures.json" "${TF_WORK}/client")
 add_test(NAME tf_bitrate COMMAND tf_tests bitrate "${TF_VEC}" "${TF_WORK}/bitrate")
-add_test(NAME tf_consent COMMAND tf_tests consent "${TF_VEC}" "${CMAKE_SOURCE_DIR}/test/data/client-fixtures.json" "${TF_WORK}/consent")
+add_test(NAME tf_consent COMMAND tf_tests consent "${TF_VEC}" "${TF_DATA}/client-fixtures.json" "${TF_WORK}/consent")
 add_test(NAME tf_telemetry COMMAND tf_tests telemetry "${TF_WORK}/telemetry")
-add_test(NAME tf_sdk_latest COMMAND tf_tests sdk_latest "${CMAKE_SOURCE_DIR}/test/data/sdk_latest_configs.json" "${TF_WORK}/sdk_latest")
-add_test(NAME tf_manifest COMMAND tf_tests manifest "${CMAKE_SOURCE_DIR}/test/data" "${TF_WORK}/manifest")
-set_tests_properties(tf_ogg tf_codec tf_sharing tf_upload tf_client tf_bitrate tf_consent tf_telemetry tf_sdk_latest tf_manifest PROPERTIES
-                     FIXTURES_REQUIRED tf_work LABELS library TIMEOUT 600)
+add_test(NAME tf_sdk_latest COMMAND tf_tests sdk_latest "${TF_DATA}/sdk_latest_configs.json" "${TF_WORK}/sdk_latest")
+add_test(NAME tf_manifest COMMAND tf_tests manifest "${TF_DATA}" "${TF_WORK}/manifest")
+add_test(NAME tf_takes COMMAND tf_tests takes "${TF_VEC}" "${TF_WORK}/takes")
+add_test(NAME tf_errors COMMAND tf_tests errors "${TF_DATA}/sdk_3.0.0")
+add_test(NAME tf_vectors30 COMMAND tf_tests vectors30 "${TF_DATA}/sdk_3.0.0" "${TF_WORK}/vectors30")
+add_test(NAME tf_api COMMAND tf_tests api "${TF_WORK}/api" "${TF_DATA}/sdk_3.0.0")
+add_test(NAME tf_share30 COMMAND tf_tests share30 "${TF_DATA}/sdk_3.0.0" "${TF_WORK}/share30")
+set(TF_LIBRARY_TESTS tf_ogg tf_codec tf_sharing tf_upload tf_client tf_bitrate tf_consent tf_telemetry tf_sdk_latest tf_manifest tf_takes
+    tf_errors tf_vectors30 tf_api tf_share30)
+set_tests_properties(${TF_LIBRARY_TESTS} PROPERTIES FIXTURES_REQUIRED tf_work LABELS library TIMEOUT 600)
+# twenty-minute recordings are encoded for the cap cases of the shared vector: a few minutes on a slow runner
+set_tests_properties(tf_share30 PROPERTIES TIMEOUT 1500)
+if(Python3_FOUND)
+  # the public surface is NAMING.md's and nothing else; the README's quick start is the example's marked region
+  add_test(NAME tf_api_scan COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test/api_scan.py")
+  add_test(NAME tf_quickstart COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test/quickstart_check.py")
+  set_tests_properties(tf_api_scan tf_quickstart PROPERTIES TIMEOUT 120)
+endif()
 target_link_libraries(vnni_check PRIVATE zf_gemm_vnni)
 target_link_libraries(cpu_detect PRIVATE zf_gemm_vnni)
 # dropin compares the native kernels to the engine's OWN kernel, so it links the engine WITHOUT the hook

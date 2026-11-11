@@ -1,15 +1,22 @@
-/* tf_tests: drives the tajweedformer library through its public API and writes what it produced, for the
- * checkers in test/ (check_*.py) to compare with the reference files. Built against the static library;
- * the internal JSON and crypto helpers are used only to read inputs and to run the crypto vectors.
+/* tf_tests: the tajweedformer library's tests. The public API (include/tajweedformer.h) where a test is about what
+ * an app sees, and the internals (src/tf/tf_internal.h, linked from the static library) where it is about a
+ * piece behind it. Some runs write what the library produced for the checkers in test/ (check_outputs.py, the
+ * engine's v4_conformance_check.py) to compare with the reference files.
  *
  *   tf_tests crypto
+ *   tf_tests errors <data dir>                  the embedded error catalogue (3.0: tf_30_tests.inc)
+ *   tf_tests vectors30 <data dir> <work dir>    the shared 3.0 vectors: manifest, speech, settled, telemetry, names, ...
+ *   tf_tests api <work dir> <data dir>          the public Client: one per process, options, diagnose, storage
+ *   tf_tests model30 <local30 dir> <key_hex> <work dir> [<configs.json> [full|prod]]   the local 3.0 model folders:
+ *                                               Model, Session, listen, reference, the Client's download path
+ *   tf_tests share30 <data dir> <work dir>      shared recordings in 3.0: sharing_30.json, the ring, the tail wait
  *   tf_tests conformance <folder> <key_hex|-> <clips.txt> <out.jsonl> [heads_mask [context]]
- *   tf_tests vectors <fixture_dir> <c16 folder> <c24 folder> <out.jsonl>     CAL vectors: engine JSON + words + decoded
- *   tf_tests settings <config_vectors.json> <folder> <out.jsonl>
- *   tf_tests folder <folder> <key_hex|->        open a folder, print the info JSON or the error code name
- *   tf_tests ogg | codec | sharing | upload | stream_share | client | download   (tf_client_tests.inc, tf_share_tests.inc)
- *   tf_tests bitrate | consent | telemetry | sdk_latest                          (2.0.1: tf_201_tests.inc)
- *   tf_tests manifest <data dir> <work dir>     the real signed V4 manifests (2.0.2: tf_manifest_tests.inc) */
+ *   tf_tests layers <fixture_dir> <c16 folder> <c24 folder> <out.jsonl>     the decoded layer and top-K on heads from files
+ *   tf_tests folder <folder> <key_hex|->        open a folder, print the info JSON or the error's code
+ *   tf_tests ogg | codec | sharing | upload | session_share | client | download   (tf_client_tests.inc, tf_share_tests.inc)
+ *   tf_tests bitrate | consent | telemetry | sdk_latest                           (tf_201_tests.inc)
+ *   tf_tests manifest <data dir> <work dir>     the real signed V4 manifests (tf_manifest_tests.inc)
+ *   tf_tests takes <vectors dir> <work dir>     takes in a row share one recording (tf_203_tests.inc) */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -28,10 +35,69 @@
 #include "zf/stream.h"
 #if defined(_WIN32)
 #include <windows.h>
+#include <psapi.h>
 #elif defined(__linux__)
 #include <sched.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
+
+/* No test may need more than 2 GB: the process caps its own memory before anything runs, so a test that runs away
+ * fails on an allocation instead of taking the machine with it (Windows: a job object's limit on committed memory;
+ * Linux: RLIMIT_DATA, the private writable memory). Where the cap cannot be set the tests run without it. */
+#define TEST_MEMORY_CAP (2048ull << 20)
+static void cap_own_memory(void) {
+#if defined(_WIN32)
+  HANDLE job = CreateJobObjectW(NULL, NULL);
+  if (!job) return;
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION lim;
+  memset(&lim, 0, sizeof lim);
+  lim.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+  lim.ProcessMemoryLimit = (SIZE_T)TEST_MEMORY_CAP;
+  if (SetInformationJobObject(job, JobObjectExtendedLimitInformation, &lim, sizeof lim)) AssignProcessToJobObject(job, GetCurrentProcess());
+#elif defined(__linux__)
+  struct rlimit rl;
+  if (!getrlimit(RLIMIT_DATA, &rl) && (rl.rlim_max == RLIM_INFINITY || rl.rlim_max >= TEST_MEMORY_CAP)) {
+    rl.rlim_cur = (rlim_t)TEST_MEMORY_CAP;
+    setrlimit(RLIMIT_DATA, &rl);
+  }
+#endif
+}
+/* the memory this process has committed, in bytes (0 where it cannot be read) */
+static long long own_memory(void) {
+#if defined(_WIN32)
+  PROCESS_MEMORY_COUNTERS pc;
+  memset(&pc, 0, sizeof pc);
+  return K32GetProcessMemoryInfo(GetCurrentProcess(), &pc, sizeof pc) ? (long long)pc.PagefileUsage : 0;
+#elif defined(__linux__)
+  long long pages = 0, resident = 0;
+  FILE *f = fopen("/proc/self/statm", "r");
+  if (!f) return 0;
+  if (fscanf(f, "%lld %lld", &pages, &resident) != 2) resident = 0;
+  fclose(f);
+  return resident * (long long)sysconf(_SC_PAGESIZE);
+#else
+  return 0;
+#endif
+}
+/* the most memory this process ever had committed (Windows) or resident (Linux), in bytes; 0 when unknown */
+static long long own_peak_memory(void) {
+#if defined(_WIN32)
+  PROCESS_MEMORY_COUNTERS pc;
+  memset(&pc, 0, sizeof pc);
+  return K32GetProcessMemoryInfo(GetCurrentProcess(), &pc, sizeof pc) ? (long long)pc.PeakPagefileUsage : 0;
+#elif defined(__linux__)
+  char line[160];
+  long long kb = 0;
+  FILE *f = fopen("/proc/self/status", "r");
+  while (f && fgets(line, sizeof line, f))
+    if (!strncmp(line, "VmHWM:", 6)) kb = atoll(line + 6);
+  if (f) fclose(f);
+  return kb * 1024;
+#else
+  return 0;
+#endif
+}
 
 static const char *const kOut[12] = {"attr_face", "attr_ghunna", "attr_qalqalah", "attr_tafkheem", "boundary", "conf",
                                      "gem", "id_log_probs", "inter1_log_probs", "inter4_log_probs", "log_probs",
@@ -132,12 +198,19 @@ static int crypto_tests(void) {
 }
 
 /* ------------------------------------------------------------------ conformance */
+/* Every output of every chunk through the public Session (tf_session_create, tf_session_push, on_chunk,
+ * tf_session_finish, tf_session_heads), fingerprinted for the engine's bit-exact checker; a new Session per
+ * clip, as an app runs take after take. */
+static long long g_conf_values, g_conf_chunks; /* a conformance run's totals: values fingerprinted, chunks */
 typedef struct {
   uint64_t *fnv; /* per chunk x 12 */
   int chunks, cap;
   uint64_t logp;
   unsigned mask;
   int bad_mask;
+  /* what every chunk must satisfy (SDK 3.0): the decoded layer covers the take so far, settled never goes down,
+   * only the last chunk is final */
+  int frames, settled, finals, bad_decoded, bad_backend, last_final;
 } ConfRun;
 
 static void on_chunk(void *user, const TfChunk *c) {
@@ -148,48 +221,69 @@ static void on_chunk(void *user, const TfChunk *c) {
   }
   for (int k = 0; k < 12; ++k) {
     const int h = tf_head_from_name(kOut[k]);
-    int frames = 0;
-    const float *p = tf_heads_get(c->heads, h, &frames);
+    TfHead hd;
+    const int have = tf_heads_get(c->heads, kOut[k], &hd) == 0;
     const int want = (r->mask >> h) & 1;
-    if (!!p != want) r->bad_mask++;
-    const size_t n = (size_t)frames * tf_head_info(h)->width;
-    r->fnv[(size_t)r->chunks * 12 + k] = p ? fnv1a(FNV0, p, n * sizeof(float)) : 0;
-    if (h == TF_HEAD_LOG_PROBS && p) r->logp = fnv1a(r->logp, p, n * sizeof(float));
+    if (have != want) r->bad_mask++;
+    const size_t n = have ? (size_t)hd.frames * hd.classes : 0;
+    g_conf_values += (long long)n;
+    g_conf_chunks += k == 0;
+    r->fnv[(size_t)r->chunks * 12 + k] = have ? fnv1a(FNV0, hd.values, n * sizeof(float)) : 0;
+    if (h == TF_HEAD_LOG_PROBS && have) {
+      r->logp = fnv1a(r->logp, hd.values, n * sizeof(float));
+      r->frames += hd.frames;
+    }
   }
+  tf__clear_error(); /* a head that is not held is asked for on purpose above */
+  const TfDecoded *d = c->decoded;
+  if (!d || d->n_frames != r->frames || c->first_frame + (c->end_ms - c->start_ms) / 40 != r->frames || c->index != r->chunks ||
+      d->settled < r->settled || d->settled > d->n_tokens || (d->is_final && d->settled != d->n_tokens))
+    r->bad_decoded++;
+  if (d) r->settled = d->settled;
+  if (d && d->is_final) r->finals++;
+  r->last_final = d && d->is_final;
+  if (!c->backend.kind || strcmp(c->backend.kind, "cpu") || strcmp(c->backend.name, "cpu") || strcmp(c->backend.stage, "cpu") || c->backend.reason)
+    r->bad_backend++;
   r->chunks++;
 }
 
-static TfModel *open_folder(const char *dir, const char *key, int load_engine, const char *ctx) {
-  TfModelOptions o = tf_model_default_options();
+static TfModel *open_folder(const char *dir, const char *key, int no_engine, const char *ctx) {
+  TfModelOpen o;
+  memset(&o, 0, sizeof o);
   o.trusted_key_hex = strcmp(key, "-") ? key : NULL;
-  o.require_signature = strcmp(key, "-") != 0;
-  o.load_engine = load_engine;
+  o.allow_unsigned = strcmp(key, "-") == 0;
+  o.no_engine = no_engine;
   o.context = ctx;
-  TfModel *m = tf_model_open(dir, &o);
+  TfModel *m = tf__model_open(dir, &o);
   if (!m) fprintf(stderr, "open %s: %s (%s)\n", dir, tf_last_error(), tf_error_name(tf_last_error_code()));
   return m;
 }
 
+/* the head names of a mask, separated by commas (TfSessionOptions.heads) */
+static void heads_list(unsigned mask, char *out, size_t n) {
+  out[0] = 0;
+  for (int h = 0; h < TF_HEAD_COUNT; ++h)
+    if (mask & TF_HEAD_BIT(h)) snprintf(out + strlen(out), n - strlen(out), "%s%s", out[0] ? "," : "", tf_head_info(h)->name);
+}
+
 static int conformance(const char *dir, const char *key, const char *list, const char *outp, unsigned mask, const char *ctx) {
-  TfModel *m = open_folder(dir, key, 1, ctx);
+  TfModel *m = open_folder(dir, key, 0, ctx);
   if (!m) return 2;
   ConfRun r;
   memset(&r, 0, sizeof r);
   r.mask = mask ? mask : TF_HEADS_DEFAULT;
-  TfStreamOptions so = tf_stream_default_options();
-  so.heads = mask;
+  char names[512];
+  heads_list(r.mask, names, sizeof names);
+  TfSessionOptions so;
+  memset(&so, 0, sizeof so);
+  so.heads = mask ? (mask == TF_HEADS_ALL ? "all" : names) : NULL;
+  so.context = ctx;
   so.on_chunk = on_chunk;
   so.user = &r;
-  TfStream *s = tf_stream_create(m, &so);
-  if (!s) {
-    fprintf(stderr, "stream: %s\n", tf_last_error());
-    return 2;
-  }
-  CHECK(tf_stream_create(m, &so) == NULL && tf_last_error_code() == TF_ERR_BUSY, "a second live stream was allowed");
   FILE *lf = fopen(list, "r"), *out = fopen(outp, "w");
   if (!lf || !out) return 2;
   char line[4096];
-  int clips = 0, greedy_ok = 0, top2_ok = 0, topk_ok = 0, topk_checks = 0;
+  int clips = 0, greedy_ok = 0, top2_ok = 0, topk_ok = 0, topk_checks = 0, joined_ok = 0;
   double audio_s = 0, wall = 0;
   while (fgets(line, sizeof line, lf)) {
     size_t len = strlen(line);
@@ -202,43 +296,66 @@ static int conformance(const char *dir, const char *key, const char *list, const
       return 2;
     }
     const int n = (int)(bytes / 4);
-    tf_stream_reset(s);
-    r.chunks = 0;
+    TfSession *s = tf_session_create(m, &so);
+    if (!s) {
+      fprintf(stderr, "session: %s\n", tf_last_error());
+      return 2;
+    }
+    if (clips == 0) {
+      /* one open Session per Model */
+      CHECK(tf_session_create(m, &so) == NULL && tf_last_error_code() == TF_ERR_SESSION_OPEN, "a second open session was allowed");
+      CHECK(tf_session_heads(s) == NULL, "the take's Heads were given before the take ended");
+    }
+    r.chunks = r.frames = r.settled = r.finals = 0;
     r.logp = FNV0;
     const double t0 = tf__now_s();
     for (int at = 0; at < n; at += 320)
-      if (tf_stream_push_audio(s, (const float *)pcm + at, n - at < 320 ? n - at : 320) < 0) {
+      if (tf_session_push(s, (const float *)pcm + at, n - at < 320 ? n - at : 320) < 0) {
         fprintf(stderr, "push: %s\n", tf_last_error());
         return 3;
       }
-    if (tf_stream_finish(s) < 0) {
+    if (tf_session_finish(s) < 0) {
       fprintf(stderr, "finish: %s\n", tf_last_error());
       return 3;
     }
     wall += tf__now_s() - t0;
     audio_s += n / 16000.0;
     free(pcm);
-    /* tokens = the decoded layer's token ids; they must equal the engine's greedy */
-    TfDecoded *d = tf_stream_decode(s);
-    const TfToken *tk;
-    const int nt = tf_decoded_tokens(d, &tk);
+    CHECK(r.finals == 1 && r.last_final, "%s: %d chunks carried is_final (the last one: %d), want exactly the last", line, r.finals, r.last_final);
+    CHECK(tf_session_push(s, (const float *)&wall, 0) == TF_ERR_SESSION_CLOSED, "%s: a push after finish was taken", line);
+    const TfHeads *h = tf_session_heads(s);
+    if (!h) {
+      fprintf(stderr, "heads: %s\n", tf_last_error());
+      return 3;
+    }
+    /* tokens = the decoded layer's token ids; they must equal the engine's greedy and tf_heads_greedy */
+    const TfDecoded *d = tf_heads_decoded(h);
+    const TfToken *tk = d->tokens, *gk = NULL;
+    const int nt = d->n_tokens;
     int g[4096];
-    const int ng = tf_stream_greedy(s, g, 4096);
-    int same = ng == nt;
-    for (int i = 0; same && i < nt; ++i) same = g[i] == tk[i].id;
+    const int ng = zf_tajweed_stream_greedy(tf__session_engine(s), g, 4096);
+    const int nh = tf_heads_greedy(h, "log_probs", &gk);
+    int same = ng == nt && nh == nt;
+    for (int i = 0; same && i < nt; ++i) same = g[i] == tk[i].id && gk[i].id == tk[i].id && gk[i].first_ms == tk[i].first_ms && gk[i].last_ms == tk[i].last_ms;
     greedy_ok += same;
-    CHECK(same, "%s: decoded tokens (%d) differ from the engine's greedy (%d)", line, nt, ng);
-    /* the take's heads equal the chunks joined */
-    ZfTajweedHeads h;
-    tf_stream_heads(s, &h);
+    CHECK(same, "%s: decoded tokens (%d) differ from the engine's greedy (%d) or tf_heads_greedy (%d)", line, nt, ng, nh);
+    CHECK(d->is_final && d->settled == nt, "%s: the take's decoded layer is not final with every token settled", line);
+    TfHead lp;
+    tf_heads_get(h, "log_probs", &lp);
+    /* the take's heads are the chunks joined */
+    {
+      const int ok = lp.frames == r.frames && fnv1a(FNV0, lp.values, (size_t)lp.frames * lp.classes * sizeof(float)) == r.logp;
+      joined_ok += ok;
+      CHECK(ok, "%s: the take's log_probs are not its chunks joined", line);
+    }
     /* the decoded layer's top-2 comes from the engine (zf_tajweed_stream_top2): it must equal a plain C scan
      * of log_probs (lower id on ties), and its margin the double difference of the two float log-probs */
     {
-      const TfFrame *fr;
-      const int nf = tf_decoded_frames(d, &fr);
-      int bad = nf != h.n40;
+      const TfFrame *fr = d->frames;
+      const int nf = d->n_frames;
+      int bad = nf != lp.frames;
       for (int t = 0; !bad && t < nf; ++t) {
-        const float *row = h.log_probs + (size_t)t * ZF_TAJWEED_VOCAB;
+        const float *row = lp.values + (size_t)t * ZF_TAJWEED_VOCAB;
         int a1 = 0;
         for (int i = 1; i < ZF_TAJWEED_VOCAB; ++i)
           if (row[i] > row[a1]) a1 = i;
@@ -251,19 +368,20 @@ static int conformance(const char *dir, const char *key, const char *list, const
       top2_ok += !bad;
       CHECK(!bad, "%s: the engine's top-2 differs from the C scan of log_probs", line);
     }
-    /* top-K from the stream (zf_tajweed_stream_topk) == a C stable argsort of the kept heads, for every
+    /* top-K from the engine's stream (zf_tajweed_stream_topk) == a C stable argsort of the kept heads, for every
      * ranked head at k 2 and k = cols, on the first 5 clips of an all-heads run */
     if (r.mask == TF_HEADS_ALL && clips < 5) {
       for (int hd = 0; hd < TF_HEAD_COUNT; ++hd) {
         const TfHeadInfo *hi = tf_head_info(hd);
         if (!strcmp(hi->kind, "logit")) continue;
-        int frames = 0;
-        const float *v = tf_heads_get(&h, hd, &frames);
-        const int cols = hi->width;
+        TfHead one;
+        tf_heads_get(h, hi->name, &one);
+        const float *v = one.values;
+        const int frames = one.frames, cols = hi->width;
         for (int kk = 0; kk < 2; ++kk) {
           const int k = kk == 0 ? 2 : cols;
-          TfTopK *tk = tf_stream_topk(s, hd, k);
-          int bad = !tk || !v || tk->frames != frames || tk->k != k;
+          TfTopK *tkk = tf__session_topk(s, hd, k);
+          int bad = !tkk || !v || tkk->frames != frames || tkk->k != k;
           int order[40];
           for (int f = 0; !bad && f < frames; ++f) {
             const float *row = v + (size_t)f * cols;
@@ -279,14 +397,14 @@ static int conformance(const char *dir, const char *key, const char *list, const
             }
             for (int j = 0; !bad && j < k; ++j) {
               const size_t i = (size_t)f * k + j;
-              const double m = j + 1 < cols ? (double)row[order[j]] - (double)row[order[j + 1]] : 0.0;
-              bad = tk->ids[i] != order[j] || tk->values[i] != row[order[j]] || tk->margins[i] != m;
+              const double mg = j + 1 < cols ? (double)row[order[j]] - (double)row[order[j + 1]] : 0.0;
+              bad = tkk->ids[i] != order[j] || tkk->values[i] != row[order[j]] || tkk->margins[i] != mg;
             }
           }
           topk_checks++;
           topk_ok += !bad;
           CHECK(!bad, "%s: stream top-K of %s at k %d differs from a C argsort", line, hi->name, k);
-          tf_topk_free(tk);
+          tf__topk_free(tkk);
         }
       }
     }
@@ -307,29 +425,124 @@ static int conformance(const char *dir, const char *key, const char *list, const
       fprintf(out, "]");
     }
     fprintf(out, "}}\n");
-    tf_decoded_free(d);
+    tf_session_destroy(s);
     clips++;
   }
   fclose(lf);
   fclose(out);
   CHECK(r.bad_mask == 0, "head selection: %d chunk heads present/absent against the mask", r.bad_mask);
-  printf("conformance run: %d clips, engine top-2 == C scan on %d\n", clips, top2_ok);
+  CHECK(r.bad_decoded == 0, "%d chunks whose decoded layer does not cover the take so far, or whose settled count went down", r.bad_decoded);
+  CHECK(r.bad_backend == 0, "%d chunks whose backend is not the CPU engine", r.bad_backend);
+  printf("conformance run: %d clips, engine top-2 == C scan on %d, take == chunks joined on %d\n", clips, top2_ok, joined_ok);
   if (topk_checks)
     printf("conformance run: stream top-K == C argsort on %d/%d (each ranked head at k 2 and k = cols, first 5 clips)\n", topk_ok,
            topk_checks);
   printf("conformance run: %d clips, greedy == decoded on %d, head mask 0x%03x %s, RTF %.3f (%.1f s audio)\n", clips, greedy_ok,
          r.mask, r.bad_mask ? "VIOLATED" : "respected", audio_s > 0 ? wall / audio_s : 0, audio_s);
-  tf_stream_destroy(s);
+  printf("conformance totals: %d clips, %lld chunks, %lld values, %.1f s, peak memory %lld MB\n", clips, g_conf_chunks, g_conf_values, wall,
+         own_peak_memory() >> 20);
   tf_model_close(m);
   free(r.fnv);
   return fails ? 1 : 0;
 }
 
-/* ------------------------------------------------------------------ CAL vectors + layers */
+/* ------------------------------------------------------------------ top-K on real takes */
+/* Each clip through a Session with top_k = k and the head log_probs, pushed 20 ms at a time: what an app gets. One
+ * JSON line per clip for test/check_outputs.py `topk`, which compares it with the contract's
+ * vectors/topk_takes.json: the SHA-256 of the take's log_probs (so a different engine output is told apart from
+ * a different ranking), then every frame's ranked ids and, as bit patterns so nothing is rounded on the way, the
+ * float log-probs (8 hex digits) and the double margins (16 hex digits). */
+static int topk_takes(const char *dir, const char *key, const char *list, const char *outp, const char *ctx, int k) {
+  TfModel *m = open_folder(dir, key, 0, ctx);
+  if (!m) return 2;
+  TfSessionOptions so;
+  memset(&so, 0, sizeof so);
+  so.heads = "log_probs";
+  so.context = ctx;
+  so.top_k = k;
+  FILE *lf = fopen(list, "r"), *out = fopen(outp, "w");
+  if (!lf || !out) return 2;
+  char line[4096];
+  int clips = 0;
+  long long frames = 0;
+  while (fgets(line, sizeof line, lf)) {
+    size_t len = strlen(line);
+    while (len && (line[len - 1] == '\n' || line[len - 1] == '\r' || line[len - 1] == ' ')) line[--len] = 0;
+    if (!len) continue;
+    char *pcm = NULL;
+    size_t bytes = 0;
+    if (tf_read_file(line, &pcm, &bytes)) {
+      fprintf(stderr, "cannot read %s\n", line);
+      return 2;
+    }
+    const int n = (int)(bytes / 4);
+    TfSession *s = tf_session_create(m, &so);
+    if (!s) {
+      fprintf(stderr, "session: %s\n", tf_last_error());
+      return 2;
+    }
+    for (int at = 0; at < n; at += 320)
+      if (tf_session_push(s, (const float *)pcm + at, n - at < 320 ? n - at : 320) < 0) {
+        fprintf(stderr, "push: %s\n", tf_last_error());
+        return 3;
+      }
+    if (tf_session_finish(s) < 0) {
+      fprintf(stderr, "finish: %s\n", tf_last_error());
+      return 3;
+    }
+    free(pcm);
+    const TfHeads *h = tf_session_heads(s);
+    const TfDecoded *d = h ? tf_heads_decoded(h) : NULL;
+    TfHead lp;
+    if (!h || !d || tf_heads_get(h, "log_probs", &lp) != 0) {
+      fprintf(stderr, "heads: %s\n", tf_last_error());
+      return 3;
+    }
+    CHECK(d->top_k == k && d->n_frames == lp.frames && lp.classes == ZF_TAJWEED_VOCAB && d->ranked_ids && d->ranked_log_probs && d->ranked_margins,
+          "%s: the take's decoded layer is not ranked %d deep over its %d frames", line, k, lp.frames);
+    if (d->top_k != k || d->n_frames != lp.frames || !d->ranked_ids) return 1;
+    uint8_t dg[32];
+    char hex[65];
+    tf_sha256(lp.values, (size_t)lp.frames * lp.classes * sizeof(float), dg);
+    tf_hex_encode(dg, 32, hex);
+    const char *base = line + len;
+    while (base > line && base[-1] != '/' && base[-1] != '\\') --base;
+    const char *dot = strrchr(base, '.');
+    fprintf(out, "{\"clip\":\"%.*s\",\"context\":\"%s\",\"k\":%d,\"frames\":%d,\"log_probs_sha256\":\"%s\",\"ids\":[", (int)(dot ? dot - base : (long)strlen(base)),
+            base, ctx, k, d->n_frames, hex);
+    const size_t total = (size_t)d->n_frames * (size_t)k;
+    for (size_t i = 0; i < total; ++i) fprintf(out, "%s%d", i ? "," : "", d->ranked_ids[i]);
+    fprintf(out, "],\"log_probs_bits\":[");
+    for (size_t i = 0; i < total; ++i) {
+      uint32_t u;
+      memcpy(&u, &d->ranked_log_probs[i], 4);
+      fprintf(out, "%s\"%08x\"", i ? "," : "", (unsigned)u);
+    }
+    fprintf(out, "],\"margins_bits\":[");
+    for (size_t i = 0; i < total; ++i) {
+      uint64_t u;
+      memcpy(&u, &d->ranked_margins[i], 8);
+      fprintf(out, "%s\"%016llx\"", i ? "," : "", (unsigned long long)u);
+    }
+    fprintf(out, "]}\n");
+    frames += d->n_frames;
+    tf_session_destroy(s);
+    ++clips;
+  }
+  fclose(lf);
+  fclose(out);
+  tf_model_close(m);
+  printf("topk run: %s, %d deep: %d clips, %lld frames\n", ctx, k, clips, frames);
+  return fails || !clips ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ the decoded layer and top-K on heads from files */
 static const char *const kOrder[12] = {"log_probs", "inter1_log_probs", "inter4_log_probs", "id_log_probs", "timing_log_probs",
                                        "gem", "attr_tafkheem", "attr_ghunna", "attr_qalqalah", "attr_face", "boundary", "conf"};
 
-static int vectors(const char *fx, const char *dir16, const char *dir24, const char *outp) {
+/* the fixture's head files through tf__decode and tf__topk, written for test/check_outputs.py to compare with the
+ * shared layers vectors (the numbers the other SDKs' decoded layers are held to) */
+static int layers(const char *fx, const char *dir16, const char *dir24, const char *outp) {
   char *path = tf_path_join(fx, "vectors.json"), *text = NULL;
   size_t n = 0;
   if (tf_read_file(path, &text, &n)) return 2;
@@ -337,11 +550,9 @@ static int vectors(const char *fx, const char *dir16, const char *dir24, const c
   TfJson *v = tf_json_parse(text, n, NULL);
   free(text);
   if (!v) return 2;
-  TfModel *m16 = open_folder(dir16, "-", 0, "c16_l64"), *m24 = open_folder(dir24, "-", 0, "c24_l72");
+  TfModel *m16 = open_folder(dir16, "-", 1, NULL), *m24 = open_folder(dir24, "-", 1, NULL);
   if (!m16 || !m24) return 2;
-  tf_settings_set_backend(m16, "fp32");
-  tf_settings_set_backend(m24, "fp32");
-  const TfJson *presets = tf_json_get(v, "presets"), *vec = tf_json_get(v, "vectors");
+  const TfJson *vec = tf_json_get(v, "vectors");
   FILE *out = fopen(outp, "w");
   int done = 0;
   for (int i = 0; i < vec->n; ++i) {
@@ -381,136 +592,62 @@ static int vectors(const char *fx, const char *dir16, const char *dir24, const c
       at += (size_t)(hi->rate_ms == 40 ? n40 : n20) * hi->width;
     }
     CHECK((size_t)((const char *)at - raw) == bytes, "%s: heads file size", tf_json_str(tf_json_get(x, "name")));
-    TfDecoded *d = tf_decode(m, &h);
-    fprintf(out, "{\"name\":\"%s\",\"context\":\"%s\",\"decoded\":%s,", tf_json_str(tf_json_get(x, "name")), ctx,
-            tf_decoded_json(d, 1));
-    tf_decoded_free(d);
-    /* top-K through tf_topk (layers_ref.py "topk": k 3 for the token heads, the full ranking of the class heads,
+    /* the same heads through the public Heads object: its decoded layer is the one tf__decode gives */
+    TfHeads view;
+    tf__heads_view(&view, &h, TF_HEADS_ALL, m);
+    view.top_k = 2;
+    const TfDecoded *pd = tf_heads_decoded(&view);
+    TfDecoded *d = tf__decode(m, &h, NULL, 2);
+    CHECK(d && pd && pd->n_tokens == d->n_tokens && !strcmp(pd->text, d->text) && pd->n_frames == n40, "%s: tf_heads_decoded differs from tf__decode",
+          tf_json_str(tf_json_get(x, "name")));
+    fprintf(out, "{\"name\":\"%s\",\"context\":\"%s\",\"decoded\":%s,", tf_json_str(tf_json_get(x, "name")), ctx, tf_decoded_json(d, 1));
+    tf__decoded_free(d);
+    tf__heads_release(&view);
+    /* top-K through tf__topk (layers_ref.py "topk": k 3 for the token heads, the full ranking of the class heads,
      * and log_probs_full8 = all 38 on the first 8 frames) */
     fprintf(out, "\"topk\":{");
     for (int hd = 0, first = 1; hd < TF_HEAD_COUNT; ++hd) {
       const TfHeadInfo *hi = tf_head_info(hd);
       if (!strcmp(hi->kind, "logit")) continue;
-      TfTopK *tk = tf_topk(&h, hd, hi->n_classes ? hi->width : 3);
-      CHECK(tk != NULL, "tf_topk %s: %s", hi->name, tf_last_error());
-      if (tk) fprintf(out, "%s\"%s\":%s", first ? "" : ",", hi->name, tf_topk_json(tk));
+      TfTopK *tk = tf__topk(&h, hd, hi->n_classes ? hi->width : 3);
+      CHECK(tk != NULL, "tf__topk %s: %s", hi->name, tf_last_error());
+      if (tk) fprintf(out, "%s\"%s\":%s", first ? "" : ",", hi->name, tf__topk_json(tk));
       first = 0;
-      tf_topk_free(tk);
+      tf__topk_free(tk);
     }
     {
       ZfTajweedHeads h8 = h;
       h8.n40 = n40 < 8 ? n40 : 8;
       h8.n20 = 2 * h8.n40;
-      TfTopK *tk = tf_topk(&h8, TF_HEAD_LOG_PROBS, 38);
-      CHECK(tk != NULL, "tf_topk full: %s", tf_last_error());
-      if (tk) fprintf(out, ",\"log_probs_full8\":%s", tf_topk_json(tk));
-      tf_topk_free(tk);
-    }
-    fprintf(out, "},\"results\":{");
-    const TfJson *refs = tf_json_get(x, "refs");
-    for (int p = 0; p < refs->n; ++p) {
-      const char *preset = refs->kids[p].key;
-      TfBuf rb;
-      tf_buf_init(&rb);
-      tf_json_write(&rb, tf_json_get(presets, preset));
-      tf_settings_set_remote_json(m, rb.p, rb.n);
-      tf_buf_free(&rb);
-      TfResult *r = tf_score(m, &h, (int)tf_json_get(x, "surah")->num, (int)tf_json_get(x, "ayah")->num, NULL);
-      if (!r) {
-        fprintf(stderr, "score: %s\n", tf_last_error());
-        return 3;
-      }
-      fprintf(out, "%s\"%s\":%s", p ? "," : "", preset, tf_result_json(r));
-      tf_result_free(r);
-      done++;
+      TfTopK *tk = tf__topk(&h8, TF_HEAD_LOG_PROBS, 38);
+      CHECK(tk != NULL, "tf__topk full: %s", tf_last_error());
+      if (tk) fprintf(out, ",\"log_probs_full8\":%s", tf__topk_json(tk));
+      tf__topk_free(tk);
     }
     fprintf(out, "}}\n");
     free(raw);
+    done++;
   }
   fclose(out);
   tf_model_close(m16);
   tf_model_close(m24);
   tf_json_free(v);
-  printf("vectors run: %d scores\n", done);
-  return 0;
-}
-
-/* ------------------------------------------------------------------ settings vectors */
-static int settings(const char *vp, const char *dir, const char *outp) {
-  char *text = NULL;
-  size_t n;
-  if (tf_read_file(vp, &text, &n)) return 2;
-  TfJson *v = tf_json_parse(text, n, NULL);
-  free(text);
-  if (!v) return 2;
-  FILE *out = fopen(outp, "w");
-  const TfJson *cases = tf_json_get(v, "cases"), *inv = tf_json_get(v, "app_invalid");
-  for (int i = 0; i < cases->n; ++i) {
-    const TfJson *c = &cases->kids[i];
-    TfModelOptions o = tf_model_default_options();
-    o.require_signature = 0;
-    o.load_engine = 0;
-    o.debug_build = tf_json_get(c, "debug") && tf_json_get(c, "debug")->boolean;
-    TfModel *m = tf_model_open(dir, &o);
-    if (!m) {
-      fprintf(stderr, "open: %s\n", tf_last_error());
-      return 2;
-    }
-    tf_settings_set_backend(m, tf_json_str(tf_json_get(c, "backend")));
-    const TfJson *remote = tf_json_get(c, "remote");
-    if (remote && remote->type != TJ_NULL) {
-      TfBuf rb;
-      tf_buf_init(&rb);
-      if (remote->type == TJ_STR) tf_buf_puts(&rb, remote->str); /* a block as text */
-      else tf_json_write(&rb, remote);
-      tf_settings_set_remote_json(m, rb.p, rb.n);
-      tf_buf_free(&rb);
-    }
-    const TfJson *app = tf_json_get(c, "app");
-    int rc = 0;
-    if (app) {
-      TfBuf ab;
-      tf_buf_init(&ab);
-      tf_json_write(&ab, app);
-      rc = tf_settings_set_app_json(m, ab.p);
-      tf_buf_free(&ab);
-    }
-    fprintf(out, "{\"name\":");
-    TfBuf nb;
-    tf_buf_init(&nb);
-    tf_buf_json_str(&nb, tf_json_str(tf_json_get(c, "name")));
-    fprintf(out, "%s,\"rc\":%d,\"settings\":%s}\n", nb.p, rc, tf_settings_json(m));
-    tf_buf_free(&nb);
-    tf_model_close(m);
-  }
-  int refused = 0;
-  for (int i = 0; inv && i < inv->n; ++i) {
-    TfModelOptions o = tf_model_default_options();
-    o.require_signature = 0;
-    o.load_engine = 0;
-    TfModel *m = tf_model_open(dir, &o);
-    TfBuf ab;
-    tf_buf_init(&ab);
-    tf_json_write(&ab, tf_json_get(&inv->kids[i], "app"));
-    const int rc = tf_settings_set_app_json(m, ab.p);
-    tf_buf_free(&ab);
-    CHECK(rc == TF_ERR_SETTINGS, "invalid app case %s was accepted", tf_json_str(tf_json_get(&inv->kids[i], "name")));
-    refused += rc == TF_ERR_SETTINGS;
-    tf_model_close(m);
-  }
-  fclose(out);
-  printf("settings run: %d cases; invalid app options refused %d/%d\n", cases->n, refused, inv ? inv->n : 0);
-  tf_json_free(v);
+  printf("layers run: %d takes decoded\n", done);
   return fails ? 1 : 0;
 }
 
 #include "tf_client_tests.inc"
 #include "tf_share_tests.inc"
 #include "tf_201_tests.inc"
+#include "tf_203_tests.inc"
 #include "tf_manifest_tests.inc"
+#include "tf_30_tests.inc"
+#include "tf_30_api_tests.inc"
+#include "tf_30_model_tests.inc"
+#include "tf_30_share_tests.inc"
 
 static int folder(const char *dir, const char *key) {
-  TfModel *m = open_folder(dir, key, 0, NULL);
+  TfModel *m = open_folder(dir, key, 1, NULL);
   if (!m) {
     printf("%s\n", tf_error_name(tf_last_error_code()));
     return 1;
@@ -622,29 +759,32 @@ static int pin_tests(const char *dir, const char *key, const char *list, int thr
   }
   free(model);
 
-  /* 2. through the SDK: a model opened pinned (no_pin 0) and `threads` threads; streams made, used and
-   * destroyed in a row on this thread give the same tokens and leave the mask as it was */
-  TfModelOptions mo = tf_model_default_options();
+  /* 2. through the SDK: a model opened pinned and with `threads` threads; Sessions made, used and destroyed in a
+   * row on this thread give the same tokens and leave the mask as it was */
+  TfModelOpen mo;
+  memset(&mo, 0, sizeof mo);
   mo.trusted_key_hex = strcmp(key, "-") ? key : NULL;
-  mo.require_signature = strcmp(key, "-") != 0;
+  mo.allow_unsigned = strcmp(key, "-") == 0;
   mo.threads = threads;
-  mo.no_pin = 0;
-  TfModel *m = tf_model_open(dir, &mo);
+  mo.pin = 1;
+  TfModel *m = tf__model_open(dir, &mo);
   if (!m) {
     fprintf(stderr, "open: %s\n", tf_last_error());
     return 3;
   }
   int first[1024], nfirst = -1;
   for (int r = 0; r < rounds; ++r) {
-    TfStream *s = tf_stream_create(m, NULL);
+    TfSession *s = tf_session_create(m, NULL);
     if (!s) return 3;
     const double t0 = tf__now_s();
-    for (int at = 0; at < n; at += 320) tf_stream_push_audio(s, x + at, n - at < 320 ? n - at : 320);
-    tf_stream_finish(s);
+    for (int at = 0; at < n; at += 320) tf_session_push(s, x + at, n - at < 320 ? n - at : 320);
+    tf_session_finish(s);
     const double dt = tf__now_s() - t0;
     int ids[1024];
-    const int ni = tf_stream_greedy(s, ids, 1024);
-    tf_stream_destroy(s);
+    const TfToken *tk = NULL;
+    const int ni = tf_heads_greedy(tf_session_heads(s), NULL, &tk);
+    for (int i = 0; i < ni && i < 1024; ++i) ids[i] = tk[i].id;
+    tf_session_destroy(s);
     const PinMask after = pin_thread_mask();
     const int restored = memcmp(&after, &original, sizeof after) == 0;
     int same = 1;
@@ -656,7 +796,7 @@ static int pin_tests(const char *dir, const char *key, const char *list, int thr
     }
     const int ok = restored && same;
     bad += !ok;
-    printf("tf stream %d (pinned, %d threads): %.0f ms, %d tokens%s, caller's mask %s: %s\n", r, threads, dt * 1e3, ni,
+    printf("session %d (pinned, %d threads): %.0f ms, %d tokens%s, caller's mask %s: %s\n", r, threads, dt * 1e3, ni,
            same ? "" : " (DIFFERENT)", restored ? "restored" : "NOT restored", ok ? "ok" : "FAIL");
   }
   tf_model_close(m);
@@ -666,28 +806,35 @@ static int pin_tests(const char *dir, const char *key, const char *list, int thr
 }
 
 int main(int argc, char **argv) {
+  cap_own_memory();
   tf__client_no_timer = 1; /* the replayed exchanges and stubs run on the test's thread; the telemetry test starts the timer itself */
   if (argc >= 2 && !strcmp(argv[1], "crypto")) return crypto_tests();
+  if (argc >= 3 && !strcmp(argv[1], "errors")) return errors_tests(argv[2]);
+  if (argc >= 4 && !strcmp(argv[1], "vectors30")) return vectors30_tests(argv[2], argv[3]);
+  if (argc >= 4 && !strcmp(argv[1], "api")) return api_tests(argv[2], argv[3]);
+  if (argc >= 4 && !strcmp(argv[1], "share30")) return share30_tests(argv[2], argv[3]);
+  if (argc >= 5 && !strcmp(argv[1], "model30")) return model30_tests(argv[2], argv[3], argv[4], argc > 5 ? argv[5] : NULL, argc > 6 ? argv[6] : NULL);
   if (argc >= 5 && !strcmp(argv[1], "pin"))
     return pin_tests(argv[2], argv[3], argv[4], argc > 5 ? atoi(argv[5]) : 4, argc > 6 ? atoi(argv[6]) : 6);
   if (argc >= 6 && !strcmp(argv[1], "conformance"))
     return conformance(argv[2], argv[3], argv[4], argv[5], argc > 6 ? (unsigned)strtoul(argv[6], NULL, 0) : 0,
                        argc > 7 ? argv[7] : NULL);
-  if (argc >= 6 && !strcmp(argv[1], "vectors")) return vectors(argv[2], argv[3], argv[4], argv[5]);
-  if (argc >= 5 && !strcmp(argv[1], "settings")) return settings(argv[2], argv[3], argv[4]);
+  if (argc >= 8 && !strcmp(argv[1], "topk")) return topk_takes(argv[2], argv[3], argv[4], argv[5], argv[6], atoi(argv[7]));
+  if (argc >= 6 && !strcmp(argv[1], "layers")) return layers(argv[2], argv[3], argv[4], argv[5]);
   if (argc >= 4 && !strcmp(argv[1], "folder")) return folder(argv[2], argv[3]);
   if (argc >= 5 && !strcmp(argv[1], "download")) return download_tests(argv[2], argv[3], argv[4]);
   if (argc >= 5 && !strcmp(argv[1], "sharing")) return sharing_tests(argv[2], argv[3], argv[4]);
   if (argc >= 4 && !strcmp(argv[1], "ogg")) return ogg_tests(argv[2], argv[3]);
   if (argc >= 4 && !strcmp(argv[1], "codec")) return codec_tests(argv[2], argv[3]);
   if (argc >= 3 && !strcmp(argv[1], "upload")) return upload_tests(argv[2]);
-  if (argc >= 6 && !strcmp(argv[1], "stream_share")) return stream_share_tests(argv[2], argv[3], argv[4], argv[5]);
-  if (argc >= 4 && !strcmp(argv[1], "client")) return client_tests(argv[2], argv[3], argc > 4 ? argv[4] : NULL);
+  if (argc >= 6 && !strcmp(argv[1], "session_share")) return session_share_tests(argv[2], argv[3], argv[4], argv[5]);
+  if (argc >= 4 && !strcmp(argv[1], "client")) return client_tests(argv[2], argv[3]);
   if (argc >= 4 && !strcmp(argv[1], "bitrate")) return bitrate_tests(argv[2], argv[3]);
   if (argc >= 5 && !strcmp(argv[1], "consent")) return consent_tests(argv[2], argv[3], argv[4]);
-  if (argc >= 4 && !strcmp(argv[1], "sdk_latest")) return sdk_latest_tests(argv[2], argv[3], argc > 4 ? argv[4] : NULL);
+  if (argc >= 4 && !strcmp(argv[1], "sdk_latest")) return sdk_latest_tests(argv[2], argv[3]);
   if (argc >= 4 && !strcmp(argv[1], "manifest")) return manifest_tests(argv[2], argv[3]);
-  if (argc >= 3 && !strcmp(argv[1], "telemetry")) return telemetry_tests(argv[2], argc > 4 ? argv[3] : NULL, argc > 4 ? argv[4] : NULL);
+  if (argc >= 4 && !strcmp(argv[1], "takes")) return takes_tests(argv[2], argv[3]);
+  if (argc >= 3 && !strcmp(argv[1], "telemetry")) return telemetry_tests(argv[2]);
   fprintf(stderr, "usage: see the comment at the top of test/tf_tests.c\n");
   return 2;
 }

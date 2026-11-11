@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Make a model folder for the tests: files linked (or copied) in, a format 2 manifest, optionally signed.
+"""Make a model folder for the tests: files linked (or copied) in, a manifest for SDK 3.0, optionally signed.
 
-    make_test_folder.py OUT [--sign SEED_HEX] [--fix-tokens-sha] SRC=DEST ...
+    make_test_folder.py OUT [--sign SEED_HEX] [--format3] [--gzip] [--version X.Y.Z] SRC=DEST ...
 
-SRC=DEST puts SRC at OUT/DEST (a hard link when possible, else a copy). --fix-tokens-sha rewrites
-calibration.json's tokens_sha256 to tokens.txt's (the settings fixture carries a placeholder). With --sign the
-manifest is signed with the Ed25519 key of that 32-byte seed (a throwaway test key; never Quran Lab's), exactly
-as tajweedformer-coreml's make_manifest.py signs: the text below. Prints the public key (hex).
+SRC=DEST puts SRC at OUT/DEST (a hard link when possible, else a copy). The manifest is format 2 (one engine
+folder per context) or, with --format3, format 3 (shared weights; --gzip stores every file gzipped, as the CDN
+does). It names the model version (default 4.0.0) and min_sdk_version 3.0.0, as a build for SDK 3.0 does. With
+--sign the manifest is signed with the Ed25519 key of that 32-byte seed (a throwaway test key; never Quran
+Lab's), over the text the SDK rebuilds (the version line right after the revision line). Prints the public key
+(hex).
+
+calibration.json and the expected table are optional (a 3.0 folder opens without either). In format 3 the
+expected table has the role `reference` (optional, outside the CPU set) and the sample clips the role `selftest`.
 """
 import hashlib
 import json
@@ -18,27 +23,33 @@ F2 = ["model_id", "family", "revision", "min_sdk_version", "engine_format", "cor
       "sidecar", "keeps", "tokens"]
 
 
+def header(m, fields):
+    t = ""
+    for k in fields:
+        t += f"{k} {m[k]}\n"
+        if k == "revision" and "version" in m:
+            t += f"version {m['version']}\n"
+    return t
+
+
 def signed_text(m):
-    t = "quranlab-model-manifest 2\n" + "".join(f"{k} {m[k]}\n" for k in F2)
+    t = "quranlab-model-manifest 2\n" + header(m, F2)
     for f in sorted(m["files"], key=lambda f: f["path"].encode()):
         t += f"file {f['sha256'].lower()} {f['size']} {f['path']}\n"
     return t
 
 
-ROLES = {"tokens.txt": "tokens", "calibration.json": "calibration", "expected_tj3.zfx": "expected", "layers.zfw": "weights",
+ROLES = {"tokens.txt": "tokens", "calibration.json": "calibration", "expected_tj3.zfx": "reference", "layers.zfw": "weights",
          "frontend.zfw": "frontend", "model_engine2.onnx.zfg": "graph", "model_engine2.onnx.zfg.bin": "graph-data",
          "frames.zfw": "frames", "model_engine2.onnx": "ort-graph"}
+OPTIONAL = {"ort-graph", "reference", "selftest"}
 F3 = ["model_id", "family", "revision", "min_sdk_version", "engine_format", "coreml_format", "tokens", "tokens_sha256",
       "default_context"]
 
 
 def signed_text3(m):
     nl = chr(10)
-    t = "quranlab-model-manifest 3" + nl + "".join(f"{k} {m[k]}" + nl for k in F3) + "contexts " + ",".join(m["contexts"]) + nl
-    # golden_tolerance (signed since SDK 2.0.1): one line per build, sorted by the build key's UTF-8 bytes; none when absent
-    gt = m.get("golden_tolerance") or {}
-    for b in sorted(gt, key=lambda k: k.encode()):
-        t += f"golden_tolerance {b} {gt[b]['token_diffs']} {gt[b]['site_flag_diffs']} {gt[b]['word_flag_diffs']}" + nl
+    t = "quranlab-model-manifest 3" + nl + header(m, F3) + "contexts " + ",".join(m["contexts"]) + nl
     order = ["android", "apple", "web", "native"]
     for f in sorted(m["files"], key=lambda f: f["path"].encode()):
         pl = "*" if "*" in f["platforms"] else ",".join(x for x in order if x in f["platforms"])
@@ -58,12 +69,16 @@ def sha(p):
 
 
 def main(argv):
-    out, seed, fix, fmt3, gz = argv[0], None, False, False, False
+    out, seed, fmt3, gz, version = argv[0], None, False, False, "4.0.0"
     pairs = []
     i = 1
     while i < len(argv):
         if argv[i] == "--sign":
             seed = argv[i + 1]
+            i += 2
+            continue
+        if argv[i] == "--version":
+            version = argv[i + 1]
             i += 2
             continue
         if argv[i] == "--gzip":
@@ -72,10 +87,6 @@ def main(argv):
             continue
         if argv[i] == "--format3":
             fmt3 = True
-            i += 1
-            continue
-        if argv[i] == "--fix-tokens-sha":
-            fix = True
             i += 1
             continue
         src, dst = argv[i].split("=", 1)
@@ -87,26 +98,19 @@ def main(argv):
         os.makedirs(os.path.dirname(full) or out, exist_ok=True)
         if os.path.exists(full):
             os.remove(full)
-        if dst == "calibration.json" and fix:
-            continue
         try:
             os.link(src, full)
         except OSError:
             shutil.copyfile(src, full)
     tok = os.path.join(out, "tokens.txt")
-    if fix:
-        src = dict((d, s) for s, d in pairs)["calibration.json"]
-        cal = json.load(open(src, encoding="utf-8"))
-        cal["tokens_sha256"] = sha(tok)
-        with open(os.path.join(out, "calibration.json"), "w", encoding="utf-8") as f:
-            json.dump(cal, f, ensure_ascii=False)
-    cal = json.load(open(os.path.join(out, "calibration.json"), encoding="utf-8"))
     files = []
     for _, dst in pairs:
         p = os.path.join(out, dst)
         files.append({"path": dst, "size": os.path.getsize(p), "sha256": sha(p)})
-    ctx = cal["default_context"]
-    m = {"format": 2, "model_id": cal["model_id"], "family": "tajweedformer", "revision": "test", "min_sdk_version": "2.0.0",
+    # the contexts: the folders that hold an engine graph; the default is c16_l64 when it is there
+    contexts = [d.split("/")[0] for _, d in pairs if d.endswith("/model_engine2.onnx.zfg")]
+    ctx = "c16_l64" if "c16_l64" in contexts or not contexts else contexts[0]
+    m = {"format": 2, "model_id": "v4.0", "family": "tajweedformer", "revision": "test", "version": version, "min_sdk_version": "3.0.0",
          "engine_format": 2, "coreml_format": 9, "tokens_sha256": sha(tok), "coreml": "-",
          "sidecar": f"{ctx}/layers.zfw" if any(d == f"{ctx}/layers.zfw" for _, d in pairs) else "-", "keeps": "-",
          "tokens": "tokens.txt", "files": files}
@@ -114,11 +118,11 @@ def main(argv):
     if fmt3:
         for f in files:
             name = f["path"].rsplit("/", 1)[-1]
-            # shared files: the string "*", exactly as publish/make_manifest3.py writes them (the downloader once
-            # accepted only a list and skipped every shared file of a real published folder, 11-08)
+            role = "selftest" if f["path"].startswith("selftest/") else ROLES.get(name, "other")
+            # shared files: the string "*", exactly as the publisher's make_manifest3.py writes them
             f.update({"platforms": ["native"] if name == "model_engine2.onnx" else "*", "soc": "*",
-                      "context": f["path"].split("/")[0] if "/" in f["path"] else "*", "role": ROLES.get(name, "other"),
-                      "need": "optional" if name == "model_engine2.onnx" else "required", "encoding": "identity"})
+                      "context": f["path"].split("/")[0] if "/" in f["path"] and role != "selftest" else "*", "role": role,
+                      "need": "optional" if role in OPTIONAL else "required", "encoding": "identity"})
         if gz:
             import gzip
             for f in files:
@@ -129,9 +133,9 @@ def main(argv):
                 os.remove(src)
                 f["decoded"] = {"path": f["path"], "size": f["size"], "sha256": f["sha256"]}
                 f.update({"path": f["path"] + ".gz", "size": len(packed), "sha256": hashlib.sha256(packed).hexdigest(), "encoding": "gzip"})
-        m = {"format": 3, "model_id": cal["model_id"], "family": "tajweedformer", "revision": "test", "min_sdk_version": "2.0.0",
+        m = {"format": 3, "model_id": "v4.0", "family": "tajweedformer", "revision": "test", "version": version, "min_sdk_version": "3.0.0",
              "engine_format": 3, "coreml_format": 9, "tokens": "tokens.txt", "tokens_sha256": tok_sha,
-             "default_context": cal["default_context"], "contexts": list(cal["contexts"].keys()), "files": files}
+             "default_context": ctx, "contexts": contexts or [ctx], "files": files}
         signed_text_fn = signed_text3
     else:
         signed_text_fn = signed_text

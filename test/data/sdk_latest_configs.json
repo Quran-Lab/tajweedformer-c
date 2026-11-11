@@ -5,73 +5,73 @@
  "configs": [
   {
    "name": "newer",
-   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"tajweed\":{\"v\":1,\"preset\":\"balanced\"},\"sdk_latest\":{\"version\":\"2.0.3\",\"severity\":\"recommended\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
-   "signature": "ed25519=4IsQ4lNMs8MTQE1MEMJnrrSsRD42lrYKM6XwBfPmNtWdn0013UEr2M9piJ1hHZWTHf1GgoAk3Aj2CJAzRC0NBA=="
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"inference\":{\"context\":\"c16_l64\"},\"sdk_latest\":{\"version\":\"3.0.1\",\"severity\":\"recommended\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
+   "signature": "ed25519=S+u6pUGT+sPZ8E3fHt3e+BEzf+c/VgDmFKPsCh/zOEX14f0pGYdKECP1FHohvVI2PMUD/uFD9x/YmAtbt1SlCA=="
   },
   {
    "name": "newer major",
-   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"tajweed\":{\"v\":1,\"preset\":\"balanced\"},\"sdk_latest\":{\"version\":\"3.0\",\"severity\":\"required\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
-   "signature": "ed25519=TU7iIOjsNbTORjwUmY4bq5neb6zkzRgn8PjkbfLHdKBwMCnq/49z1Cus2BmgoqdMizJgnMnTq/DiGQJyjCznCw=="
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"inference\":{\"context\":\"c16_l64\"},\"sdk_latest\":{\"version\":\"4.0\",\"severity\":\"required\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
+   "signature": "ed25519=H9p9Fk51PmF+T+GNAjFyVQPQmKZxmPtQmTTlV6SQHYmphrLLe5Yj1gE5L0NlMkMxkuWy7HHrsPTCd+kThZwfDg=="
   },
   {
    "name": "equal",
-   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"tajweed\":{\"v\":1,\"preset\":\"balanced\"},\"sdk_latest\":{\"version\":\"2.0.2\",\"severity\":\"recommended\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
-   "signature": "ed25519=XbdXr5zsi4v9E4V15NEUjrR/npLlYCRY81s2rfw4IYsOxD8fda+ybmBeGpnsvlg8Gfa0hv0II0Yw2RyslTJhAQ=="
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"inference\":{\"context\":\"c16_l64\"},\"sdk_latest\":{\"version\":\"3.0.0\",\"severity\":\"recommended\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
+   "signature": "ed25519=PCW3wqb+vnEli6qGn1gkwKPvjBbSHBxP3vIUrEMOW/LgsCBuVZUYd3wLjSGIK0ceiW7MdNfbsbU3+b3NDBbrCQ=="
   },
   {
    "name": "older",
-   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"tajweed\":{\"v\":1,\"preset\":\"balanced\"},\"sdk_latest\":{\"version\":\"2.0.1\",\"severity\":\"recommended\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
-   "signature": "ed25519=rkyReD6I0kgt0Qn/nEOz8OFOUi0XgMzrSRK8DrK/Fpkj0YDAB/Xe1zwjYu2lfLpevEjhXU81+X2wzY7b4DEWBA=="
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"inference\":{\"context\":\"c16_l64\"},\"sdk_latest\":{\"version\":\"2.0.3\",\"severity\":\"recommended\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
+   "signature": "ed25519=EFZCI+yurQ9IyIAxvNRVJvjyb4L+ir8PfF4yetABHIq+BGwCjnBWsvirQH7soeHxIwY3yDTxC7pLP1IX4NsjBw=="
   },
   {
    "name": "absent",
-   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"tajweed\":{\"v\":1,\"preset\":\"balanced\"}}",
-   "signature": "ed25519=+xHXdhidm3vRcKDPgOLp6qOp0uQbFyv11QT5NSJSzudI/quFrFh9Lk05QB2/M0MgYh36rMsP+Z7/tOdtHRDvBg=="
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"inference\":{\"context\":\"c16_l64\"}}",
+   "signature": "ed25519=DqySl8kKnOEOcBzi1KqFLUZEOABuFrQFeNBBfj04wXnkcvB34nhg1oy1EGi8Hx/1ZcefNMNyMrRziGszSbuLBg=="
   },
   {
    "name": "junk version",
-   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"tajweed\":{\"v\":1,\"preset\":\"balanced\"},\"sdk_latest\":{\"version\":\"2.0.x\",\"severity\":\"recommended\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
-   "signature": "ed25519=Kmh0bqgdxodKbfM2/Z91/tUvo0nIJ9m4TSUPSLQqmyMCBGZ5UUmt5pUrefo3jl4ONCJ6QYT6u5Vg6g30ZUWPBA=="
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"inference\":{\"context\":\"c16_l64\"},\"sdk_latest\":{\"version\":\"3.0.x\",\"severity\":\"recommended\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
+   "signature": "ed25519=PqJGsMOE8umeiywsUwGrBxDJORZiPgR/bo/+EGPYASHNQftqQ5tjCsD1hOjDZR+63tLI1UsUCczX2oTzoxkNDQ=="
   },
   {
    "name": "prerelease version",
-   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"tajweed\":{\"v\":1,\"preset\":\"balanced\"},\"sdk_latest\":{\"version\":\"2.0.3-beta\",\"severity\":\"recommended\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
-   "signature": "ed25519=+E2udXFZpNw9GVm1C541zinkB3W4u1RJpVuAUD3t19s2SzZGst5ROG/2jp8qZRHvjeSLH2KulJr48bjQ7FSCDA=="
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"inference\":{\"context\":\"c16_l64\"},\"sdk_latest\":{\"version\":\"3.0.1-beta\",\"severity\":\"recommended\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
+   "signature": "ed25519=mKConeTeDTpvKmn2fHUR7WA1r0YxdtCz24BrRoRcdziHnKHuuBQ2znjqeAmF/m6w95+SvEfOcO7QMYliyr2cBg=="
   },
   {
    "name": "empty version",
-   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"tajweed\":{\"v\":1,\"preset\":\"balanced\"},\"sdk_latest\":{\"version\":\"\",\"severity\":\"recommended\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
-   "signature": "ed25519=cGUrR9rnKi/DOQ6hV6NwQkH7ovo8fOvDRJfUKIUxPhsz3wbCCbHgMGhaVEYzu/uY3tV0tOzPbZL0vMBykMf2Aw=="
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"inference\":{\"context\":\"c16_l64\"},\"sdk_latest\":{\"version\":\"\",\"severity\":\"recommended\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
+   "signature": "ed25519=xzPL3hYLN1r3VD1WDU6v7acJntWLHX7BmH5Wd0yGph47grwGlQE4rBv2SwYPrVSEt9XhItp4cqiMmhizCmCECw=="
   },
   {
    "name": "version a number",
-   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"tajweed\":{\"v\":1,\"preset\":\"balanced\"},\"sdk_latest\":{\"version\":3,\"severity\":\"recommended\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
-   "signature": "ed25519=z/3T7KJnvBLhTiWZ4Su3zUu67Xk1vVLLMRFBefTr0E4Y456X0UrzkWNv7EUEehdzbOrs5+m+dKV3cy8WtT8JBw=="
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"inference\":{\"context\":\"c16_l64\"},\"sdk_latest\":{\"version\":4,\"severity\":\"recommended\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
+   "signature": "ed25519=vrHFQPxliZCL8TKSt7RxDovZKVk87HEagxov04LlhgzkksjYeIlET2hntCPZNKOGAlxadpC0p5Z+DcfZi9FwDQ=="
   },
   {
    "name": "no severity",
-   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"tajweed\":{\"v\":1,\"preset\":\"balanced\"},\"sdk_latest\":{\"version\":\"2.0.3\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
-   "signature": "ed25519=wcS3B0b7I3rYlPuvpwe56EI2MgNxdL92HLXPuN5ngQtacDGD308OW8MOK0iOV2UjcQRvKFq8q3uGXGLZjf5vCg=="
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"inference\":{\"context\":\"c16_l64\"},\"sdk_latest\":{\"version\":\"3.0.1\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
+   "signature": "ed25519=4c9i3mdUkcewQ8WcABwqQLbo1fXoHbS+ZTgWYGDgWOiAczX2x+sY/seCGIQuj6LakN71FlsQnj4mgA34HrooCg=="
   },
   {
    "name": "no url",
-   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"tajweed\":{\"v\":1,\"preset\":\"balanced\"},\"sdk_latest\":{\"version\":\"2.0.3\",\"severity\":\"recommended\"}}",
-   "signature": "ed25519=NFakL7bmIOnTYJVdWQ2ghbGc3rurMkQuAMF/N/JzM8cZfybU15gxX7OZyf7Pf6k93b9cAXVjHB//4sdS5XnNCQ=="
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"inference\":{\"context\":\"c16_l64\"},\"sdk_latest\":{\"version\":\"3.0.1\",\"severity\":\"recommended\"}}",
+   "signature": "ed25519=4Az3iFMigJdrr1UGX+WUob14Ea3jschbV/+AHRIhlkvyVQ1JXBlggYfjJA0eIi1QftMe4FIJmfgXFdcEx1UlDA=="
   },
   {
    "name": "url not a string",
-   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"tajweed\":{\"v\":1,\"preset\":\"balanced\"},\"sdk_latest\":{\"version\":\"2.0.3\",\"severity\":\"recommended\",\"url\":[\"x\"]}}",
-   "signature": "ed25519=PGPmjlgdMjDdvRzSkL9RYn5YHTFJo1vhRINt5YFwUhbTpEqtkt7Va5cH3R0xQkRpOTRhiWv65xryDJY9hIMNDA=="
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"inference\":{\"context\":\"c16_l64\"},\"sdk_latest\":{\"version\":\"3.0.1\",\"severity\":\"recommended\",\"url\":[\"x\"]}}",
+   "signature": "ed25519=MhhKbtQzNeZHJ1wRYojCYHqkrcSLyxZxkZ1VUP8N5e4vhIG2T/byWGkAtcqPZPPeJTGqct22BEZvHALiOZORCA=="
   },
   {
    "name": "not an object",
-   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"tajweed\":{\"v\":1,\"preset\":\"balanced\"},\"sdk_latest\":\"2.0.3\"}",
-   "signature": "ed25519=anDeZbOSkmxMGuQAwHnJQuDbbvtKLkod/EhWVxvfqnnLX6q/srzcPz4FIh94Q5P+JpQF8UJAn1d6fFQa6ryrDQ=="
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"inference\":{\"context\":\"c16_l64\"},\"sdk_latest\":\"3.0.1\"}",
+   "signature": "ed25519=Nxjs8JZUvI5eqvkP2PVLQ5BMj+riq2RPFPiDLNlVv67NP8LWN40lAGQ2dh+2zd937IqG7kUO2WtxxN49HHX2AA=="
   },
   {
    "name": "null",
-   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"tajweed\":{\"v\":1,\"preset\":\"balanced\"},\"sdk_latest\":null}",
-   "signature": "ed25519=Vde7/uwq/K0QSLKF20QUplB1Dm45anVWyRwA/4Yg1p/fVUF/roDxsJdLPXYF6vZJz9OfWmNLOgqZf6K9HQZ8Bw=="
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Latest\",\"issued_at\":1794182400,\"expires_at\":4102444800,\"flags\":{\"analytics\":true,\"contributions\":false},\"inference\":{\"context\":\"c16_l64\"},\"sdk_latest\":null}",
+   "signature": "ed25519=wa4Dx6jYLK6gHsd0WkI7V3QKt/zea6MgXva1uXPWblZl539Ir7VmZsiw0vJx0jIsk9nUEBlOlYGLMFO+9wF8Bw=="
   }
  ]
 }

@@ -1,42 +1,48 @@
-/* tajweedformer.h: the TajweedFormer SDK for Windows and Linux (C API, SDK 2.0.2).
+/* tajweedformer.h: the TajweedFormer SDK for Windows and Linux (C API, SDK 3.0.0).
  *
- * The exact engine (bit for bit the reference arithmetic) runs the V4 TajweedFormer model from a
- * verified model folder (sdk/v4.0), and this library gives every layer of what it computes:
+ * A pure inference engine: audio in, the model's own output out. Five things, with the same names and the same
+ * order of calls as the Android, Apple and web SDKs:
  *
- *   raw      every head of the network per chunk (log_probs, inter1/inter4, id, timing, gem, the four
- *            attribute heads, boundary, conf), selectable per stream
- *   decoded  per 40 ms frame the top-1 and runner-up token with their log-probs and margin; the greedy
- *            transcript with per-token peak log-prob, runner-up, margin and confidence
- *   tajweed  for a known surah:ayah: per-site verdicts with per-head and fused LLRs, madd counts,
- *            qalqalah and gemination evidence, per-word scores and flags, the settings in force
+ *   Client   the app's link to Quran Lab (the key, the signed config, the model files, telemetry, sharing);
+ *            one per process
+ *   Model    one verified model build on this device (version, contexts, tokens, calibration and reference
+ *            data, sample clips); it holds the engine
+ *   Session  one take: audio in, chunks and events out, the take's Heads at the end
+ *   Heads    raw model output for a chunk or a whole take: every selected head, greedy tokens, the decoded layer
+ *   Backend  what runs the model (here always the CPU engine)
  *
- * Settings resolve app code > the portal's tajweed block (signed /v1/config) > calibration.json.
- * The same concepts, names and numbers as the Android, Apple and Web SDKs.
+ *   static void on_chunk(void *user, const TfChunk *chunk) { puts(chunk->decoded->text); }
  *
- *   TfModelOptions o = tf_model_default_options();
- *   TfModel *m = tf_model_open("models/sdk/v4.0", &o);          verified: manifest, signature, hashes
- *   tf_settings_set_app_json(m, "{\"preset\":\"sensitive\"}");   optional
- *   TfStream *s = tf_stream_create(m, NULL);
- *   tf_stream_push_audio(s, pcm, n);  ...  tf_stream_finish(s);
- *   TfDecoded *d = tf_stream_decode(s);                          what was heard
- *   TfResult *r = tf_stream_score(s, 1, 2);                      tajweed verdicts for 1:2
- *   puts(tf_result_json(r));
- *   tf_result_free(r); tf_decoded_free(d); tf_stream_destroy(s); tf_model_close(m);
+ *   TfClient *client = tf_client_create(&(TfClientOptions){.key = "qlk_v1_...", .app_id = "com.example.app"});
+ *   TfModel *model = tf_client_model(client, NULL);                    downloaded once, verified, opened, warm
+ *   TfSession *session = tf_session_create(model, &(TfSessionOptions){.on_chunk = on_chunk});
+ *   while (more audio) tf_session_push(session, samples, n);           mono float samples
+ *   tf_session_finish(session);                                        the end of the take
+ *   const TfHeads *heads = tf_session_heads(session);                  the take's raw output
+ *   tf_session_destroy(session); tf_model_close(model); tf_client_destroy(client);
  *
- * Threads: a TfModel may be shared for scoring and decoding. Settings calls and streams belong to one
- * thread at a time. The engine allows ONE live stream per process (its operators keep process-wide
- * state); a second tf_stream_create fails with TF_ERR_BUSY until the first is destroyed. The server
- * tier runs one stream per worker process (the `tajweedformer serve`/`bench` commands).
+ * The SDK never compares a recitation with an expected ayah and never says "mistake". It gives the heads, the
+ * decoded layer, the events (speech started and ended), and two files as read-only data for a judge of your own:
+ * the calibration (tf_model_calibration_json) and the expected units of each ayah (tf_model_reference).
  *
- * Errors: functions return NULL or a negative TF_ERR_* value; tf_last_error() gives the message of the
- * calling thread's last failure. Strings returned as `const char *` belong to the object they came from
- * and stay valid until that object changes or is freed; `char *` results are freed with tf_free. */
+ * Options: every options struct may be NULL or zeroed; zero is the default of every field.
+ *
+ * Errors: a function returns NULL or a negative TfError. tf_last_error_code() is the calling thread's last failure,
+ * tf_last_error() its message and tf_last_error_fix() what to do about it; tf_error_name(), tf_error_fix() and
+ * tf_error_docs() give the catalogue entry of any TfError (the same codes, texts and links as the other SDKs).
+ * A call on a NULL object fails and leaves an earlier error in place, so after a chain of calls the first failure
+ * is the one reported.
+ *
+ * Strings and arrays returned as `const` belong to the object they came from and stay valid until the next call on
+ * that object, or until it is closed or destroyed.
+ *
+ * Threads: a Client may be used from any thread. A Model and its Session belong to one thread at a time. A Model
+ * has one open Session at a time, and a process runs one take at a time (the engine's rule): a server runs one
+ * worker process per take in flight (the `tajweedformer serve` and `bench` commands). */
 #ifndef TAJWEEDFORMER_H
 #define TAJWEEDFORMER_H
 
 #include <stddef.h>
-
-#include "zf_tajweed.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -52,458 +58,457 @@ extern "C" {
 #define TF_API
 #endif
 
-#define TF_SDK_VERSION "2.0.2"
-#define TF_API_VERSION 1
+#define TF_SDK_VERSION "3.0.0"
 
+TF_API const char *tf_version(void); /* "3.0.0" */
+
+/* ============================================================================ errors */
+
+/* The 26 errors of the catalogue shared by the four SDKs (docs: https://sdk.quranlab.ai/docs/errors). */
 typedef enum {
   TF_OK = 0,
-  TF_ERR_ARGUMENT = -1,
-  TF_ERR_IO = -2,
-  TF_ERR_MANIFEST = -3,          /* manifest.json missing or malformed */
-  TF_ERR_SIGNATURE = -4,         /* the manifest or config signature does not verify */
-  TF_ERR_SIGNATURE_REQUIRED = -5,/* unsigned, and a signature is required */
-  TF_ERR_CHECKSUM = -6,          /* a file's size or SHA-256 differs from the manifest */
-  TF_ERR_NOT_LISTED = -7,        /* a file the folder needs is not listed */
-  TF_ERR_SDK_TOO_OLD = -8,       /* min_sdk_version above this SDK's version */
-  TF_ERR_UNSUPPORTED_MODEL = -9, /* not a V4 TajweedFormer folder (format, family, engine_format) */
-  TF_ERR_CALIBRATION = -10,
-  TF_ERR_ENGINE = -11,
-  TF_ERR_SETTINGS = -12,         /* an app setting is invalid (app code is strict) */
-  TF_ERR_BUSY = -13,             /* another stream is live in this process */
-  TF_ERR_NETWORK = -14,
-  TF_ERR_HTTP = -15,             /* the server answered with an error status */
-  TF_ERR_NO_MEMORY = -16,
-  TF_ERR_NOT_AVAILABLE = -17,    /* not possible here (for example uploads without attestation) */
-  TF_ERR_CONFIG = -18            /* a remote config failed verification (signature, key id, expiry) */
+  TF_ERR_INVALID_ARGUMENT = -1,      /* a value the API does not accept */
+  TF_ERR_INVALID_KEY = -2,           /* the server does not know the key, or it is revoked */
+  TF_ERR_SDK_TOO_OLD = -3,           /* this key needs a newer SDK */
+  TF_ERR_SERVER_REJECTED = -4,       /* the server refused this app */
+  TF_ERR_CLIENT_EXISTS = -5,         /* a second Client while the first is not destroyed */
+  TF_ERR_MODEL_UNAVAILABLE = -6,     /* Quran Lab has no model build for this SDK version yet */
+  TF_ERR_NEEDS_CONNECTION = -7,      /* the model is not downloaded yet: a connection is needed once */
+  TF_ERR_NETWORK_NOT_PERMITTED = -8, /* never raised by this SDK (Windows and Linux have no such permission) */
+  TF_ERR_DOWNLOAD_FAILED = -9,       /* a download stopped; it resumes at the next call */
+  TF_ERR_STORAGE_FULL = -10,          /* not enough space for the model */
+  TF_ERR_STORAGE_FAILED = -11,       /* the SDK's folder cannot be read or written */
+  TF_ERR_MODEL_MISSING = -12,        /* the folder has no model, or a listed file is gone */
+  TF_ERR_MODEL_INVALID = -13,        /* the manifest or a model file is malformed */
+  TF_ERR_SIGNATURE_INVALID = -14,    /* the manifest's signature does not verify */
+  TF_ERR_CHECKSUM_MISMATCH = -15,    /* a file's size or SHA-256 differs from the manifest */
+  TF_ERR_MODEL_INCOMPATIBLE = -16,   /* the build needs a newer SDK, or is not one this SDK runs */
+  TF_ERR_RUNTIME_UNSUPPORTED = -17,  /* this build cannot run here: the SDK supports Windows and Linux on x86-64 */
+  TF_ERR_REFERENCE_MISSING = -18,    /* tf_reference_units before tf_reference_fetch */
+  TF_ERR_SESSION_OPEN = -19,         /* the Model already has an open Session */
+  TF_ERR_SESSION_CLOSED = -20,       /* a call on a Session that has ended */
+  TF_ERR_CANCELLED = -21,            /* the take was cancelled */
+  TF_ERR_ENGINE_FAILED = -22,        /* the engine reported an error */
+  TF_ERR_MICROPHONE_DENIED = -23,    /* never raised by this SDK (it has no microphone) */
+  TF_ERR_MICROPHONE_UNAVAILABLE = -24, /* never raised by this SDK */
+  TF_ERR_INTERRUPTED = -25,          /* never raised by this SDK */
+  TF_ERR_SHARING_UNAVAILABLE = -26   /* a sharing call while Quran Lab's config does not allow sharing for this app */
 } TfError;
 
-TF_API const char *tf_version(void); /* "2.0.2" */
-TF_API int tf_api_version(void);
-TF_API const char *tf_error_name(int code); /* "signature_invalid", ... */
-TF_API const char *tf_last_error(void);     /* this thread's last failure, or NULL */
-TF_API int tf_last_error_code(void);
-TF_API void tf_free(void *p);
+TF_API int tf_last_error_code(void);          /* this thread's last failure (a TfError), 0 when none */
+TF_API const char *tf_last_error(void);       /* its message, or NULL */
+TF_API const char *tf_last_error_fix(void);   /* what to do about it: one sentence, or NULL */
+TF_API const char *tf_error_name(int error);  /* the stable code: "invalid_argument", ..., "ok" for 0 */
+TF_API const char *tf_error_fix(int error);   /* the catalogue's fix for that code */
+TF_API const char *tf_error_docs(int error);  /* https://sdk.quranlab.ai/docs/errors#<code> */
 
-/* ============================================================================ heads (raw layer) */
+/* ============================================================================ Backend */
 
-typedef enum {
-  TF_HEAD_LOG_PROBS = 0,  /* [n40, 38] final CTC, log-softmax */
-  TF_HEAD_INTER1 = 1,     /* [n40, 38] stack-1 InterCTC */
-  TF_HEAD_INTER4 = 2,     /* [n40, 38] stack-4 InterCTC (diagnostic) */
-  TF_HEAD_ID = 3,         /* [n20, 38] identity CTC */
-  TF_HEAD_TIMING = 4,     /* [n20, 38] H-time chain; 0 = pause */
-  TF_HEAD_GEM = 5,        /* [n20, 2] single, held */
-  TF_HEAD_TAFKHEEM = 6,   /* [n20, 3] thin, heavy, low_heavy */
-  TF_HEAD_GHUNNA = 7,     /* [n20, 5] none, plain, geminate, ikhfa, idgham */
-  TF_HEAD_QALQALAH = 8,   /* [n20, 3] none, sughra, kubra */
-  TF_HEAD_FACE = 9,       /* [n20, 4] none, imala, tasheel, sakt */
-  TF_HEAD_BOUNDARY = 10,  /* [n20] logit: a unit starts here */
-  TF_HEAD_CONF = 11,      /* [n20] logit: the frame's label is truthful */
-  TF_HEAD_COUNT = 12
+/* What ran or will run the model. Here always {"cpu", "cpu", "cpu", NULL}: the exact CPU engine, no accelerator.
+ * The strings are static. */
+typedef struct {
+  const char *kind;    /* "cpu" or "accelerator" */
+  const char *name;    /* "cpu" */
+  const char *stage;   /* "cpu": no accelerator here */
+  const char *reason;  /* NULL */
+} TfBackend;
+
+/* ============================================================================ output */
+
+typedef struct TfHeads TfHeads;
+
+/* One raw head of a chunk or a take. */
+typedef struct {
+  const char *name;                 /* "log_probs", "inter1_log_probs", "inter4_log_probs", "id_log_probs",
+                                       "timing_log_probs", "gem", "attr_tafkheem", "attr_ghunna", "attr_qalqalah",
+                                       "attr_face", "boundary", "conf" */
+  const char *kind;                 /* "ctc" (log-probs over the tokens) or "attribute" */
+  int frame_ms;                     /* 40 or 20 */
+  int frames;
+  int classes;                      /* values per frame: 38 for a ctc head; 2 to 5 for the class heads (softmax
+                                       probabilities); 1 for boundary and conf (a logit) */
+  const float *values;              /* [frames, classes], row major */
+  const char *const *class_names;   /* [classes] for the class heads ("single", "held", ...), else NULL */
 } TfHead;
 
-#define TF_HEAD_BIT(h) (1u << (h))
-/* What the scorer reads; a stream always keeps these. */
-#define TF_HEADS_SCORER (TF_HEAD_BIT(TF_HEAD_LOG_PROBS) | TF_HEAD_BIT(TF_HEAD_INTER1) | \
-                         TF_HEAD_BIT(TF_HEAD_TIMING) | TF_HEAD_BIT(TF_HEAD_GEM) | TF_HEAD_BIT(TF_HEAD_QALQALAH))
-/* The default selection: the scorer's heads and conf (the decoded layer's confidence). */
-#define TF_HEADS_DEFAULT (TF_HEADS_SCORER | TF_HEAD_BIT(TF_HEAD_CONF))
-#define TF_HEADS_ALL 0xFFFu
-
-typedef struct {
-  const char *name;     /* "log_probs", "inter1_log_probs", ..., "conf" (the graph's output names) */
-  int width;            /* values per frame */
-  int rate_ms;          /* 40 or 20 */
-  const char *kind;     /* "log_softmax", "softmax" or "logit" */
-  int n_classes;        /* names below, 0 for the token heads (use tokens.txt) and the logits */
-  const char *const *classes;
-} TfHeadInfo;
-TF_API const TfHeadInfo *tf_head_info(int head);
-TF_API int tf_head_from_name(const char *name); /* -1 when unknown */
-/* One head's array inside a ZfTajweedHeads (NULL when absent), and its frame count. */
-TF_API const float *tf_heads_get(const ZfTajweedHeads *h, int head, int *frames);
-
-/* ============================================================================ the model */
-
-typedef struct TfModel TfModel;
-
-typedef struct {
-  size_t struct_size;          /* sizeof(TfModelOptions) */
-  const char *context;         /* NULL: the portal's (when set before open via remote_json) or calibration's default */
-  int threads;                 /* engine threads, 0 = the fast cores */
-  int sample_rate;             /* rate of pushed audio: 0/16000, or 8000..48000 through the engine's resampler */
-  int batch;                   /* chunks run together for stored audio (same bits); 0/1 for live audio */
-  int load_engine;             /* 1 (default): streams; 0: scoring heads from elsewhere only */
-  int require_signature;       /* 1 (default): the manifest must be signed by a trusted key */
-  int verify_files;            /* 1 (default): check every listed file's size and SHA-256 at open */
-  const char *trusted_key_hex; /* raw Ed25519 public key (64 hex); NULL = Quran Lab's key */
-  int debug_build;             /* 1 lets app code turn on checks whose calibration status is "off" */
-  const char *remote_json;     /* optional: the portal's /v1/config (verified) or its tajweed block */
-  /* 1: the engine does not pin its threads to cores (many streams in many processes: the server tier; the
-   * `tajweedformer serve`, `bench` and `worker` commands set it). 0 (default): the engine's pinning, best for one
-   * stream. ZfTajweedOpenOptions.no_pin of the engine (API 3). -1 (default): the engine's platform default
-   * (phones pin, Windows, Linux and macOS do not). Bits are the same either way. */
-  int no_pin;
-} TfModelOptions;
-
-TF_API TfModelOptions tf_model_default_options(void);
-/* Opens a V4 folder: manifest format 2, family tajweedformer, engine_format 2, min_sdk_version <= TF_SDK_VERSION,
- * signature (by default required), every listed file's size and SHA-256; never opens an unlisted file. */
-TF_API TfModel *tf_model_open(const char *folder, const TfModelOptions *options);
-TF_API void tf_model_close(TfModel *m);
-/* {"model_id","revision","family","signed","key_id","contexts":[...],"context","default_context",
- *  "chunk_ms","vocab","blank","tokens":[...],"presets":[{"name","label","site_fa"}],"word_presets":[...],
- *  "heads":[{"name","width","rate_ms","kind","classes"}],"sdk_version"} */
-TF_API const char *tf_model_info_json(TfModel *m);
-TF_API const char *tf_model_context(const TfModel *m);
-TF_API int tf_model_chunk_ms(const TfModel *m);
-TF_API const char *tf_model_token_name(const TfModel *m, int id); /* "<blk>", "|", ... */
-/* The engine's own handles, for anything this header does not wrap. */
-TF_API ZfTajweedModel *tf_model_engine(TfModel *m);
-TF_API ZfTajweedConfig *tf_model_engine_config(TfModel *m);
-
-/* ============================================================================ settings */
-
-/* App code (strict: an invalid value is TF_ERR_SETTINGS and nothing changes). Replaces the whole app layer;
- * NULL clears it. {"preset": "balanced", "overrides": {"cons_sub": {"preset": "sensitive"},
- * "vowel_sub": {"threshold": 1.25}}, "checks": {"qalqalah": true}, "word": {"preset": "general"} or
- * {"word": {"threshold": 4.5}}}. ("context" is chosen at open.) */
-TF_API int tf_settings_set_app_json(TfModel *m, const char *json);
-/* The portal's layer: a whole /v1/config document or its "tajweed" block, as received. Lenient: invalid fields
- * are dropped (listed in the effective settings' "dropped"), never the block. Returns the number dropped, or
- * TF_ERR_ARGUMENT for text that is not JSON (the layer is then cleared). Use tf_client_* for the verified fetch. */
-TF_API int tf_settings_set_remote_json(TfModel *m, const char *json, size_t len);
-/* "int8" (the exact engine's heads) or "fp32" (heads from elsewhere); NULL = the default for this model. */
-TF_API int tf_settings_set_backend(TfModel *m, const char *backend);
-/* The effective settings with each value's source: the engine's resolution plus "word". */
-TF_API const char *tf_settings_json(TfModel *m);
-
-/* ============================================================================ streams */
-
-typedef struct TfStream TfStream;
-typedef struct TfClient TfClient;
-
-typedef struct {
-  int index;                   /* chunk number in the take, from 0 */
-  int start_ms, end_ms;        /* the chunk's 40 ms frames on the take's clock */
-  int frame0;                  /* first 40 ms frame of the chunk in the take */
-  const ZfTajweedHeads *heads; /* this chunk's selected heads (others NULL); valid during the call */
-} TfChunk;
-typedef void (*TfChunkCallback)(void *user, const TfChunk *chunk);
-
-typedef struct {
-  size_t struct_size;
-  unsigned heads;              /* TF_HEAD_BIT mask COMPUTED, kept and handed over (the scorer's heads are always
-                                  added); 0 = TF_HEADS_DEFAULT; TF_HEADS_ALL = all. A head not asked for is not
-                                  computed at all (the engine's lazy heads, API 3) and comes back NULL */
-  TfChunkCallback on_chunk;    /* optional, called on the pushing thread after every chunk */
-  void *user;
-  /* Recitation sharing (optional): with a platform client whose learner agreed to share, every take this stream
-   * listens to is shared in full in the background (tf_sharing_session_*); nothing happens otherwise. */
-  TfClient *client;
-  const char *input_route;     /* built_in, wired, usb, bluetooth, car, continuity, other, unknown (default) */
-} TfStreamOptions;
-TF_API TfStreamOptions tf_stream_default_options(void);
-
-TF_API TfStream *tf_stream_create(TfModel *m, const TfStreamOptions *options);
-TF_API void tf_stream_destroy(TfStream *s);
-TF_API int tf_stream_push_audio(TfStream *s, const float *samples, int n); /* chunks run, or < 0 */
-TF_API int tf_stream_finish(TfStream *s);                                    /* the end of the take */
-TF_API void tf_stream_reset(TfStream *s);                                    /* a new take */
-/* The take's selected heads so far (plus the scorer's), valid until the next push, finish or reset. */
-TF_API int tf_stream_heads(const TfStream *s, ZfTajweedHeads *out);
-/* The engine's greedy transcript ids (equal to tf_decoded's token ids). Returns the count. */
-TF_API int tf_stream_greedy(const TfStream *s, int *ids, int max);
-
-/* ============================================================================ decoded layer */
-
+/* One 40 ms frame of log_probs. */
 typedef struct {
   int top1;                 /* largest log-prob, lowest id on ties */
   float top1_log_prob;
-  int runner_up;            /* largest of the other 37, lowest id on ties */
+  int runner_up;            /* largest of the others, lowest id on ties */
   float runner_up_log_prob;
   double margin;            /* top1_log_prob - runner_up_log_prob */
 } TfFrame;
 
+/* One greedy token: a run of frames with the same best token, blank removed. */
 typedef struct {
-  int id;                   /* token id (tokens.txt) */
-  int frame0, frame1;       /* 40 ms frames of the run, inclusive */
-  int start_ms, end_ms;     /* 40 * frame0, 40 * (frame1 + 1) */
+  int id;                   /* token id (the vocabulary) */
+  const char *name;         /* its name, NULL when decoded without a Model */
+  int first_ms, peak_ms, last_ms; /* where its first, peak and last frame begin */
+  int first_frame, last_frame;    /* frames of the run, inclusive */
   int peak_frame;           /* the run's frame with the largest top-1 log-prob */
+  int start_ms, end_ms;     /* the run: frame_ms * first_frame, frame_ms * (last_frame + 1) */
   float log_prob;           /* at the peak */
   int runner_up;            /* at the peak */
   float runner_up_log_prob;
   double margin;
-  double confidence;        /* mean sigmoid(conf) over the token's 20 ms frames; NAN without conf */
+  double confidence;        /* mean sigmoid(conf) over the token's frames; NAN without the conf head */
 } TfToken;
 
+/* The tokens between two word bars. */
 typedef struct {
   int first_token, n_tokens;
   int start_ms, end_ms;
   double confidence;        /* min over its tokens (NAN without conf) */
   double margin;            /* min over its tokens */
-} TfSegment;                /* tokens between "|" (V4 rarely emits "|": use the tajweed layer's words) */
+} TfWord;
 
-typedef struct TfDecoded TfDecoded;
-TF_API TfDecoded *tf_decode(const TfModel *m, const ZfTajweedHeads *heads); /* m may be NULL (no unit names) */
-TF_API TfDecoded *tf_stream_decode(const TfStream *s);
-TF_API void tf_decoded_free(TfDecoded *d);
-TF_API int tf_decoded_frames(const TfDecoded *d, const TfFrame **frames);
-TF_API int tf_decoded_tokens(const TfDecoded *d, const TfToken **tokens);
-TF_API int tf_decoded_segments(const TfDecoded *d, const TfSegment **segments);
-/* {"frames":[...],"tokens":[{"id","unit",...}],"words":[...],"transcript"} (frames only with with_frames; each
- * frame carries "ranked": its k best tokens, see tf_decode_k) */
-TF_API const char *tf_decoded_json(TfDecoded *d, int with_frames);
-/* The decoded layer to depth k (2 to 38; tf_decode is k = 2): each frame also ranks its k best tokens of
- * log_probs (tf_decoded_ranked). */
-TF_API TfDecoded *tf_decode_k(const TfModel *m, const ZfTajweedHeads *heads, int k);
-TF_API TfDecoded *tf_stream_decode_k(const TfStream *s, int k);
-/* The per-frame ranking of the decoded layer: [frames, k] ids, log-probs and margins. Returns k. */
-TF_API int tf_decoded_ranked(const TfDecoded *d, const int **ids, const float **log_probs, const double **margins);
-
-/* ============================================================================ top-K (any ranked head) */
-
-/* Per frame the k best entries of a token head (log_probs, inter1, inter4, id, timing: 38 tokens) or a class
- * head (gem 2, attr_tafkheem 3, attr_ghunna 5, attr_qalqalah 3, attr_face 4: tf_head_info(head)->classes):
- * highest value first, equal values by the lower id (a stable argsort). margins[j] = values[j] - the value
- * ranked j + 1, as a double from the float values (also when that one is beyond k), 0 for the last rank of
- * the row. boundary and conf have no ranking. Arrays are [frames, k], row major. */
+/* The decoded layer: what the model heard, ready to show. Plain data; it belongs to the chunk or the Heads it
+ * came with. */
 typedef struct {
-  int head;                 /* TF_HEAD_* */
-  int frames, k, cols;
-  const int *ids;
-  const float *values;      /* log-probs or probabilities */
-  const double *margins;
-} TfTopK;
-/* For heads from anywhere (zf_tajweed_topk). NULL on error (an absent head, k out of 1..cols). */
-TF_API TfTopK *tf_topk(const ZfTajweedHeads *heads, int head, int k);
-/* For a stream's take so far (zf_tajweed_stream_topk): the head must be computed by the stream (its selection). */
-TF_API TfTopK *tf_stream_topk(const TfStream *s, int head, int k);
-TF_API void tf_topk_free(TfTopK *t);
-/* {"head","k","cols","classes":[...]?,"ids":[[...]],"values":[[...]],"margins":[[...]]} (valid until freed) */
-TF_API const char *tf_topk_json(TfTopK *t);
+  const char *text;         /* the token names, separated by spaces */
+  int n_tokens;
+  const TfToken *tokens;
+  int n_words;
+  const TfWord *words;
+  int n_frames;
+  const TfFrame *frames;
+  int top_k;                /* 0, or the depth asked for with TfSessionOptions.top_k */
+  const int *ranked_ids;            /* [n_frames, top_k]: each frame's best tokens, best first (NULL when top_k 0) */
+  const float *ranked_log_probs;    /* [n_frames, top_k] */
+  const double *ranked_margins;     /* [n_frames, top_k]: to the next rank; 0 for the last rank of all 38 */
+  int settled;              /* the first `settled` tokens will not change in this take; the rest still can */
+  int is_final;             /* 1 on the last one of the take */
+} TfDecoded;
 
-/* ============================================================================ tajweed layer */
+/* {"tokens":[{"id","unit","frame0","frame1","startMs","endMs","peakFrame","logProb","runnerUp","runnerUpUnit",
+ *  "runnerUpLogProb","margin","confidence"}],"words":[...],"transcript","settled","isFinal"}, and with with_frames
+ * "frames":[{"top1","top1LogProb","runnerUp","runnerUpLogProb","margin","ranked":[...]}] first. Valid until the
+ * next call on the same decoded layer. */
+TF_API const char *tf_decoded_json(const TfDecoded *decoded, int with_frames);
 
+TF_API int tf_heads_count(const TfHeads *h);                  /* the heads it holds */
+TF_API const char *tf_heads_name(const TfHeads *h, int i);
+/* One raw head by name. TF_ERR_INVALID_ARGUMENT for a name the Heads do not hold. */
+TF_API int tf_heads_get(const TfHeads *h, const char *name, TfHead *out);
+/* Greedy tokens of a ctc head (NULL: "log_probs"): returns the count and sets *tokens. confidence is NAN except
+ * for log_probs with conf selected. */
+TF_API int tf_heads_greedy(const TfHeads *h, const char *name, const TfToken **tokens);
+/* The decoded layer of exactly these Heads (for the take's Heads: the final one). */
+TF_API const TfDecoded *tf_heads_decoded(const TfHeads *h);
+
+/* A chunk, valid during the on_chunk call. */
 typedef struct {
-  int word;                 /* word index on the scored path (the engine's site.word) */
-  int has_score;
-  double score;             /* the largest clipped fused LLR over every single edit inside the word (engine API 3;
-                               with an API 2 engine: over the word's site alternatives) */
-  int evidence_site;        /* index into tf_result_engine's site array, -1 when no site */
-  int has_threshold;        /* calibration.json carries a word block */
-  double threshold;
-  int flagged;              /* score >= threshold; -1 unknown (no word calibration or the check off), 0, 1 */
-  int start_ms, end_ms;     /* the word's sites' frames on the best path; -1 unknown */
-  int n_flagged_sites, n_flagged_madd, n_flagged_qalqalah, n_flagged_gemination;
-  /* the best edit (engine API 3): its class, kind (ZF_TJ_EDIT_*), the unit edited, the unit put in (-1 for a
-   * deletion) and the per-head LLRs; -1 / NAN when the word has no score */
-  int evidence_class, evidence_edit, evidence_expected, evidence_alt;
-  double evidence_llr_final, evidence_llr_inter1;
-} TfWordScore;
+  int index;                /* chunk number in the take, from 0 */
+  int start_ms, end_ms;     /* on the take's clock */
+  int first_frame;          /* its first 40 ms frame in the take */
+  TfBackend backend;        /* what ran it */
+  int speech;               /* 1 when the chunk holds speech frames */
+  const TfHeads *heads;     /* the Heads of this chunk only */
+  const TfDecoded *decoded; /* the decoded layer of the take so far */
+} TfChunk;
 
-typedef struct TfResult TfResult;
-/* Score a take of surah:ayah (the whole ayah). backend NULL: the settings' backend. */
-TF_API TfResult *tf_score(TfModel *m, const ZfTajweedHeads *heads, int surah, int ayah, const char *backend);
-TF_API TfResult *tf_stream_score(TfStream *s, int surah, int ayah);
-TF_API void tf_result_free(TfResult *r);
-TF_API const ZfTajweedResult *tf_result_engine(const TfResult *r); /* sites, madd, qalqalah, gemination */
-TF_API int tf_result_words(const TfResult *r, const TfWordScore **words);
-/* {"surah","ayah","context","backend","settings","sites":[...],"madd":[...],"qalqalah":[...],"gemination":[...],
- *  "words":[...],"summary":{...},"raw":<the engine's JSON>} */
-TF_API const char *tf_result_json(TfResult *r);
-
-/* ============================================================================ model downloads */
-
-typedef void (*TfProgressCallback)(void *user, const char *path, long long done, long long total);
-
+/* What happened to the take. */
+enum {
+  TF_EVENT_SPEECH_STARTED = 1,  /* the first speech frame after silence: at_ms */
+  TF_EVENT_SPEECH_ENDED = 2,    /* silence after speech: at_ms (where the speech ended), silence_ms */
+  TF_EVENT_INTERRUPTED = 3,     /* never raised by this SDK (no microphone) */
+  TF_EVENT_RESUMED = 4,         /* never raised by this SDK */
+  TF_EVENT_BACKEND_CHANGED = 5, /* never raised by this SDK (no accelerator) */
+  TF_EVENT_ENDED = 6            /* the take ended without tf_session_finish: reason */
+};
+enum {
+  TF_ENDED_SILENCE = 1,     /* end_on_silence_ms */
+  TF_ENDED_BACKGROUND = 2,  /* never raised by this SDK */
+  TF_ENDED_HIDDEN = 3,      /* never raised by this SDK */
+  TF_ENDED_INTERRUPTED = 4, /* never raised by this SDK */
+  TF_ENDED_SOURCE_END = 5,  /* the clip of tf_session_listen ran out */
+  TF_ENDED_LIMIT = 6,       /* the take reached 20 minutes of audio, the most a take holds */
+  TF_ENDED_ERROR = 7        /* error holds the TfError */
+};
 typedef struct {
-  size_t struct_size;
-  const char *cdn_url;        /* the model base: default https://cdn.quranlab.ai/models ({base}/{repo}/{revision}/{folder}/...);
-                                 https://cdn.quranlab.ai still works (its /hf/ path), and the signed config's base fits here */
-  const char *key;            /* developer key (qlk_v1_...) */
-  const char *repo;           /* "Quran-Lab/tajweedformer-v4" */
-  const char *revision;       /* commit, from the signed config's models entry */
-  const char *folder;         /* "sdk/v4.0" */
-  const char *dest;           /* local folder to fill (resumable; .part files kept between runs) */
-  const char *contexts;       /* comma list; NULL = every context (the native profile: the full CPU set) */
-  const char *trusted_key_hex;
-  TfProgressCallback progress;
-  void *user;
-} TfDownloadOptions;
-TF_API TfDownloadOptions tf_download_default_options(void);
-/* Fetches and verifies the manifest, then every file of the profile (CPU engine files and common files;
- * never CoreML or NPU files), resuming partial files with HTTP Range and checking each SHA-256. */
-TF_API int tf_download_model(const TfDownloadOptions *o);
+  int type;                 /* TF_EVENT_* */
+  const char *name;         /* "speechStarted", "speechEnded", "ended": the same names in every SDK */
+  int at_ms;                /* speechStarted, speechEnded */
+  int silence_ms;           /* speechEnded: the silence that ended it */
+  int reason;               /* ended: TF_ENDED_* */
+  const char *reason_name;  /* ended: "silence", "sourceEnd", "limit", "error" */
+  int error;                /* ended with TF_ENDED_ERROR: the TfError */
+} TfEvent;
 
-/* ============================================================================ portal (platform client) */
+/* ============================================================================ Client */
 
-/* Consent: Quran Lab's signed config decides whether sharing is offered to the app (flags.contributions); the
- * learner decides on the sheet. The SDK asks at the right moment (after a finished session with feedback, never on
- * first launch) and shows the sheet at most three times per install, ever: "not now" may lead to a re-ask >= 7
- * sessions later until the third showing; a "share" answer or turning sharing off ends asking for good, across copy
- * decks, wording and SDK upgrades (a grant keeps the version it was given to). This library has no UI of its own
- * (so there is nothing to theme): the app shows its own sheet with the SDK's strings (copy_json below, or
- * tf_client_sharing_copy_json, with the app's own wording applied) and reports the learner's tap through
- * tf_client_sharing_answer, now or later. Every ask is counted (the status' asks, telemetry share_asked) and the
- * re-ask rules are the SDK's. Nothing is recorded or sent before a "share" answer. */
+typedef struct TfClient TfClient;
+typedef struct TfModel TfModel;
+
+/* Anonymous telemetry (sums and histograms per day; no audio, text or identifier). On by default; Quran Lab's
+ * signed config can stop it too. */
+typedef enum { TF_ANALYTICS_ON = 0, TF_ANALYTICS_OFF = 1 } TfAnalytics;
+
+/* The SDK asks the learner whether to share recitations (section Sharing). This library has no UI: the app shows
+ * its own sheet with these strings and reports the tap with tf_sharing_answer. */
 typedef struct {
-  int reask;                /* 0: the first ask, 1 or 2: a gentle re-ask */
-  int guardian;             /* the app's audience is children: address the parent or guardian */
-  const char *copy_json;    /* the copy deck for the client's language, with the app's own wording applied */
-  /* 2.0.1 (read only by apps built against 2.0.1 or later): */
-  int update;               /* deprecated: always 0 since 2.0.1 (a grant persists across decks and wording) */
-  const char *consent_version; /* the version a "share" answer grants (the deck's, or custom-<24 hex>) */
+  int reask;                   /* 0: the first ask, 1 or 2: a gentle re-ask */
+  int guardian;                /* the audience is children: address the parent or guardian */
+  const char *copy_json;       /* the copy deck for the client's language, with the app's own wording applied */
+  const char *consent_version; /* the version a "share" answer grants */
 } TfConsentRequest;
-typedef void (*TfConsentCallback)(void *user, const TfConsentRequest *req);
-
-/* The client's log (2.0.1): messages for the developer, never for the learner, never sent anywhere. */
-typedef enum { TF_LOG_DEBUG = 0, TF_LOG_INFO = 1, TF_LOG_WARNING = 2, TF_LOG_ERROR = 3 } TfLogLevel;
-typedef void (*TfLogCallback)(void *user, int level, const char *message);
 
 typedef struct {
-  size_t struct_size;
-  const char *key;            /* the developer key from portal.quranlab.ai (desktop key) */
-  const char *app_id;         /* Windows package family name / AppUserModelID, or Linux reverse-DNS id */
-  const char *platform;       /* "windows" or "linux"; NULL = this system */
-  const char *app_name, *app_version;
-  const char *api_url;        /* default https://api.quranlab.ai */
-  const char *storage_dir;    /* where the SDK keeps its state (config cache, counters, outbox, consent) */
-  const char *trusted_key_hex;/* config signing key; NULL = Quran Lab's */
-  int telemetry;              /* 1 (default): anonymous telemetry (deltas of the day's sums); flags.analytics can stop it */
-  int contributions;          /* ignored since 2.0.1: Quran Lab's signed config decides per app whether sharing is
-                               offered (flags.contributions); the learner still decides on the sheet */
-  int children;               /* the app's audience is children (consent addressed to a guardian) */
-  const char *language;       /* copy deck language, BCP 47; NULL = "en" */
-  TfConsentCallback on_consent;
-  void *user;
-  /* 2.0.1 (apps built against 2.0.0 leave these 0 through struct_size): */
-  int debug_build;            /* 1 in the app's debug builds (as TfModelOptions.debug_build), for example
-                                 #ifndef NDEBUG co.debug_build = 1; #endif. The library is always built as a release,
-                                 so the app says which build it is. 0: the client logs nothing */
-  TfLogCallback on_log;       /* where the log goes in debug builds; NULL: stderr */
-  void *log_user;
+  const char *key;             /* the desktop key from sdk.quranlab.ai (qlk_v1_...); required */
+  const char *app_id;          /* the app's id as registered for the key (Windows: package family name or
+                                  AppUserModelID; Linux: a reverse-DNS id); required */
+  const char *app_version;     /* NULL: "0" */
+  const char *storage;         /* a folder the app can write: the SDK's state and the model files; NULL:
+                                  %LOCALAPPDATA%/<app_id>/tajweedformer, or $XDG_DATA_HOME (~/.local/share) on Linux */
+  TfAnalytics analytics;
+  const char *audience;        /* NULL or "general"; "children": consent is addressed to a guardian */
+  const char *language;        /* the copy deck's language, BCP 47; NULL: "en" */
+  void (*on_consent)(void *user, const TfConsentRequest *request); /* the SDK asks to show the sharing sheet */
+  int debug;                   /* 1 in the app's debug builds: the client logs for the developer (a newer SDK,
+                                  a pin the server could not honour); 0: it logs nothing */
+  void (*on_log)(void *user, int level, const char *message); /* where that log goes; NULL: stderr. level 0 debug,
+                                  1 info, 2 warning, 3 error */
+  void *user;                  /* passed to on_consent and on_log */
+  const char *trusted_key_hex; /* tests only: another Ed25519 public key (64 hex) for the signed config and the
+                                  model manifest; NULL: Quran Lab's */
 } TfClientOptions;
 
-TF_API TfClientOptions tf_client_default_options(void);
-TF_API TfClient *tf_client_create(const TfClientOptions *o);
+/* One Client per process: a second one while the first is not destroyed is TF_ERR_CLIENT_EXISTS. Never waits for
+ * the network: registration, the signed config and the telemetry go in the background. */
+TF_API TfClient *tf_client_create(const TfClientOptions *options);
 TF_API void tf_client_destroy(TfClient *c);
-/* Launch sequence: token, register (once per UTC day), config, telemetry left from earlier runs, due uploads. Each
- * step independent; never blocks recognition. Opening a client counts one launch in the telemetry. */
-TF_API int tf_client_launch(TfClient *c);
-/* POST /v1/register at most once per UTC day per install (a day stamp in the storage directory, written after a
- * 200); a second call the same day returns 0 without a request. */
-TF_API int tf_client_register(TfClient *c);
-/* GET /v1/config, verified (Ed25519 over the exact body, key id, expiry); kept on disk. */
-TF_API int tf_client_refresh_config(TfClient *c);
-TF_API const char *tf_client_config_json(TfClient *c); /* the last verified config, or NULL */
-/* The verified config may carry "sdk_latest": {"version","severity","url"} for the app's platform (2.0.1). When that
- * version is newer than this SDK's (dotted numbers; anything else is not newer), a debug build (debug_build 1) logs
- * once per client, at TF_LOG_WARNING: "Quran Lab SDK X is available (severity), you have Y: URL". Release builds
- * stay silent; a missing or malformed field is ignored. Unknown top-level fields of the config are ignored. */
-/* Puts the verified config's tajweed block into the model's portal layer. */
-TF_API int tf_client_apply_config(TfClient *c, TfModel *m);
-/* Telemetry (anonymous, docs/platform-client.md): one call per finished session. The SDK reads the numbers it needs
- * from the session's model, decoded layer and result (no audio, no text, no ids leave the device: only sums and
- * histograms per UTC day). It sends deltas: what was counted since the previous delta of the same UTC day, sealed
- * with a random report_id and kept on disk until the server takes it (a retry sends the same bytes). Send points:
- * every 15 minutes while a client is open (its own timer once tf_client_launch ran, or the next
- * tf_client_session_finished), tf_client_background, tf_client_destroy, and tf_client_launch (leftovers). */
-typedef struct {
-  size_t struct_size;
-  const TfModel *model;       /* the session's model (revision, context, preset, word level, checks) */
-  const TfDecoded *decoded;   /* optional: token margins and confidences */
-  const TfResult *result;     /* optional: classes, madd, words, flag rate, coverage (surah) */
-  double audio_s, compute_s;  /* audio length and engine wall time of the session */
-  int chunks;
-  double model_load_ms;       /* > 0 when the session loaded the model */
-  int cold_start;             /* the first session of this launch */
-  int aborted;                /* the session never finished */
-  int fallback;               /* 0 none, else a TF_FALLBACK_* reason */
-  int feedback_shown;         /* the learner saw the model's feedback (drives the sharing ask) */
-} TfSessionStats;
-enum { TF_FALLBACK_NONE = 0, TF_FALLBACK_NON_FINITE, TF_FALLBACK_DEADLINE, TF_FALLBACK_MODEL_LOAD, TF_FALLBACK_MEMORY,
-       TF_FALLBACK_THERMAL, TF_FALLBACK_OTHER };
-/* The developer opt-out in code (never a prompt): TfClientOptions.telemetry = ZF_ANALYTICS_OFF. */
-#define ZF_ANALYTICS_OFF 0
-TF_API void tf_client_session_finished(TfClient *c, const TfSessionStats *st);
-/* Seals what was counted (include_today: also today's counts; 0: only earlier days) and sends every sealed delta,
- * oldest first. Returns the deltas accepted. */
-TF_API int tf_client_flush(TfClient *c, int include_today);
-/* The app goes to the background or idle (a window minimized, the app about to sleep): seals and sends a delta now.
- * Returns the deltas accepted, or < 0. */
-TF_API int tf_client_background(TfClient *c);
-TF_API int tf_client_report_issue(TfClient *c, const char *kind, const char *code, const char *message);
-/* Sharing. */
-TF_API const char *tf_sharing_copy_json(const char *language); /* the bundled deck (consent sheet, settings, thank-you) */
-/* The learner's answer to a sheet (the SDK's ask through on_consent or a pending ask, shown in the app's own UI):
- * 1 share, 0 not now. Only from the learner's own tap. Counted as share_yes / share_no. */
-TF_API int tf_client_sharing_answer(TfClient *c, int share);
-TF_API int tf_client_sharing_set(TfClient *c, int on);        /* the settings switch (not a sheet answer); off stops uploads at once */
-TF_API int tf_client_sharing_state(TfClient *c);              /* 1 on (granted, to any version), 0 off or not granted */
-/* {"consent","enabled","asks","sessions","pendingAsk","thanked","guardian","sharedSessions","uploadTrust","mayUpload",
- *  "consentVersion" (agreed to, what shared sessions carry),"consentTextSha256","effectiveConsentVersion" (what a new
- *  grant would record),"updateNeeded" (deprecated: always false since 2.0.1)} */
-TF_API const char *tf_client_sharing_status_json(TfClient *c);
-TF_API int tf_client_sharing_delete(TfClient *c);             /* "Delete what I shared" (device-key deletion) */
-/* The app chooses the moment (timing only): no ask once asking ended (a yes, sharing off, three sheets shown). */
-TF_API int tf_client_sharing_ask_now(TfClient *c);
-/* The app's own wording (2.0.1): replaces deck strings by key ("sheet.what", "impact.minutes.other", ...: the deck's
- * keys, impact.minutes by plural category). An unknown key, an empty or blank text, text that is not UTF-8 or a key
- * given twice is TF_ERR_ARGUMENT and nothing changes; n = 0 (or keys NULL) clears. With overrides the learner agrees
- * to that text: the consent version becomes custom-<the first 24 hex digits of its SHA-256> (the canonical text of
- * docs/platform-client.md) and every session shared under a grant to it carries consent_text_sha256. A learner
- * who agreed earlier keeps the version recorded then and is not asked again; new grants record the new version.
- * Set it right after tf_client_create, before tf_client_launch, at every start. Disclosure lines must stay honest (the doc). */
-TF_API int tf_sharing_set_wording(TfClient *c, const char *const *keys, const char *const *texts, int n);
-/* Read only, for the developer to send to Quran Lab: the effective consent version, the canonical text and its
- * SHA-256 (64 hex). The text and hash are NULL without overrides. Valid until the next tf_sharing_set_wording. */
-TF_API const char *tf_sharing_consent_version(TfClient *c);
-TF_API const char *tf_sharing_consent_text(TfClient *c);
-TF_API const char *tf_sharing_consent_sha256(TfClient *c);
-/* The client's copy deck (its language) with the app's own wording applied and the effective consent_version: what
- * the app's own sheet shows. Without overrides, the bundled deck itself. */
-TF_API const char *tf_client_sharing_copy_json(TfClient *c);
-/* "Show my recovery code" (26 Crockford characters in groups of 4): for the learner only, behind the app's own
- * confirmation; used at portal.quranlab.ai/delete when the device is lost. TF_ERR_NOT_AVAILABLE before the first
- * shared session. */
-TF_API int tf_client_sharing_recovery_code(TfClient *c, char out[33]);
-/* GET /v1/contributions/summary: {"you":{"sessions","minutes"},"app":...|null,"all":...}, or NULL. */
-TF_API const char *tf_client_sharing_summary_json(TfClient *c);
-/* The shared-session upload (PLATFORM_CLIENT.md section 10; the 2.0.0 design): with consent on, each session the SDK
- * listens to is encoded as one Ogg Opus stream (libopus, 48 kHz mono, 20 ms frames, complexity 10, VBR), cut into
- * segments of 10, 20, 40, then 60 s, and uploaded in the background (presigned PUTs to R2, a thread of the client)
- * from an on-disk outbox in storage_dir/outbox that survives a crash or restart (tf_client_launch resumes it).
- * Desktop uploads at the capped trust tier: flags.upload_trust[windows|linux] absent or "capped" = upload; "off"
- * or "attested" = none. Turning sharing off (tf_client_sharing_set 0) aborts the PUT in flight and deletes the
- * unsent sessions at once. Streams created with TfStreamOptions.client do all of this by themselves; the calls
- * below are for apps that capture audio outside a TfStream. */
-/* Bitrate (2.0.1): an adaptive ladder of 192000, 96000, 64000 and 32000 bit/s, starting at the top for each client.
- * An upload's network failure (no connection, a timeout, HTTP 408 or 5xx) steps down; a closed segment while 120 s
- * or more of closed audio waits steps down; three segment uploads in a row while at most 30 s waits step up. The
- * rung in force when a segment opens is that segment's bitrate (tf_sharing_outbox_json "segmentBitrates"). */
-#define TF_SHARING_BITRATE_DEFAULT 192000 /* bit/s: the ladder's top and start */
-typedef struct TfShareSession TfShareSession;
-/* NULL (TF_ERR_NOT_AVAILABLE) when sharing is off: no consent, the option, flags.contributions or upload_trust. */
-TF_API TfShareSession *tf_sharing_session_begin(TfClient *c, int input_sample_rate, const char *input_route);
-TF_API int tf_sharing_session_push(TfShareSession *s, const float *samples, int n); /* mono, [-1, 1] */
-/* The end of the session (completed 1), or a cancelled one (0: kept only from 2 s). Frees the session; returns
- * the milliseconds shared (0: nothing). */
-TF_API int tf_sharing_session_finish(TfShareSession *s, int completed);
-/* No effect since 2.0.1 (the ladder decides, the same in every SDK); kept for compatibility: 0, or TF_ERR_ARGUMENT
- * outside 6000 to 510000. */
-TF_API int tf_sharing_set_bitrate(TfClient *c, int bits_per_second);
-TF_API int tf_sharing_bitrate(TfClient *c); /* the bitrate the next segment opens with (bit/s) */
-/* The outbox's sessions, oldest first: [{"id","created","ended","completed","segments" (closed),"uploaded",
- * "segmentBitrates":[bit/s per closed segment, in order],"error"}]. Free with tf_free; NULL on error. */
-TF_API char *tf_sharing_outbox_json(TfClient *c);
-TF_API int tf_sharing_outbox_pending(TfClient *c);                     /* sessions not uploaded yet */
-TF_API int tf_sharing_outbox_resume(TfClient *c);                      /* start or wake the uploader */
-/* Wakes the uploader and waits (at most timeout_ms) for a full pass; returns the sessions still pending. */
-TF_API int tf_sharing_outbox_wait(TfClient *c, int timeout_ms);
 
-/* PLATFORM_CLIENT.md's C name for the old sharing option. No effect since 2.0.1: the signed config decides. */
-TF_API void zf_platform_set_contributions(int on);
+typedef struct {
+  const char *version;         /* pin a model version ("4.0.0"); NULL: the one Quran Lab releases to this app.
+                                  tf_client_model and tf_client_prefetch only */
+  int threads;                 /* engine threads; 0: the fast cores */
+  int pin;                     /* 0: the engine's default (desktops and servers: threads not pinned to cores);
+                                  1: pinned; -1: not pinned. Timing only, never a bit */
+  const char *trusted_key_hex; /* tests only: another Ed25519 public key (64 hex) for the manifest; NULL: Quran
+                                  Lab's (tf_client_model uses the client's) */
+} TfModelOptions;
+
+/* The Model for this app: downloads on first use (resumable), verifies every file, opens and warms the engine, so
+ * call it early. Without a network and without a model on disk: TF_ERR_NEEDS_CONNECTION. While Quran Lab has no
+ * build for this SDK version: TF_ERR_MODEL_UNAVAILABLE. */
+TF_API TfModel *tf_client_model(TfClient *c, const TfModelOptions *options);
+
+typedef struct {
+  int unmetered_only;          /* 1: wait for an unmetered connection. This library cannot tell what kind of
+                                  connection the machine has (diagnose reports "unknown"), so here the download
+                                  goes ahead: an app that knows it is on a metered connection does not call
+                                  prefetch */
+  void (*on_progress)(void *user, long long bytes_done, long long bytes_total);
+  void *user;
+  const char *version;         /* as TfModelOptions.version */
+} TfPrefetchOptions;
+
+/* Downloads and verifies the model ahead of use. Safe at every start: a no-op when done; it resumes where an
+ * earlier call stopped. Returns 0 when the model is on disk. */
+TF_API int tf_client_prefetch(TfClient *c, const TfPrefetchOptions *options);
+/* What the SDK holds on disk: {"models":[{"version","build","bytes"}],"sharingQueueBytes":n}, one entry per model
+ * build, ordered by version then build. */
+TF_API const char *tf_client_storage_json(TfClient *c);
+/* Removes the model files (never the consent state or the sharing queue). Close the Model first. */
+TF_API int tf_client_remove_models(TfClient *c);
+
+/* One structured report, safe to paste into an issue: no audio, text or identifiers. */
+typedef struct {
+  const char *sdk_version;     /* "3.0.0" */
+  const char *sdk_latest;      /* the SDK release the signed config in force names, or NULL when it names none */
+  int key_accepted;            /* 1 accepted, 0 refused, -1 not known yet (no answer from the server) */
+  const char *key_reason;      /* why not: the server's code, or NULL */
+  const char *config;          /* "fresh" (a verified config that has not expired), "stale" (expired) or "none" */
+  const char *model_version;   /* NULL without a model on disk */
+  const char *model_build;
+  int model_verified;
+  const char *context;         /* the context in force, or NULL */
+  TfBackend backend;           /* kind NULL without a model on disk */
+  const char *microphone;      /* "none": this SDK has no microphone */
+  long long storage_models;    /* bytes */
+  long long storage_sharing;
+  const char *last_error;      /* the code of the last error this process raised, or NULL */
+  int dropped_chunks;          /* chunks dropped because the app did not read them: always 0 here (chunks come
+                                  by callback, none waits) */
+  const char *connection;      /* "unmetered", "metered", "none" or "unknown": always "unknown" here */
+  const char *json;            /* all of it as JSON */
+} TfDiagnosis;
+TF_API int tf_client_diagnose(TfClient *c, TfDiagnosis *out);
+TF_API const char *tf_client_diagnose_json(TfClient *c);
+
+/* App-reported counter: the results of the app's own judge. rule is lower-case letters, digits and underscores
+ * (at most 24, a letter first; use the calibration's class ids where they apply), 0 <= flagged <= checked <=
+ * 100000. Counts only; nothing is sent when the app never calls it. */
+TF_API int tf_client_report_checks(TfClient *c, const char *rule, int checked, int flagged);
+
+/* The app left the foreground (a window minimized, about to sleep) or returned to it. Background sends the
+ * telemetry counted so far and closes the shared recording that waits for another take. */
+TF_API int tf_client_background(TfClient *c);
+TF_API int tf_client_foreground(TfClient *c);
+
+/* ============================================================================ Model */
+
+/* Opens a model folder already on disk, verified the same way: the signed manifest, then every file's size and
+ * SHA-256; a file the manifest does not list is never opened. */
+TF_API TfModel *tf_model_open(const char *folder, const TfModelOptions *options);
+TF_API void tf_model_close(TfModel *m);
+
+TF_API const char *tf_model_id(const TfModel *m);       /* "v4.0" */
+TF_API const char *tf_model_version(const TfModel *m);  /* "4.0.0" */
+TF_API const char *tf_model_build(const TfModel *m);    /* the build id (40 hex); for diagnostics only */
+/* {"id","version","build","family","contexts":[...],"default_context","chunk_ms":{"<context>":ms},"heads":[{"name",
+ *  "kind","frame_ms","classes","class_names"}],"default_heads":[...],"tokens":[...],"blank","word_bar",
+ *  "calibration":{"format","sha256"}|null,"reference":bool,"sample_clips":[{"name","kind","duration_ms"}],
+ *  "signed","key_id","sdk_version"} */
+TF_API const char *tf_model_info_json(TfModel *m);
+/* Audio per chunk in a context (160, 320 or 480 ms); context NULL: the default one. 0 for an unknown context. */
+TF_API int tf_model_chunk_ms(const TfModel *m, const char *context);
+
+/* The vocabulary. */
+typedef struct {
+  int count;                   /* 38 */
+  int blank;                   /* 0 */
+  int word_bar;                /* the id of "|", -1 when the vocabulary has none */
+  const char *const *names;    /* [count] */
+} TfTokens;
+TF_API const TfTokens *tf_model_tokens(const TfModel *m);
+TF_API int tf_model_token_count(const TfModel *m);
+TF_API const char *tf_model_token_name(const TfModel *m, int id);   /* NULL out of range */
+TF_API int tf_model_token_id(const TfModel *m, const char *name);    /* -1 when unknown */
+
+/* calibration.json as shipped: read-only data for a judge of your own, never applied by the SDK. */
+typedef struct {
+  const char *json;            /* the file's bytes, NUL-terminated */
+  size_t size;
+  const char *format;          /* "quranlab.tajweed-calibration/1" */
+  const char *sha256;          /* of the file, as the signed manifest lists it */
+} TfCalibration;
+/* NULL when the folder has no calibration (not an error). */
+TF_API const char *tf_model_calibration_json(const TfModel *m);
+TF_API int tf_model_calibration(const TfModel *m, TfCalibration *out); /* 1 when present, 0 when not */
+/* A number of the calibration by its path, for example "contexts.c16_l64.sites.vowel_sub.thresholds.balanced" or
+ * "contexts.c16_l64.fusion.a.vowel_sub". 1 and *out set, or 0 when the path is not a number. */
+TF_API int tf_model_calibration_number(const TfModel *m, const char *path, double *out);
+
+/* The expected units of each ayah: read-only data, downloaded only when the app asks. The SDK never aligns them
+ * and never compares them with a take. */
+typedef struct TfReference TfReference;
+typedef struct {
+  int n;                       /* units of the ayah */
+  const int *ids;              /* [n] token ids */
+  const int *word;             /* [n] the 0-based word of each unit */
+  int n_words;
+} TfUnits;
+TF_API TfReference *tf_model_reference(TfModel *m);            /* NULL when the build has none (not an error) */
+TF_API int tf_reference_is_downloaded(const TfReference *r);
+TF_API int tf_reference_fetch(TfReference *r);                  /* download and verify, once; 0 when on disk */
+/* TF_ERR_REFERENCE_MISSING before the fetch; TF_ERR_INVALID_ARGUMENT for a surah or ayah that does not exist. */
+TF_API int tf_reference_units(TfReference *r, int surah, int ayah, TfUnits *out);
+
+/* The self-test clips of the folder: real recitations to run without a microphone. */
+typedef struct {
+  const char *name;            /* "Husary_001001" */
+  const char *kind;            /* "clean" or "planted" */
+  int duration_ms;
+} TfClip;
+TF_API int tf_model_sample_clip_count(const TfModel *m);
+TF_API int tf_model_sample_clip(const TfModel *m, int i, TfClip *out);
+
+TF_API int tf_model_backend(const TfModel *m, TfBackend *out); /* what the next Session will use */
+
+/* ============================================================================ Session */
+
+typedef struct TfSession TfSession;
+
+enum { TF_PACE_REAL_TIME = 0, TF_PACE_FAST = 1 };
+
+typedef struct {
+  const char *context;         /* NULL: the config's inference.context, then the manifest's default */
+  int sample_rate;             /* of pushed audio: 0 or 16000, or 8000 to 48000 (resampled by the engine) */
+  const char *heads;           /* head names separated by commas, or "all"; NULL: "log_probs,inter1_log_probs,
+                                  timing_log_probs,gem,attr_qalqalah,conf". A head not asked for is not computed
+                                  (log_probs always is) */
+  const char *backend;         /* NULL, "auto" or "cpu": the CPU engine either way */
+  int top_k;                   /* 0, or 1 to 38: the decoded layer ranks that many tokens per frame */
+  int end_on_silence_ms;       /* 0: off. Else 500 to 60000: the take finishes after that much silence following
+                                  speech (a held sound is speech: the timing head hears it) */
+  int pace;                    /* tf_session_listen only: TF_PACE_REAL_TIME (default) or TF_PACE_FAST */
+  void (*on_chunk)(void *user, const TfChunk *chunk);   /* each chunk as it is ready, on the pushing thread */
+  void (*on_event)(void *user, const TfEvent *event);   /* what happened to the take, on the pushing thread */
+  void *user;
+  const char *input_route;     /* where the audio comes from, for a shared recording: "built_in", "wired", "usb",
+                                  "bluetooth", "car", "continuity", "other"; NULL: "unknown" */
+} TfSessionOptions;
+
+/* A Session the app pushes audio into: one take. TF_ERR_SESSION_OPEN while the Model has an open Session. */
+TF_API TfSession *tf_session_create(TfModel *m, const TfSessionOptions *options);
+/* The same path with no microphone: runs a sample clip of the Model through a Session on the calling thread (at
+ * the clip's pace, or as fast as possible) and returns it ended: ended(sourceEnd), or ended(silence) earlier with
+ * end_on_silence_ms. Read tf_session_heads, then tf_session_destroy. */
+TF_API TfSession *tf_session_listen(TfModel *m, const TfClip *clip, const TfSessionOptions *options);
+/* Audio in: mono float samples in [-1, 1] at sample_rate. Returns the chunks run. TF_ERR_SESSION_CLOSED once the
+ * take has ended (by itself, or by finish or cancel). A take holds at most 20 minutes of audio: at that point it
+ * ends by itself as a finish would (the last chunk final, the Heads kept) with the event ended(limit), and the
+ * rest of the pushed buffer is not taken. */
+TF_API int tf_session_push(TfSession *s, const float *samples, int n);
+/* The end of the take: the last chunks arrive (the last one's decoded layer has is_final), then the take's Heads
+ * are ready. Returns the chunks run. On a take that already ended by itself: 0. */
+TF_API int tf_session_finish(TfSession *s);
+TF_API const TfHeads *tf_session_heads(TfSession *s);   /* the take's Heads once it has ended; NULL before */
+TF_API int tf_session_cancel(TfSession *s);             /* end the take, keep nothing */
+TF_API int tf_session_backend(const TfSession *s, TfBackend *out);
+/* App-reported counter: where the learner recited in this take (surah 1 to 114, 1 <= ayah_from <= ayah_to <= the
+ * surah's ayahs). At most one report per take: a second replaces the first. Counts only. */
+TF_API int tf_session_report_recited(TfSession *s, int surah, int ayah_from, int ayah_to);
+TF_API void tf_session_destroy(TfSession *s);            /* an open take is cancelled */
+
+/* ============================================================================ Sharing */
+
+/* Recitation sharing. Quran Lab's signed config decides whether learners in this app are asked; the learner
+ * decides. The sheet is shown at most three times per install; a yes is never asked again. With a yes, every take
+ * of a Session whose Model came from tf_client_model is shared in full in the background (one Ogg Opus recording
+ * for takes in a row, an on-disk queue that survives restarts). Nothing is recorded or sent before a yes. */
+typedef struct {
+  int is_available;            /* Quran Lab's config allows sharing for this app */
+  int is_on;                   /* the learner said yes (and sharing is available) */
+  int asks;                    /* sheets shown so far */
+  int pending_ask;             /* an ask waits for an answer (without on_consent: show the sheet now) */
+  int guardian;                /* the grant was given by a guardian */
+  int shared;                  /* recordings uploaded from this install */
+  const char *consent_version; /* what a new grant would record */
+  const char *consent_text;    /* with the app's own wording: the canonical text to send to Quran Lab; else NULL */
+  const char *consent_sha256;  /* its SHA-256; NULL without the app's own wording */
+} TfSharing;
+TF_API int tf_sharing_status(TfClient *c, TfSharing *out);
+TF_API int tf_sharing_is_available(TfClient *c);
+TF_API int tf_sharing_is_on(TfClient *c);
+/* The settings switch. Off stops uploads at once and deletes the unsent queue. */
+TF_API int tf_sharing_set_on(TfClient *c, int on);
+/* Ask now, if an ask is still allowed (the app chooses the moment only). TF_ERR_SHARING_UNAVAILABLE when the
+ * config does not offer sharing to this app. */
+TF_API int tf_sharing_ask(TfClient *c);
+/* The learner's answer to a sheet, only from the learner's own tap: 1 share, 0 not now. */
+TF_API int tf_sharing_answer(TfClient *c, int share);
+/* The client's copy deck with the app's own wording applied: what the app's sheet and settings show. */
+TF_API const char *tf_sharing_copy_json(TfClient *c);
+/* Audio the app already captures outside takes (before the first, between two, after the last), mono float at
+ * sample_rate: the last second before a take and the half second after it go into the shared recording, and
+ * what lies between two takes in a row. Dropped at once without a yes. The model never sees it. */
+TF_API int tf_sharing_feed(TfClient *c, const float *samples, int n, int sample_rate);
+/* The queue: [{"id","created","ended","completed","segments","uploaded","takes","error"}], oldest first. */
+TF_API const char *tf_sharing_items_json(TfClient *c);
+/* The learner's summary: {"you":{"sessions","minutes"},"app":...|null,"all":...}, or NULL. */
+TF_API const char *tf_sharing_summary_json(TfClient *c);
+/* "Delete what I shared": deleted from Quran Lab's servers at once, with the unsent queue. */
+TF_API int tf_sharing_delete(TfClient *c);
+/* The code for deletion when the device is lost (26 characters in groups of 4), for the learner only; "" before
+ * the first shared recording. */
+TF_API int tf_sharing_recovery_code(TfClient *c, char out[33]);
+/* The app's own wording: replaces deck strings by key ("sheet.what", ...). An unknown key, an empty text, text
+ * that is not UTF-8 or a key given twice is TF_ERR_INVALID_ARGUMENT and nothing changes; n = 0 clears. Call it
+ * right after tf_client_create at every start, and send TfSharing.consent_text to Quran Lab for review. */
+TF_API int tf_sharing_set_wording(TfClient *c, const char *const *keys, const char *const *texts, int n);
 
 #ifdef __cplusplus
 }

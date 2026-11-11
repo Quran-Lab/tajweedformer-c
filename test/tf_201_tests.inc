@@ -21,7 +21,6 @@
 extern int tf__client_no_timer;
 int tf__ladder_event(TfClient *c, int event, double backlog_s);
 void tf__telemetry_add(TfClient *c, const char *field, long long n);
-char *tf__settings_json_alloc(TfModel *m);
 
 static char *read_text(const char *path, size_t *n) {
   char *t = NULL;
@@ -165,9 +164,9 @@ static int marker_bitrate(const char *outbox, const char *id, int n) {
   return v;
 }
 static int only_session(TfClient *c, char id[33]) {
-  char *js = tf_sharing_outbox_json(c);
+  char *js = tf__sharing_outbox_json(c);
   TfJson *j = js ? tf_json_parse(js, strlen(js), NULL) : NULL;
-  tf_free(js);
+  free(js);
   const int ok = j && j->type == TJ_ARR && j->n == 1 && tf_json_str(tf_json_get(&j->kids[0], "id"));
   if (ok) snprintf(id, 33, "%s", tf_json_str(tf_json_get(&j->kids[0], "id")));
   tf_json_free(j);
@@ -188,7 +187,7 @@ static int bitrate_tests(const char *vdir, const char *dir) {
     int steps = 0, ok = 0;
     for (int i = 0; c && cases && i < cases->n; ++i) {
       tf__ladder_event(c, -1, 0);
-      CHECK(tf_sharing_bitrate(c) == 192000, "a fresh ladder starts at 192000");
+      CHECK(tf__sharing_bitrate(c) == 192000, "a fresh ladder starts at 192000");
       const TfJson *st = tf_json_get(&cases->kids[i], "steps");
       for (int k = 0; st && k < st->n; ++k) {
         const char *ev = tf_json_str(tf_json_get(&st->kids[k], "event"));
@@ -202,7 +201,7 @@ static int bitrate_tests(const char *vdir, const char *dir) {
       }
     }
     printf("bitrate ladder vs the shared vector: %d/%d steps in %d cases\n", ok, steps, cases ? cases->n : 0);
-    tf_client_destroy(c);
+    tf__client_close(c);
     tf_json_free(v);
     free(d1);
   }
@@ -225,9 +224,9 @@ static int bitrate_tests(const char *vdir, const char *dir) {
   free(clip);
   char *d2 = tf_path_join(dir, "stream");
   TfClient *c = share_client(d2);
-  CHECK(c && tf_client_sharing_answer(c, 1) == 0 && tf_client_sharing_state(c), "consent");
+  CHECK(c && tf__client_sharing_answer(c, 1) == 0 && tf__client_sharing_state(c), "consent");
   char *outbox = tf_path_join(d2, "outbox");
-  TfShareSession *ss = tf_sharing_session_begin(c, 48000, "built_in");
+  TfShareSession *ss = tf__sharing_session_begin(c, 48000, "built_in");
   CHECK(ss != NULL, "session: %s", tf_last_error() ? tf_last_error() : "");
   if (!ss) return 1;
   char id[33] = "";
@@ -240,7 +239,7 @@ static int bitrate_tests(const char *vdir, const char *dir) {
   size_t seg_n[8] = {0};
   int frame = 0;
   for (int k = 1; k <= 4; ++k) {
-    for (; frame < starts[k]; ++frame) tf_sharing_session_push(ss, x + (size_t)frame * 960, 960);
+    for (; frame < starts[k]; ++frame) tf__sharing_session_push(ss, x + (size_t)frame * 960, 960);
     if (k == 1) tf__ladder_event(c, 0, 0);                                         /* -> 96000 */
     if (k == 2) tf__ladder_event(c, 0, 0), tf__ladder_event(c, 0, 0);              /* -> 32000 */
     if (k == 3)
@@ -259,8 +258,8 @@ static int bitrate_tests(const char *vdir, const char *dir) {
       for (int i = 0; i < 6; ++i) tf__ladder_event(c, 1, 0);                       /* -> 96000 -> 192000 */
     }
   }
-  for (; frame < total / 960; ++frame) tf_sharing_session_push(ss, x + (size_t)frame * 960, 960);
-  const int ms = tf_sharing_session_finish(ss, 1);
+  for (; frame < total / 960; ++frame) tf__sharing_session_push(ss, x + (size_t)frame * 960, 960);
+  const int ms = share_finish(c, ss, 1);
   CHECK(ms == 150000, "shared %d ms", ms);
   for (int s = 4; s <= 5; ++s) {
     char name[32];
@@ -284,11 +283,11 @@ static int bitrate_tests(const char *vdir, const char *dir) {
     markers_ok += b == want_br[s - 1];
   }
   {
-    char *js = tf_sharing_outbox_json(c);
+    char *js = tf__sharing_outbox_json(c);
     char want[128];
     snprintf(want, sizeof want, "\"segmentBitrates\":[%d,%d,%d,%d,%d]", want_br[0], want_br[1], want_br[2], want_br[3], want_br[4]);
     CHECK(js && strstr(js, want), "outbox item: %s", js ? js : "NULL");
-    tf_free(js);
+    free(js);
   }
   /* the stream joined */
   size_t all_n = 0;
@@ -381,7 +380,7 @@ static int bitrate_tests(const char *vdir, const char *dir) {
   printf("bitrate stream: markers %d/5 at their rungs\n", markers_ok);
   free(all);
   for (int s = 1; s <= 5; ++s) free(segs[s]);
-  tf_client_destroy(c);
+  tf__client_close(c);
   free(outbox);
   free(d2);
   free(x);
@@ -394,15 +393,15 @@ static int bitrate_tests(const char *vdir, const char *dir) {
   lcg_noise(y, 48000 * 20, 0.2);
   char *d3 = tf_path_join(dir, "wiring");
   c = share_client(d3);
-  tf_client_sharing_answer(c, 1);
-  tf_sharing_outbox_resume(c);
+  tf__client_sharing_answer(c, 1);
+  tf__sharing_outbox_resume(c);
   g_st.put_status = 503;
-  ss = tf_sharing_session_begin(c, 48000, NULL);
+  ss = tf__sharing_session_begin(c, 48000, NULL);
   int fr = 0;
-  for (; fr < 51; ++fr) tf_sharing_session_push(ss, y + (size_t)fr * 960, 960); /* segment 1 closed, 2 opened */
-  for (int i = 0; i < 1000 && tf_sharing_bitrate(c) != 96000; ++i) SLEEP_MS(10);
-  CHECK(tf_sharing_bitrate(c) == 96000, "after the 503: %d (%d PUTs failed)", tf_sharing_bitrate(c), g_st.put_failed);
-  for (; fr < 101; ++fr) tf_sharing_session_push(ss, y + (size_t)fr * 960, 960); /* segment 3 opened */
+  for (; fr < 51; ++fr) tf__sharing_session_push(ss, y + (size_t)fr * 960, 960); /* segment 1 closed, 2 opened */
+  for (int i = 0; i < 1000 && tf__sharing_bitrate(c) != 96000; ++i) SLEEP_MS(10);
+  CHECK(tf__sharing_bitrate(c) == 96000, "after the 503: %d (%d PUTs failed)", tf__sharing_bitrate(c), g_st.put_failed);
+  for (; fr < 101; ++fr) tf__sharing_session_push(ss, y + (size_t)fr * 960, 960); /* segment 3 opened */
   char *ob = tf_path_join(d3, "outbox");
   char wid[33] = "";
   only_session(c, wid);
@@ -412,23 +411,23 @@ static int bitrate_tests(const char *vdir, const char *dir) {
   /* the network is back: the retry is due (clock moved past the backoff), three PUTs succeed */
   g_st.put_status = 0;
   tf__now_override = (long long)time(NULL) + 3600;
-  tf_sharing_outbox_resume(c);
-  for (; fr < 151; ++fr) tf_sharing_session_push(ss, y + (size_t)fr * 960, 960); /* segment 3 closed, 4 opened */
-  tf_sharing_outbox_resume(c);
-  for (int i = 0; i < 1000 && tf_sharing_bitrate(c) != 192000; ++i) SLEEP_MS(10);
-  CHECK(tf_sharing_bitrate(c) == 192000, "after the successes: %d (%d PUTs)", tf_sharing_bitrate(c), g_st.puts);
+  tf__sharing_outbox_resume(c);
+  for (; fr < 151; ++fr) tf__sharing_session_push(ss, y + (size_t)fr * 960, 960); /* segment 3 closed, 4 opened */
+  tf__sharing_outbox_resume(c);
+  for (int i = 0; i < 1000 && tf__sharing_bitrate(c) != 192000; ++i) SLEEP_MS(10);
+  CHECK(tf__sharing_bitrate(c) == 192000, "after the successes: %d (%d PUTs)", tf__sharing_bitrate(c), g_st.puts);
   const int opened_up = fr / 50 + 1; /* the segment the next boundary opens */
-  for (; fr < 50 * opened_up + 1; ++fr) tf_sharing_session_push(ss, y + (size_t)fr * 960, 960);
+  for (; fr < 50 * opened_up + 1; ++fr) tf__sharing_session_push(ss, y + (size_t)fr * 960, 960);
   const int b_up = marker_bitrate(ob, wid, opened_up + 1);
   CHECK(b_up == 192000, "segment %d after the successes at %d", opened_up + 1, b_up);
-  tf_sharing_session_finish(ss, 1);
-  const int left = tf_sharing_outbox_wait(c, 20000);
+  share_finish(c, ss, 1);
+  const int left = tf__sharing_outbox_wait(c, 20000);
   int segs_up = 0;
   CHECK(left == 0 && g_st.n_s == 1 && joined_ok(&g_st.s[0], 1, &segs_up), "the wired session uploaded as one stream (%d left)", left);
   printf("bitrate wiring: a 503 PUT took the next segment to 96000 (segments 1-3: %d %d %d); %d PUTs later segment %d opened at %d; %d segments "
          "uploaded as one stream\n", b1, b2, b3, g_st.puts, opened_up + 1, b_up, segs_up);
   tf__now_override = 0;
-  tf_client_destroy(c);
+  tf__client_close(c);
   tf_http_set_transport(NULL, NULL);
   stub_reset();
   free(ob);
@@ -440,14 +439,13 @@ static int bitrate_tests(const char *vdir, const char *dir) {
 
 /* ================================================================== consent wording */
 typedef struct {
-  int calls, update, reask;
+  int calls, reask;
   char version[40];
   char *copy;
 } AskRec;
 static void on_ask(void *u, const TfConsentRequest *r) {
   AskRec *a = (AskRec *)u;
   a->calls++;
-  a->update = r->update;
   a->reask = r->reask;
   snprintf(a->version, sizeof a->version, "%s", r->consent_version ? r->consent_version : "");
   free(a->copy);
@@ -460,7 +458,7 @@ static void on_ask(void *u, const TfConsentRequest *r) {
 }
 static TfClient *consent_client(const char *dir, AskRec *rec) {
   seed_config(dir, "{\"contributions\":true}");
-  TfClientOptions o = tf_client_default_options();
+  TfClientConfig o = tf__client_default_config();
   o.key = "qlk_v1_local_test_aaaaaaaaaaaaaaaaaaaaaa";
   o.app_id = "org.example.Sharing";
   o.platform = "linux";
@@ -471,14 +469,13 @@ static TfClient *consent_client(const char *dir, AskRec *rec) {
     o.on_consent = on_ask;
     o.user = rec;
   }
-  return tf_client_create(&o);
+  return tf__client_open(&o);
 }
 static void feedback_session(TfClient *c) {
   TfSessionStats ss;
   memset(&ss, 0, sizeof ss);
-  ss.struct_size = sizeof ss;
   ss.feedback_shown = 1;
-  tf_client_session_finished(c, &ss);
+  tf__client_session_finished(c, &ss);
 }
 /* the session JSON of the only session in the outbox */
 static TfJson *session_body(TfClient *c, const char *dir) {
@@ -491,11 +488,11 @@ static TfJson *session_body(TfClient *c, const char *dir) {
   return j;
 }
 static int status_has(TfClient *c, const char *what) {
-  const char *s = tf_client_sharing_status_json(c);
+  const char *s = tf__client_sharing_status_json(c);
   return s && strstr(s, what) != NULL;
 }
 static int status_int(TfClient *c, const char *key) {
-  const char *s = tf_client_sharing_status_json(c);
+  const char *s = tf__client_sharing_status_json(c);
   TfJson *j = s ? tf_json_parse(s, strlen(s), NULL) : NULL;
   const TfJson *v = tf_json_get(j, key);
   const int n = v && v->type == TJ_NUM ? (int)v->num : -1;
@@ -505,14 +502,14 @@ static int status_int(TfClient *c, const char *key) {
 /* a capture opened now carries this consent_version (and this consent_text_sha256, or none for NULL) in its session
  * JSON; the empty capture is then dropped (under 2 s), so the outbox is as before */
 static int session_version_is(TfClient *c, const char *dir, const char *version, const char *hash) {
-  TfShareSession *ss = tf_sharing_session_begin(c, 48000, NULL);
+  TfShareSession *ss = tf__sharing_session_begin(c, 48000, NULL);
   if (!ss) return 0;
   TfJson *sj = session_body(c, dir);
   const char *v = tf_json_str(tf_json_get(sj, "consent_version")), *h = tf_json_str(tf_json_get(sj, "consent_text_sha256"));
   const int ok = sj && v && !strcmp(v, version) && (hash ? h && !strcmp(h, hash) : !tf_json_get(sj, "consent_text_sha256"));
   if (!ok) printf("  session JSON: consent_version %s, consent_text_sha256 %s\n", v ? v : "(none)", h ? h : "(none)");
   tf_json_free(sj);
-  tf_sharing_session_finish(ss, 0);
+  tf__sharing_session_finish(ss, 0);
   return ok;
 }
 static int keys_sorted(const TfJson *j) {
@@ -544,7 +541,7 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
     const int rc = tf_sharing_set_wording(c, keys, texts, n);
     const char *wv = tf_json_str(tf_json_get(cs, "consent_version")), *wh = tf_json_str(tf_json_get(cs, "consent_text_sha256"));
     const char *wc = tf_json_str(tf_json_get(cs, "canonical_utf8_hex"));
-    const char *gv = tf_sharing_consent_version(c), *gh = tf_sharing_consent_sha256(c), *gt = tf_sharing_consent_text(c);
+    const char *gv = tf__sharing_consent_version(c), *gh = tf__sharing_consent_sha256(c), *gt = tf__sharing_consent_text(c);
     char *hex = NULL;
     if (gt) {
       hex = (char *)malloc(2 * strlen(gt) + 1);
@@ -555,7 +552,7 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
           gh ? gh : "NULL");
     ok += good;
     free(hex);
-    tf_client_destroy(c);
+    tf__client_close(c);
   }
   const TfJson *refused = tf_json_get(v, "refused");
   int ref_ok = 0;
@@ -565,23 +562,23 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
     const char *k0[] = {"sheet.title"}, *t0[] = {"Help other learners"};
     tf_sharing_set_wording(c, k0, t0, 1);
     char before[40];
-    snprintf(before, sizeof before, "%s", tf_sharing_consent_version(c));
+    snprintf(before, sizeof before, "%s", tf__sharing_consent_version(c));
     for (int i = 0; refused && i < refused->n; ++i) {
       const TfJson *ov = tf_json_get(&refused->kids[i], "overrides");
       const char *k1[1] = {ov->kids[0].key}, *t1[1] = {ov->kids[0].str};
       const int rc = tf_sharing_set_wording(c, k1, t1, 1);
-      const int good = rc == TF_ERR_ARGUMENT && !strcmp(tf_sharing_consent_version(c), before);
+      const int good = rc == TF_ERR_INVALID_ARGUMENT && !strcmp(tf__sharing_consent_version(c), before);
       CHECK(good, "refused input (%s) was accepted or changed the version", tf_json_str(tf_json_get(&refused->kids[i], "why")));
       ref_ok += good;
     }
     const char *k2[] = {"sheet.title", "sheet.title"}, *t2[] = {"a", "b"};
     const char *k3[] = {"impact.minutes"}, *t3[] = {"x"};
     const char *k4[] = {"sheet.title"}, *t4[] = {"\xc2\xa0\xe3\x80\x80"}; /* no-break space, ideographic space */
-    CHECK(tf_sharing_set_wording(c, k2, t2, 2) == TF_ERR_ARGUMENT, "a key given twice was accepted");
-    CHECK(tf_sharing_set_wording(c, k3, t3, 1) == TF_ERR_ARGUMENT, "the plural object itself was accepted as a key");
-    CHECK(tf_sharing_set_wording(c, k4, t4, 1) == TF_ERR_ARGUMENT, "Unicode white space was accepted as a text");
-    CHECK(!strcmp(tf_sharing_consent_version(c), before), "a refused call changed the version");
-    tf_client_destroy(c);
+    CHECK(tf_sharing_set_wording(c, k2, t2, 2) == TF_ERR_INVALID_ARGUMENT, "a key given twice was accepted");
+    CHECK(tf_sharing_set_wording(c, k3, t3, 1) == TF_ERR_INVALID_ARGUMENT, "the plural object itself was accepted as a key");
+    CHECK(tf_sharing_set_wording(c, k4, t4, 1) == TF_ERR_INVALID_ARGUMENT, "Unicode white space was accepted as a text");
+    CHECK(!strcmp(tf__sharing_consent_version(c), before), "a refused call changed the version");
+    tf__client_close(c);
   }
   printf("consent text vs the shared vector: %d/%d cases, %d/%d refused inputs refused\n", ok, cases ? cases->n : 0, ref_ok, refused ? refused->n : 0);
   tf_json_free(v);
@@ -594,13 +591,12 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
   memset(&rec, 0, sizeof rec);
   snprintf(d, sizeof d, "%s/flow", dir);
   TfClient *c = consent_client(d, &rec);
-  CHECK(tf_sharing_session_begin(c, 48000, NULL) == NULL, "default path: a capture before any answer");
+  CHECK(tf__sharing_session_begin(c, 48000, NULL) == NULL, "default path: a capture before any answer");
   feedback_session(c);
-  CHECK(rec.calls == 1 && rec.update == 0 && rec.reask == 0 && !strcmp(rec.version, "share-2026-11-09"), "the first ask: %d calls, update %d, version %s",
-        rec.calls, rec.update, rec.version);
-  CHECK(rec.copy && !strcmp(rec.copy, tf_sharing_copy_json("en")), "the ask's copy is the bundled deck without own wording");
-  tf_client_sharing_answer(c, 1);
-  CHECK(tf_client_sharing_state(c) == 1, "granted under the deck");
+  CHECK(rec.calls == 1 && rec.reask == 0 && !strcmp(rec.version, "share-2026-11-09"), "the first ask: %d calls, version %s", rec.calls, rec.version);
+  CHECK(rec.copy && !strcmp(rec.copy, tf__sharing_deck_json("en")), "the ask's copy is the bundled deck without own wording");
+  tf__client_sharing_answer(c, 1);
+  CHECK(tf__client_sharing_state(c) == 1, "granted under the deck");
   CHECK(session_version_is(c, d, "share-2026-11-09", NULL), "without own wording the session JSON has the deck's version and no hash");
   static const char *const kw[] = {"sheet.what", "impact.minutes.other"};
   static const char *const tw[] = {"The audio of your recitations in this app and basic technical details. Nothing else.",
@@ -608,32 +604,32 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
   static const char *const tw2[] = {"The audio of your recitations in this app and the app's version. Nothing else.",
                                     "You have shared {minutes} minutes. Thank you."};
   CHECK(tf_sharing_set_wording(c, kw, tw, 2) == 0, "own wording: %s", tf_last_error() ? tf_last_error() : "");
-  const char *custom = tf_sharing_consent_version(c), *hash = tf_sharing_consent_sha256(c);
+  const char *custom = tf__sharing_consent_version(c), *hash = tf__sharing_consent_sha256(c);
   CHECK(custom && !strncmp(custom, "custom-", 7) && strlen(custom) == 31 && hash && strlen(hash) == 64 && !strncmp(custom + 7, hash, 24),
         "custom version %s", custom ? custom : "NULL");
   char custom_v[40], hash_v[65];
   snprintf(custom_v, sizeof custom_v, "%s", custom ? custom : "");
   snprintf(hash_v, sizeof hash_v, "%s", hash ? hash : "");
   {
-    const char *copy = tf_client_sharing_copy_json(c);
+    const char *copy = tf__client_sharing_copy_json(c);
     char want_v[64];
     snprintf(want_v, sizeof want_v, "\"consent_version\":\"%s\"", custom_v);
     CHECK(copy && strstr(copy, tw[0]) && strstr(copy, tw[1]) && strstr(copy, want_v) && strstr(copy, "\"one\":"), "the client's copy: %.200s",
           copy ? copy : "NULL");
   }
   for (int i = 0; i < 30; ++i) feedback_session(c);
-  CHECK(tf_client_sharing_ask_now(c) == 0, "ask_now after a yes");
+  CHECK(tf__client_sharing_ask_now(c) == 0, "ask_now after a yes");
   CHECK(rec.calls == 1, "own wording after a deck grant asked again: %d calls", rec.calls);
-  CHECK(tf_client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-09\"") && status_has(c, "\"updateNeeded\":false") &&
+  CHECK(tf__client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-09\"") && status_has(c, "\"updateNeeded\":false") &&
             status_has(c, "\"pendingAsk\":false"),
-        "own wording after a deck grant paused sharing: %s", tf_client_sharing_status_json(c));
+        "own wording after a deck grant paused sharing: %s", tf__client_sharing_status_json(c));
   CHECK(session_version_is(c, d, "share-2026-11-09", NULL), "own wording after a deck grant: the session JSON lost the deck's version");
   /* clearing the wording again changes nothing for this learner */
-  CHECK(tf_sharing_set_wording(c, NULL, NULL, 0) == 0 && !strcmp(tf_sharing_consent_version(c), "share-2026-11-09") &&
-            tf_sharing_consent_sha256(c) == NULL && tf_sharing_consent_text(c) == NULL,
+  CHECK(tf_sharing_set_wording(c, NULL, NULL, 0) == 0 && !strcmp(tf__sharing_consent_version(c), "share-2026-11-09") &&
+            tf__sharing_consent_sha256(c) == NULL && tf__sharing_consent_text(c) == NULL,
         "cleared wording");
-  CHECK(tf_client_sharing_state(c) == 1 && rec.calls == 1, "a cleared wording paused or asked");
-  tf_client_destroy(c);
+  CHECK(tf__client_sharing_state(c) == 1 && rec.calls == 1, "a cleared wording paused or asked");
+  tf__client_close(c);
 
   /* a new learner under the wording records custom-...; then the app changes its wording: no ask, the original
    * custom version and hash in the JSON, across a restart; deletion under that older version */
@@ -641,25 +637,25 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
   snprintf(d, sizeof d, "%s/custom", dir);
   c = consent_client(d, &rec);
   tf_sharing_set_wording(c, kw, tw, 2);
-  CHECK(tf_sharing_session_begin(c, 48000, NULL) == NULL, "own wording: a capture before any answer");
+  CHECK(tf__sharing_session_begin(c, 48000, NULL) == NULL, "own wording: a capture before any answer");
   feedback_session(c);
-  CHECK(rec.calls == 1 && rec.update == 0 && !strcmp(rec.version, custom_v) && rec.copy && strstr(rec.copy, tw[0]),
-        "the ask under own wording: %d calls, update %d, version %s", rec.calls, rec.update, rec.version);
-  tf_client_sharing_answer(c, 1);
+  CHECK(rec.calls == 1 && !strcmp(rec.version, custom_v) && rec.copy && strstr(rec.copy, tw[0]), "the ask under own wording: %d calls, version %s",
+        rec.calls, rec.version);
+  tf__client_sharing_answer(c, 1);
   {
     char want[200];
     snprintf(want, sizeof want, "\"consentVersion\":\"%s\",\"consentTextSha256\":\"%s\"", custom_v, hash_v);
-    CHECK(tf_client_sharing_state(c) == 1 && status_has(c, want), "status after the grant: %s", tf_client_sharing_status_json(c));
+    CHECK(tf__client_sharing_state(c) == 1 && status_has(c, want), "status after the grant: %s", tf__client_sharing_status_json(c));
   }
   CHECK(tf_sharing_set_wording(c, kw, tw2, 2) == 0, "the second wording");
   char custom2[40], hash2[65];
-  snprintf(custom2, sizeof custom2, "%s", tf_sharing_consent_version(c));
-  snprintf(hash2, sizeof hash2, "%s", tf_sharing_consent_sha256(c) ? tf_sharing_consent_sha256(c) : "");
+  snprintf(custom2, sizeof custom2, "%s", tf__sharing_consent_version(c));
+  snprintf(hash2, sizeof hash2, "%s", tf__sharing_consent_sha256(c) ? tf__sharing_consent_sha256(c) : "");
   CHECK(strcmp(custom2, custom_v) && !strncmp(custom2, "custom-", 7), "the second wording has its own version: %s", custom2);
   for (int i = 0; i < 30; ++i) feedback_session(c);
-  CHECK(rec.calls == 1 && tf_client_sharing_state(c) == 1, "a wording change after a custom grant: %d calls, state %d", rec.calls,
-        tf_client_sharing_state(c));
-  TfShareSession *ss = tf_sharing_session_begin(c, 48000, NULL);
+  CHECK(rec.calls == 1 && tf__client_sharing_state(c) == 1, "a wording change after a custom grant: %d calls, state %d", rec.calls,
+        tf__client_sharing_state(c));
+  TfShareSession *ss = tf__sharing_session_begin(c, 48000, NULL);
   {
     TfJson *sj = session_body(c, d);
     CHECK(sj && tf_json_str(tf_json_get(sj, "consent_text_sha256")) && !strcmp(tf_json_get(sj, "consent_text_sha256")->str, hash_v) &&
@@ -669,16 +665,16 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
   }
   float *noise = (float *)malloc(sizeof(float) * 48000 * 3);
   lcg_noise(noise, 48000 * 3, 0.2);
-  tf_sharing_session_push(ss, noise, 48000 * 3);
-  tf_sharing_session_finish(ss, 1);
-  CHECK(tf_sharing_outbox_pending(c) == 1, "one session pending under the older custom version");
-  tf_client_destroy(c);
+  tf__sharing_session_push(ss, noise, 48000 * 3);
+  tf__sharing_session_finish(ss, 1);
+  CHECK(tf__sharing_outbox_pending(c) == 1, "one session pending under the older custom version");
+  tf__client_close(c);
   c = consent_client(d, &rec);
   tf_sharing_set_wording(c, kw, tw2, 2);
   for (int i = 0; i < 10; ++i) feedback_session(c);
-  CHECK(rec.calls == 1 && tf_client_sharing_state(c) == 1 && !strcmp(tf_sharing_consent_version(c), custom2), "a restart under the new wording: %d calls",
+  CHECK(rec.calls == 1 && tf__client_sharing_state(c) == 1 && !strcmp(tf__sharing_consent_version(c), custom2), "a restart under the new wording: %d calls",
         rec.calls);
-  CHECK(tf_sharing_outbox_pending(c) == 1, "the session recorded under the older custom version survived the restart");
+  CHECK(tf__sharing_outbox_pending(c) == 1, "the session recorded under the older custom version survived the restart");
   {
     char *text = NULL;
     size_t n;
@@ -687,27 +683,27 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
       free(text);
       tf_http_set_transport(replay_sharing, NULL);
       char code[33];
-      CHECK(tf_client_sharing_recovery_code(c, code) == 0, "a contributor exists");
-      CHECK(tf_client_sharing_delete(c) == 0, "delete under an older custom version: %s", tf_last_error() ? tf_last_error() : "");
-      CHECK(tf_client_sharing_recovery_code(c, code) != 0 && tf_sharing_outbox_pending(c) == 0, "the contributor or the queue survived the deletion");
+      CHECK(tf__client_sharing_recovery_code(c, code) == 0, "a contributor exists");
+      CHECK(tf__client_sharing_delete(c) == 0, "delete under an older custom version: %s", tf_last_error() ? tf_last_error() : "");
+      CHECK(tf__client_sharing_recovery_code(c, code) != 0 && tf__sharing_outbox_pending(c) == 0, "the contributor or the queue survived the deletion");
       tf_http_set_transport(NULL, NULL);
       tf_json_free(g_rp.fx);
       g_rp.fx = NULL;
     }
   }
-  CHECK(tf_client_sharing_state(c) == 1 && rec.calls == 1, "deletion changed the grant or asked");
+  CHECK(tf__client_sharing_state(c) == 1 && rec.calls == 1, "deletion changed the grant or asked");
   /* withdrawal: never asked again; the settings switch records the version in force then */
-  tf_client_sharing_set(c, 0);
+  tf__client_sharing_set(c, 0);
   for (int i = 0; i < 30; ++i) feedback_session(c);
-  CHECK(tf_client_sharing_ask_now(c) == 0 && rec.calls == 1 && tf_client_sharing_state(c) == 0, "asked after sharing was turned off: %d calls", rec.calls);
-  tf_client_sharing_set(c, 1);
+  CHECK(tf__client_sharing_ask_now(c) == 0 && rec.calls == 1 && tf__client_sharing_state(c) == 0, "asked after sharing was turned off: %d calls", rec.calls);
+  tf__client_sharing_set(c, 1);
   {
     char want[200];
     snprintf(want, sizeof want, "\"consentVersion\":\"%s\",\"consentTextSha256\":\"%s\"", custom2, hash2);
-    CHECK(tf_client_sharing_state(c) == 1 && status_has(c, want), "the settings switch grants the wording in force: %s", tf_client_sharing_status_json(c));
+    CHECK(tf__client_sharing_state(c) == 1 && status_has(c, want), "the settings switch grants the wording in force: %s", tf__client_sharing_status_json(c));
   }
   CHECK(session_version_is(c, d, custom2, hash2), "the settings switch's grant in the session JSON");
-  tf_client_destroy(c);
+  tf__client_close(c);
 
   /* 3. upgrades: a 2.0.0 sharing.json (the exact 2.0.0 format; 2.0.0 recorded consentVersion with every grant, and
    * its decks were share-2026-11-07), one without a version, a 2.0.1 grant to an earlier deck, and a recording-fix
@@ -745,35 +741,35 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
     c = consent_client(d, &rec);
     char want[80];
     snprintf(want, sizeof want, "\"consentVersion\":\"%s\"", up[k].want);
-    CHECK(rec.calls == 0 && tf_client_sharing_state(c) == 1 && status_has(c, want), "%s: at start %d calls, %s", up[k].name, rec.calls,
-          tf_client_sharing_status_json(c));
+    CHECK(rec.calls == 0 && tf__client_sharing_state(c) == 1 && status_has(c, want), "%s: at start %d calls, %s", up[k].name, rec.calls,
+          tf__client_sharing_status_json(c));
     for (int i = 0; i < 12; ++i) feedback_session(c);
-    tf_client_sharing_ask_now(c);
-    CHECK(rec.calls == 0 && tf_client_sharing_state(c) == 1 && status_has(c, want) && status_has(c, "\"pendingAsk\":false"), "%s: after sessions %d calls, %s",
-          up[k].name, rec.calls, tf_client_sharing_status_json(c));
+    tf__client_sharing_ask_now(c);
+    CHECK(rec.calls == 0 && tf__client_sharing_state(c) == 1 && status_has(c, want) && status_has(c, "\"pendingAsk\":false"), "%s: after sessions %d calls, %s",
+          up[k].name, rec.calls, tf__client_sharing_status_json(c));
     CHECK(session_version_is(c, d, up[k].want, NULL), "%s: the session JSON does not carry %s", up[k].name, up[k].want);
-    tf_client_destroy(c);
+    tf__client_close(c);
     c = consent_client(d, NULL); /* no callback: a pending ask would show in the status */
     feedback_session(c);
-    CHECK(tf_client_sharing_state(c) == 1 && status_has(c, want) && status_has(c, "\"pendingAsk\":false"), "%s: after a restart %s", up[k].name,
-          tf_client_sharing_status_json(c));
+    CHECK(tf__client_sharing_state(c) == 1 && status_has(c, want) && status_has(c, "\"pendingAsk\":false"), "%s: after a restart %s", up[k].name,
+          tf__client_sharing_status_json(c));
     if (k == 0) {
       /* withdrawal under 2.0.0's version: uploads stop, the queue goes, no ask; the settings switch then records the
        * version in force */
-      ss = tf_sharing_session_begin(c, 48000, NULL);
-      tf_sharing_session_push(ss, noise, 48000 * 3);
-      tf_sharing_session_finish(ss, 1);
-      CHECK(tf_sharing_outbox_pending(c) == 1, "one session pending under 2.0.0's version");
-      tf_client_sharing_set(c, 0);
-      CHECK(tf_client_sharing_state(c) == 0 && tf_sharing_outbox_pending(c) == 0, "withdrawal under 2.0.0's version");
+      ss = tf__sharing_session_begin(c, 48000, NULL);
+      tf__sharing_session_push(ss, noise, 48000 * 3);
+      tf__sharing_session_finish(ss, 1);
+      CHECK(tf__sharing_outbox_pending(c) == 1, "one session pending under 2.0.0's version");
+      tf__client_sharing_set(c, 0);
+      CHECK(tf__client_sharing_state(c) == 0 && tf__sharing_outbox_pending(c) == 0, "withdrawal under 2.0.0's version");
       for (int i = 0; i < 20; ++i) feedback_session(c);
-      CHECK(status_has(c, "\"pendingAsk\":false") && status_has(c, "\"consent\":\"final\""), "asked after the withdrawal: %s", tf_client_sharing_status_json(c));
-      tf_client_sharing_set(c, 1);
-      CHECK(tf_client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-09\""), "the settings switch after an upgrade: %s",
-            tf_client_sharing_status_json(c));
+      CHECK(status_has(c, "\"pendingAsk\":false") && status_has(c, "\"consent\":\"final\""), "asked after the withdrawal: %s", tf__client_sharing_status_json(c));
+      tf__client_sharing_set(c, 1);
+      CHECK(tf__client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-09\""), "the settings switch after an upgrade: %s",
+            tf__client_sharing_status_json(c));
       CHECK(session_version_is(c, d, "share-2026-11-09", NULL), "the settings switch's grant in the session JSON");
     }
-    tf_client_destroy(c);
+    tf__client_close(c);
     up_ok += fails == f0;
   }
   free(noise);
@@ -791,20 +787,20 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
     if (rec.calls != before) {
       if (na < 8) at[na] = i, reasks[na] = rec.reask;
       na++;
-      tf_client_sharing_answer(c, 0);
+      tf__client_sharing_answer(c, 0);
     }
   }
   CHECK(na == 3 && at[0] == 1 && at[1] == 8 && at[2] == 15 && reasks[0] == 0 && reasks[1] == 1 && reasks[2] == 2,
         "Not now: %d asks, at %d %d %d", na, na > 0 ? at[0] : -1, na > 1 ? at[1] : -1, na > 2 ? at[2] : -1);
-  CHECK(status_has(c, "\"consent\":\"final\"") && status_has(c, "\"asks\":3"), "after the third Not now: %s", tf_client_sharing_status_json(c));
-  CHECK(tf_client_sharing_ask_now(c) == 0 && rec.calls == 3, "ask_now after three sheets");
-  tf_client_destroy(c);
+  CHECK(status_has(c, "\"consent\":\"final\"") && status_has(c, "\"asks\":3"), "after the third Not now: %s", tf__client_sharing_status_json(c));
+  CHECK(tf__client_sharing_ask_now(c) == 0 && rec.calls == 3, "ask_now after three sheets");
+  tf__client_close(c);
   c = consent_client(d, &rec);
   for (int i = 0; i < 30; ++i) feedback_session(c);
-  CHECK(rec.calls == 3 && tf_client_sharing_state(c) == 0, "a fourth sheet after a restart: %d calls", rec.calls);
-  tf_client_sharing_set(c, 1);
-  CHECK(tf_client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-09\""), "the settings switch after three Not now");
-  tf_client_destroy(c);
+  CHECK(rec.calls == 3 && tf__client_sharing_state(c) == 0, "a fourth sheet after a restart: %d calls", rec.calls);
+  tf__client_sharing_set(c, 1);
+  CHECK(tf__client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-09\""), "the settings switch after three Not now");
+  tf__client_close(c);
 
   /* sheets left unanswered (no callback, the pending ask never answered) count too: three, 7 sessions apart */
   snprintf(d, sizeof d, "%s/unanswered", dir);
@@ -820,24 +816,24 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
   }
   CHECK(na == 3 && at[0] == 1 && at[1] == 8 && at[2] == 15, "unanswered: %d asks, at %d %d %d", na, na > 0 ? at[0] : -1, na > 1 ? at[1] : -1,
         na > 2 ? at[2] : -1);
-  tf_client_destroy(c);
+  tf__client_close(c);
   c = consent_client(d, NULL);
   for (int i = 0; i < 20; ++i) feedback_session(c);
-  tf_client_sharing_ask_now(c);
+  tf__client_sharing_ask_now(c);
   CHECK(status_int(c, "asks") == 3, "unanswered after a restart: %d asks", status_int(c, "asks"));
-  tf_client_destroy(c);
+  tf__client_close(c);
 
   /* sharing turned off before any sheet: never asked; the settings switch records the wording in force */
   memset(&rec, 0, sizeof rec);
   snprintf(d, sizeof d, "%s/off", dir);
   c = consent_client(d, &rec);
-  tf_client_sharing_set(c, 0);
+  tf__client_sharing_set(c, 0);
   for (int i = 0; i < 30; ++i) feedback_session(c);
-  CHECK(tf_client_sharing_ask_now(c) == 0 && rec.calls == 0, "asked after sharing was turned off first: %d calls", rec.calls);
+  CHECK(tf__client_sharing_ask_now(c) == 0 && rec.calls == 0, "asked after sharing was turned off first: %d calls", rec.calls);
   tf_sharing_set_wording(c, kw, tw, 2);
-  tf_client_sharing_set(c, 1);
+  tf__client_sharing_set(c, 1);
   CHECK(session_version_is(c, d, custom_v, hash_v), "the settings switch under own wording records it");
-  tf_client_destroy(c);
+  tf__client_close(c);
 
   /* the ask count carried over from 2.0.0: two sheets and a "Not now" leave one more ask at most, 7 sessions after
    * the last; 2.0.0's unanswered asks (it asked at every session) leave none */
@@ -859,16 +855,16 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
     if (rec.calls != before) {
       if (na < 8) at[na] = i, reasks[na] = rec.reask;
       na++;
-      tf_client_sharing_answer(c, 0);
+      tf__client_sharing_answer(c, 0);
     }
   }
   CHECK(na == 1 && at[0] == 16 && reasks[0] == 2 && status_has(c, "\"consent\":\"final\"") && status_has(c, "\"asks\":3"),
-        "2.0.0's two asks: %d more, at %d, %s", na, na ? at[0] : -1, tf_client_sharing_status_json(c));
-  tf_client_destroy(c);
+        "2.0.0's two asks: %d more, at %d, %s", na, na ? at[0] : -1, tf__client_sharing_status_json(c));
+  tf__client_close(c);
   c = consent_client(d, &rec);
   for (int i = 0; i < 20; ++i) feedback_session(c);
   CHECK(rec.calls == 1, "2.0.0's two asks after a restart: %d calls", rec.calls);
-  tf_client_destroy(c);
+  tf__client_close(c);
   memset(&rec, 0, sizeof rec);
   snprintf(d, sizeof d, "%s/upgrade_unanswered", dir);
   {
@@ -881,15 +877,15 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
   }
   c = consent_client(d, &rec);
   for (int i = 0; i < 30; ++i) feedback_session(c);
-  tf_client_sharing_ask_now(c);
-  CHECK(rec.calls == 0 && tf_client_sharing_state(c) == 0, "2.0.0's five unanswered asks: %d more", rec.calls);
-  tf_client_destroy(c);
+  tf__client_sharing_ask_now(c);
+  CHECK(rec.calls == 0 && tf__client_sharing_state(c) == 0, "2.0.0's five unanswered asks: %d more", rec.calls);
+  tf__client_close(c);
   free(rec.copy);
   /* 5. the decks: eight languages, version 2026-11-09.1, consent share-2026-11-09, the new keys, no {days} */
   static const char *const langs[] = {"ar", "bn", "en", "fr", "id", "ms", "tr", "ur"};
   int decks = 0;
   for (int i = 0; i < 8; ++i) {
-    const char *t = tf_sharing_copy_json(langs[i]);
+    const char *t = tf__sharing_deck_json(langs[i]);
     TfJson *j = t ? tf_json_parse(t, strlen(t), NULL) : NULL;
     const TfJson *s = tf_json_get(j, "strings");
     const int good = j && !strcmp(tf_json_str(tf_json_get(j, "lang")), langs[i]) && !strcmp(tf_json_str(tf_json_get(j, "version")), "2026-11-09.1") &&
@@ -949,10 +945,10 @@ static long long jnum(const TfJson *o, const char *k) {
   const TfJson *v = tf_json_get(o, k);
   return v && v->type == TJ_NUM ? (long long)v->num : 0;
 }
-static TfClient *tele_client(const char *dir, int telemetry, const char *flags, TfConsentCallback cb, void *user) {
+static TfClient *tele_client(const char *dir, int telemetry, const char *flags, void (*cb)(void *, const TfConsentRequest *), void *user) {
   tf_mkdirs(dir);
   if (flags) seed_config(dir, flags);
-  TfClientOptions o = tf_client_default_options();
+  TfClientConfig o = tf__client_default_config();
   o.key = "qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa";
   o.app_id = "org.example.Telemetry";
   o.platform = "linux";
@@ -962,7 +958,7 @@ static TfClient *tele_client(const char *dir, int telemetry, const char *flags, 
   o.telemetry = telemetry;
   o.on_consent = cb;
   o.user = user;
-  return tf_client_create(&o);
+  return tf__client_open(&o);
 }
 static int count_files(const char *dir, const char *prefix) {
   char names[256][64];
@@ -993,18 +989,17 @@ static int count_files(const char *dir, const char *prefix) {
 static void plain_session(TfClient *c) {
   TfSessionStats ss;
   memset(&ss, 0, sizeof ss);
-  ss.struct_size = sizeof ss;
   ss.audio_s = 5;
   ss.compute_s = 0.5;
   ss.chunks = 10;
-  tf_client_session_finished(c, &ss);
+  tf__client_session_finished(c, &ss);
 }
 static void t_ask(void *u, const TfConsentRequest *r) {
   (void)r;
   (*(int *)u)++;
 }
 
-static int telemetry_tests(const char *dir, const char *fx_folder, const char *fixture) {
+static int telemetry_tests(const char *dir) {
   tf_mkdirs(dir);
   tf_mutex_init(&g_ts.m);
   tf_http_set_transport(tstub, NULL);
@@ -1017,23 +1012,23 @@ static int telemetry_tests(const char *dir, const char *fx_folder, const char *f
   snprintf(d, sizeof d, "%s/seal", dir);
   TfClient *c = tele_client(d, 1, NULL, NULL, NULL);
   g_ts.events_status = 503;
-  CHECK(tf_client_background(c) == 0 && events_seen() == 1, "503: %d events", events_seen());
+  CHECK(tf__client_background(c) == 0 && events_seen() == 1, "503: %d events", events_seen());
   TfJson *b0 = event_body(0);
   CHECK(b0 && is_hex32(tf_json_str(tf_json_get(b0, "report_id"))) && jnum(b0, "launches") == 1 && !strcmp(tf_json_str(tf_json_get(b0, "day")), "2026-11-09") &&
-            !strcmp(tf_json_str(tf_json_get(b0, "sdk_version")), "2.0.2") && tf_json_get(b0, "cohorts") && tf_json_get(b0, "cohorts")->n == 0,
+            !strcmp(tf_json_str(tf_json_get(b0, "sdk_version")), "3.0.0") && tf_json_get(b0, "cohorts") && tf_json_get(b0, "cohorts")->n == 0,
         "the launch delta: %s", g_ts.bodies[0] ? g_ts.bodies[0] : "NULL");
   CHECK(count_files(d, "report-") == 1, "the delta is kept on disk");
-  tf_client_background(c);
+  tf__client_background(c);
   CHECK(events_seen() == 2 && g_ts.bodies[1] && !strcmp(g_ts.bodies[0], g_ts.bodies[1]), "the retry is not the same bytes");
   g_ts.events_status = 202;
-  CHECK(tf_client_background(c) == 1 && events_seen() == 3 && !strcmp(g_ts.bodies[0], g_ts.bodies[2]), "202: sent once more, same bytes");
+  CHECK(tf__client_background(c) == 1 && events_seen() == 3 && !strcmp(g_ts.bodies[0], g_ts.bodies[2]), "202: sent once more, same bytes");
   CHECK(count_files(d, "report-") == 0, "a 202 left the delta on disk");
-  tf_client_background(c);
+  tf__client_background(c);
   CHECK(events_seen() == 3, "an empty delta was sent");
   /* a 400 drops (and queues the bad_request issue) */
   plain_session(c);
   g_ts.events_status = 400;
-  tf_client_background(c);
+  tf__client_background(c);
   CHECK(events_seen() == 4 && count_files(d, "report-") == 0, "a 400 kept the delta");
   {
     char *ip = tf_path_join(d, "issues.json");
@@ -1045,7 +1040,7 @@ static int telemetry_tests(const char *dir, const char *fx_folder, const char *f
   /* 413 drops too */
   plain_session(c);
   g_ts.events_status = 413;
-  tf_client_background(c);
+  tf__client_background(c);
   CHECK(events_seen() == 5 && count_files(d, "report-") == 0, "a 413 kept the delta");
   g_ts.events_status = 202;
   printf("deltas: 503 kept, retry byte-identical (report_id %s), 202 deleted, 400 and 413 dropped\n", tf_json_str(tf_json_get(b0, "report_id")));
@@ -1057,7 +1052,7 @@ static int telemetry_tests(const char *dir, const char *fx_folder, const char *f
   tf__now_override = D + 86400 + 60;
   plain_session(c);
   int e0 = events_seen();
-  tf_client_background(c);
+  tf__client_background(c);
   CHECK(events_seen() == e0 + 2, "midnight: %d deltas", events_seen() - e0);
   {
     TfJson *x = event_body(e0), *y = event_body(e0 + 1);
@@ -1073,14 +1068,14 @@ static int telemetry_tests(const char *dir, const char *fx_folder, const char *f
   /* closing the client is a send point */
   plain_session(c);
   e0 = events_seen();
-  tf_client_destroy(c);
+  tf__client_close(c);
   CHECK(events_seen() == e0 + 1, "close: %d deltas", events_seen() - e0);
 
   /* 3. the 15-minute send point (the next SDK call), then the client's own timer */
   tf__now_override = D + 10 * 3600;
   snprintf(d, sizeof d, "%s/fifteen", dir);
   c = tele_client(d, 1, NULL, NULL, NULL);
-  tf_client_background(c);
+  tf__client_background(c);
   e0 = events_seen();
   tf__now_override += 60;
   plain_session(c);
@@ -1088,18 +1083,18 @@ static int telemetry_tests(const char *dir, const char *fx_folder, const char *f
   tf__now_override += 15 * 60;
   plain_session(c);
   CHECK(count_files(d, "report-") == 1 && events_seen() == e0, "the 15-minute seal (%d sealed, %d sent)", count_files(d, "report-"), events_seen() - e0);
-  CHECK(tf_client_background(c) == 1 && events_seen() == e0 + 1, "background sends the sealed delta");
+  CHECK(tf__client_background(c) == 1 && events_seen() == e0 + 1, "background sends the sealed delta");
   {
     TfJson *x = event_body(e0);
     const TfJson *cx = tf_json_get(x, "cohorts");
     CHECK(cx && cx->n == 1 && jnum(&cx->kids[0], "sessions") == 2, "the 15-minute delta holds both sessions");
     tf_json_free(x);
   }
-  tf_client_destroy(c);
+  tf__client_close(c);
   tf__client_no_timer = 0;
   snprintf(d, sizeof d, "%s/timer", dir);
   c = tele_client(d, 1, NULL, NULL, NULL);
-  tf_client_launch(c);
+  tf__client_launch(c);
   e0 = events_seen();
   /* a session counted, then 15 minutes pass: whichever looks first (the timer thread, or the next call, which wakes
    * it), the timer sends exactly one delta */
@@ -1109,156 +1104,42 @@ static int telemetry_tests(const char *dir, const char *fx_folder, const char *f
   for (int i = 0; i < 500 && events_seen() == e0; ++i) SLEEP_MS(10);
   SLEEP_MS(100);
   CHECK(events_seen() == e0 + 1, "the timer sent %d deltas, want 1 (%d sealed on disk)", events_seen() - e0, count_files(d, "report-"));
-  tf_client_destroy(c);
+  tf__client_close(c);
   tf__client_no_timer = 1;
   printf("send points: 15 minutes (sealed by the next call, sent by the timer), background, close, launch\n");
-
-  /* 4. the 2.0.1 fields from a scored result */
-  if (fx_folder && fixture) {
-    char *vp = tf_path_join(fixture, "vectors.json");
-    TfJson *v = read_json_file(vp);
-    free(vp);
-    const TfJson *vec = tf_json_get(v, "vectors");
-    TfModelOptions mo = tf_model_default_options();
-    mo.require_signature = 0;
-    mo.load_engine = 0;
-    TfModel *m = tf_model_open(fx_folder, &mo);
-    CHECK(m && vec && vec->n > 0, "fixture: %s", tf_last_error() ? tf_last_error() : "");
-    const TfJson *x = NULL;
-    for (int i = 0; vec && i < vec->n && !x; ++i)
-      if (!strcmp(tf_json_str(tf_json_get(&vec->kids[i], "context")), "c16_l64")) x = &vec->kids[i];
-    if (m && x) {
-      tf_settings_set_backend(m, "fp32");
-      tf_settings_set_app_json(m, "{\"checks\":{\"madd\":true,\"qalqalah\":true,\"gemination\":true}}");
-      const int n40 = (int)tf_json_get(x, "n40")->num, n20 = (int)tf_json_get(x, "n20")->num;
-      char *hp = tf_path_join(fixture, tf_json_str(tf_json_get(x, "heads"))), *raw = NULL;
-      size_t bytes;
-      tf_read_file(hp, &raw, &bytes);
-      free(hp);
-      ZfTajweedHeads h;
-      memset(&h, 0, sizeof h);
-      h.n40 = n40;
-      h.n20 = n20;
-      h.vocab = 38;
-      const float *at = (const float *)raw;
-      const float **slots[12] = {&h.log_probs, &h.inter1_log_probs, &h.inter4_log_probs, &h.id_log_probs, &h.timing_log_probs, &h.gem,
-                                 &h.attr_tafkheem, &h.attr_ghunna, &h.attr_qalqalah, &h.attr_face, &h.boundary, &h.conf};
-      for (int k = 0; k < 12; ++k) {
-        const TfHeadInfo *hi = tf_head_info(tf_head_from_name(kOrder[k]));
-        *slots[k] = at;
-        at += (size_t)(hi->rate_ms == 40 ? n40 : n20) * hi->width;
-      }
-      const int surah = (int)tf_json_get(x, "surah")->num, ayah = (int)tf_json_get(x, "ayah")->num;
-      TfResult *r = tf_score(m, &h, surah, ayah, NULL);
-      CHECK(r != NULL, "score: %s", tf_last_error() ? tf_last_error() : "");
-      snprintf(d, sizeof d, "%s/fields", dir);
-      c = tele_client(d, 1, NULL, NULL, NULL);
-      tf_client_background(c);
-      e0 = events_seen();
-      TfSessionStats st;
-      memset(&st, 0, sizeof st);
-      st.struct_size = sizeof st;
-      st.model = m;
-      st.result = r;
-      st.audio_s = 4;
-      st.compute_s = 0.4;
-      st.chunks = 8;
-      tf_client_session_finished(c, &st);
-      tf_client_background(c);
-      TfJson *b = event_body(e0);
-      /* what the result holds, counted directly */
-      const ZfTajweedSite *sites;
-      const int ns = zf_tajweed_result_sites(tf_result_engine(r), &sites);
-      const TfWordScore *w;
-      const int nw = tf_result_words(r, &w);
-      long long scored = 0, wchecked = 0, wflag = 0;
-      for (int i = 0; i < nw; ++i) {
-        scored += w[i].has_score;
-        wchecked += w[i].has_score && w[i].flagged >= 0;
-        wflag += w[i].flagged == 1;
-      }
-      const TfJson *rc = tf_json_get(b, "rule_checks"), *rf = tf_json_get(b, "rule_flags"), *sa = tf_json_get(b, "surah_ayahs");
-      char sk[8];
-      snprintf(sk, sizeof sk, "%d", surah);
-      CHECK(b && jnum(b, "ayahs") == 1 && jnum(sa, sk) == 1 && sa->n == 1 && jnum(b, "words") == scored, "ayahs, surah_ayahs, words: %s",
-            g_ts.bodies[e0] ? g_ts.bodies[e0] : "NULL");
-      int bad = 0;
-      static const char *const allowed[] = {"vowel_sub", "vowel_del", "vowel_ins", "short_to_long", "long_to_short", "cons_sub", "cons_del", "insertion",
-                                            "madd", "qalqalah", "gemination", "word"};
-      for (int i = 0; rc && i < rc->n; ++i) {
-        int known = 0;
-        for (int k = 0; k < 12; ++k) known |= !strcmp(rc->kids[i].key, allowed[k]);
-        bad += !known || rc->kids[i].type != TJ_NUM || rc->kids[i].num <= 0;
-      }
-      for (int i = 0; rf && i < rf->n; ++i) bad += !(jnum(rf, rf->kids[i].key) <= jnum(rc, rf->kids[i].key) && jnum(rf, rf->kids[i].key) > 0);
-      CHECK(rc && rc->n <= 32 && bad == 0, "rule keys: %d faults", bad);
-      long long site_checks = 0;
-      for (int k = 0; k < 8; ++k) site_checks += jnum(rc, allowed[k]);
-      long long enabled_sites = 0;
-      {
-        TfJson *rj = tf_json_parse(tf_result_json(r), strlen(tf_result_json(r)), NULL);
-        const TfJson *ss2 = tf_json_get(tf_json_get(rj, "settings"), "sites");
-        for (int i = 0; i < ns; ++i) {
-          const TfJson *en = tf_json_get(tf_json_get(ss2, allowed[sites[i].cls]), "enabled");
-          enabled_sites += en && en->boolean;
-        }
-        tf_json_free(rj);
-      }
-      CHECK(site_checks == enabled_sites && site_checks > 0, "site checks %lld, sites of enabled classes %lld", site_checks, enabled_sites);
-      CHECK(jnum(rc, "word") == wchecked && jnum(rf, "word") == wflag, "word checks %lld/%lld", jnum(rc, "word"), jnum(rf, "word"));
-      {
-        TfBuf ob;
-        tf_buf_init(&ob);
-        tf_json_write(&ob, rc);
-        tf_buf_puts(&ob, " flags ");
-        tf_json_write(&ob, rf);
-        printf("scored result %d:%d: ayahs %lld, words %lld, %d sites, rule_checks %s\n", surah, ayah, jnum(b, "ayahs"), jnum(b, "words"), ns,
-               ob.p ? ob.p : "");
-        tf_buf_free(&ob);
-      }
-      tf_json_free(b);
-      tf_client_destroy(c);
-      tf_result_free(r);
-      free(raw);
-    }
-    tf_model_close(m);
-    tf_json_free(v);
-  } else {
-    printf("the 2.0.1 fields from a scored result: no fixture given, skipped\n");
-  }
 
   /* 5. share counters: the pending ask the app's own sheet reads, and the ask callback */
   snprintf(d, sizeof d, "%s/share_pending", dir);
   c = tele_client(d, 1, "{\"contributions\":true}", NULL, NULL);
-  tf_client_background(c);
+  tf__client_background(c);
   e0 = events_seen();
   feedback_session(c);
-  CHECK(strstr(tf_client_sharing_status_json(c), "\"pendingAsk\":true"), "no pending ask");
-  tf_client_sharing_answer(c, 0);
-  tf_client_background(c);
+  CHECK(strstr(tf__client_sharing_status_json(c), "\"pendingAsk\":true"), "no pending ask");
+  tf__client_sharing_answer(c, 0);
+  tf__client_background(c);
   {
     TfJson *b = event_body(e0);
     CHECK(jnum(b, "share_asked") == 1 && jnum(b, "share_no") == 1 && !tf_json_get(b, "share_yes"), "pending ask counters: %s",
           g_ts.bodies[e0] ? g_ts.bodies[e0] : "NULL");
     tf_json_free(b);
   }
-  tf_client_destroy(c);
+  tf__client_close(c);
   int asked = 0;
   snprintf(d, sizeof d, "%s/share_callback", dir);
   c = tele_client(d, 1, "{\"contributions\":true}", t_ask, &asked);
-  tf_client_background(c);
+  tf__client_background(c);
   e0 = events_seen();
   feedback_session(c);
-  tf_client_sharing_answer(c, 1);
-  tf_client_sharing_set(c, 1); /* the settings switch: not a sheet answer */
-  tf_client_background(c);
+  tf__client_sharing_answer(c, 1);
+  tf__client_sharing_set(c, 1); /* the settings switch: not a sheet answer */
+  tf__client_background(c);
   {
     TfJson *b = event_body(e0);
     CHECK(asked == 1 && jnum(b, "share_asked") == 1 && jnum(b, "share_yes") == 1 && !tf_json_get(b, "share_no"), "callback counters: %s",
           g_ts.bodies[e0] ? g_ts.bodies[e0] : "NULL");
     tf_json_free(b);
   }
-  tf_client_destroy(c);
+  tf__client_close(c);
   printf("share counters: pending ask asked 1 / no 1; ask callback asked 1 / yes 1 (the settings switch not counted)\n");
 
   /* 6. register once per UTC day; a failed attempt keeps new_install and tries again */
@@ -1266,38 +1147,38 @@ static int telemetry_tests(const char *dir, const char *fx_folder, const char *f
   snprintf(d, sizeof d, "%s/register", dir);
   g_ts.n_register = g_ts.n_register_new = 0;
   c = tele_client(d, 1, NULL, NULL, NULL);
-  tf_client_launch(c);
-  tf_client_register(c);
-  tf_client_destroy(c);
+  tf__client_launch(c);
+  tf__client_register(c);
+  tf__client_close(c);
   c = tele_client(d, 1, NULL, NULL, NULL);
-  tf_client_launch(c);
+  tf__client_launch(c);
   CHECK(g_ts.n_register == 1 && g_ts.n_register_new == 1, "the same day: %d registers", g_ts.n_register);
   tf__now_override = D + 86400 + 3600;
-  tf_client_launch(c);
-  tf_client_register(c);
+  tf__client_launch(c);
+  tf__client_register(c);
   CHECK(g_ts.n_register == 2 && g_ts.n_register_new == 1, "the next day: %d registers (%d with new_install)", g_ts.n_register, g_ts.n_register_new);
-  tf_client_destroy(c);
+  tf__client_close(c);
   snprintf(d, sizeof d, "%s/register_fail", dir);
   g_ts.n_register = g_ts.n_register_new = 0;
   g_ts.register_status = 500;
   c = tele_client(d, 1, NULL, NULL, NULL);
-  tf_client_launch(c);
-  tf_client_register(c);
+  tf__client_launch(c);
+  tf__client_register(c);
   g_ts.register_status = 200;
-  tf_client_register(c);
-  tf_client_register(c);
+  tf__client_register(c);
+  tf__client_register(c);
   CHECK(g_ts.n_register == 3 && g_ts.n_register_new == 3, "failed registers: %d calls, %d with new_install", g_ts.n_register, g_ts.n_register_new);
-  tf_client_destroy(c);
+  tf__client_close(c);
   g_ts.register_status = 0;
   printf("register: once per UTC day (2 calls over two days), retried after a 500 with new_install kept\n");
 
   /* 7. the developer's opt-out: nothing counted, nothing sent */
   snprintf(d, sizeof d, "%s/off", dir);
-  c = tele_client(d, ZF_ANALYTICS_OFF, NULL, NULL, NULL);
+  c = tele_client(d, 0, NULL, NULL, NULL);
   e0 = events_seen();
   plain_session(c);
-  tf_client_background(c);
-  tf_client_destroy(c);
+  tf__client_background(c);
+  tf__client_close(c);
   CHECK(events_seen() == e0 && count_files(d, "telemetry-") == 0 && count_files(d, "report-") == 0, "telemetry off sent or kept something");
 
   for (int i = 0; i < 64; ++i) free(g_ts.bodies[i]);
@@ -1330,7 +1211,7 @@ static int sl_stub(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
   } else if (path && !strncmp(path, "/v1/config", 10)) {
     g_sl.config_calls++;
     const TfJson *cfg = sl_config(g_sl.serve);
-    if (!cfg) return tf__fail(TF_ERR_NETWORK, "no such test config");
+    if (!cfg) return tf__fail(TF__ERR_NETWORK, "no such test config");
     reply(r, 200, tf_json_str(tf_json_get(cfg, "body")));
     snprintf(r->signature, sizeof r->signature, "%s", tf_json_str(tf_json_get(cfg, "signature")));
     snprintf(r->key_id, sizeof r->key_id, "%s", tf_json_str(tf_json_get(g_sl.fx, "key_id")));
@@ -1346,7 +1227,7 @@ static void sl_log(void *u, int level, const char *msg) {
   snprintf(g_sl.last, sizeof g_sl.last, "%s", msg);
 }
 static TfClient *sl_client(const char *dir, int debug) {
-  TfClientOptions o = tf_client_default_options();
+  TfClientConfig o = tf__client_default_config();
   o.key = "qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa";
   o.app_id = "org.example.Latest";
   o.platform = "linux";
@@ -1355,47 +1236,47 @@ static TfClient *sl_client(const char *dir, int debug) {
   o.trusted_key_hex = tf_json_str(tf_json_get(g_sl.fx, "public_key_hex"));
   o.debug_build = debug;
   o.on_log = sl_log;
-  return tf_client_create(&o);
+  return tf__client_open(&o);
 }
 
 /* sdk_latest: a newer version logs one warning per client (two configs, one line), in debug builds only; equal, older,
  * absent and malformed fields log nothing and are no error; an added top-level field passes verification (the
  * signature covers the raw bytes) and does not disturb the settings the config feeds */
-static int sdk_latest_tests(const char *configs, const char *dir, const char *fx_folder) {
+static int sdk_latest_tests(const char *configs, const char *dir) {
   g_sl.fx = read_json_file(configs);
   if (!g_sl.fx) return 2;
   tf_mkdirs(dir);
   tf_http_set_transport(sl_stub, NULL);
-  static const char want[] = "Quran Lab SDK 2.0.3 is available (recommended), you have 2.0.2: https://github.com/Quran-Lab/tajweedformer-c/releases";
+  static const char want[] = "Quran Lab SDK 3.0.1 is available (recommended), you have 3.0.0: https://github.com/Quran-Lab/tajweedformer-c/releases";
   char d[1100];
   /* newer: one line at launch; a second newer config (a refresh) adds none */
   snprintf(d, sizeof d, "%s/newer", dir);
   g_sl.serve = "newer";
   TfClient *c = sl_client(d, 1);
-  int rc = tf_client_launch(c);
-  CHECK(rc == 0 && tf_client_config_json(c) && strstr(tf_client_config_json(c), "\"sdk_latest\""), "the config with sdk_latest was not accepted: %d %s",
+  int rc = tf__client_launch(c);
+  CHECK(rc == 0 && tf__client_config_json(c) && strstr(tf__client_config_json(c), "\"sdk_latest\""), "the config with sdk_latest was not accepted: %d %s",
         rc, tf_last_error() ? tf_last_error() : "");
   CHECK(g_sl.lines == 1 && g_sl.level == TF_LOG_WARNING && !strcmp(g_sl.last, want), "newer: %d lines, level %d: %s", g_sl.lines, g_sl.level, g_sl.last);
   g_sl.serve = "newer major";
-  CHECK(tf_client_refresh_config(c) == 0 && strstr(tf_client_config_json(c), "\"3.0\""), "the second config");
+  CHECK(tf__client_refresh_config(c) == 0 && strstr(tf__client_config_json(c), "\"4.0\""), "the second config");
   CHECK(g_sl.lines == 1, "two configs gave %d lines", g_sl.lines);
-  tf_client_destroy(c);
+  tf__client_close(c);
   printf("sdk_latest newer: \"%s\" once for two configs (warning level)\n", g_sl.last);
   /* the next launch (a new client) says it again */
   g_sl.lines = 0;
   c = sl_client(d, 1);
-  tf_client_launch(c);
-  CHECK(g_sl.lines == 1 && strstr(g_sl.last, "SDK 3.0 is available (required)"), "the next launch: %d lines: %s", g_sl.lines, g_sl.last);
-  tf_client_destroy(c);
+  tf__client_launch(c);
+  CHECK(g_sl.lines == 1 && strstr(g_sl.last, "SDK 4.0 is available (required)"), "the next launch: %d lines: %s", g_sl.lines, g_sl.last);
+  tf__client_close(c);
   /* a release build (debug_build 0): silent */
   g_sl.lines = 0;
   g_sl.serve = "newer";
   snprintf(d, sizeof d, "%s/release", dir);
   c = sl_client(d, 0);
-  tf_client_launch(c);
-  tf_client_refresh_config(c);
-  CHECK(g_sl.lines == 0 && tf_client_config_json(c), "a release build logged %d lines", g_sl.lines);
-  tf_client_destroy(c);
+  tf__client_launch(c);
+  tf__client_refresh_config(c);
+  CHECK(g_sl.lines == 0 && tf__client_config_json(c), "a release build logged %d lines", g_sl.lines);
+  tf__client_close(c);
   /* equal, older, absent, malformed: nothing logged, no error, the config accepted */
   static const char *const quiet[] = {"equal", "older", "absent", "junk version", "prerelease version", "empty version", "version a number",
                                       "no severity", "no url", "url not a string", "not an object", "null"};
@@ -1405,31 +1286,14 @@ static int sdk_latest_tests(const char *configs, const char *dir, const char *fx
     g_sl.serve = quiet[i];
     snprintf(d, sizeof d, "%s/quiet%d", dir, (int)i);
     c = sl_client(d, 1);
-    rc = tf_client_launch(c);
-    const int good = rc == 0 && tf_client_config_json(c) != NULL && g_sl.lines == 0;
+    rc = tf__client_launch(c);
+    const int good = rc == 0 && tf__client_config_json(c) != NULL && g_sl.lines == 0;
     CHECK(good, "%s: rc %d, %d lines (%s)", quiet[i], rc, g_sl.lines, g_sl.last);
     ok += good;
-    tf_client_destroy(c);
+    tf__client_close(c);
   }
   printf("sdk_latest quiet: %d/%d (equal, older, absent, malformed: no line, no error, config accepted); release build: no line\n", ok,
          (int)(sizeof quiet / sizeof quiet[0]));
-  /* the settings layer: the same effective settings and drops with and without the field */
-  if (fx_folder) {
-    TfModelOptions mo = tf_model_default_options();
-    mo.require_signature = 0;
-    mo.load_engine = 0;
-    TfModel *m = tf_model_open(fx_folder, &mo);
-    const char *a = tf_json_str(tf_json_get(sl_config("newer"), "body")), *b = tf_json_str(tf_json_get(sl_config("absent"), "body"));
-    const int da = m ? tf_settings_set_remote_json(m, a, strlen(a)) : -99;
-    char *sa = m ? tf__settings_json_alloc(m) : NULL;
-    const int db = m ? tf_settings_set_remote_json(m, b, strlen(b)) : -99;
-    char *sb = m ? tf__settings_json_alloc(m) : NULL;
-    CHECK(m && da == db && da >= 0 && sa && sb && !strcmp(sa, sb), "sdk_latest changed the settings: dropped %d vs %d", da, db);
-    printf("sdk_latest and the settings layer: %d dropped with the field, %d without, effective settings identical\n", da, db);
-    free(sa);
-    free(sb);
-    tf_model_close(m);
-  }
   tf_http_set_transport(NULL, NULL);
   tf_json_free(g_sl.fx);
   printf("sdk_latest: %s\n", fails ? "FAIL" : "ok");

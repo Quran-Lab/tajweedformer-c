@@ -27,24 +27,61 @@ jobs:
       - name: Ninja (Windows)
         if: runner.os == 'Windows'
         run: choco install ninja -y --no-progress
-      - name: Ninja (Linux)
+      - name: Ninja and libcurl (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ninja-build libcurl4-openssl-dev libssl-dev
+        # Only what the runner does not already have is installed (it ships ninja and libssl-dev; libcurl's
+        # headers are what is usually missing). The Ubuntu archive's hosts were unreachable from the runners for
+        # hours on 2026-11-11 (their names did not resolve), so after a failed try a mirror outside ubuntu.com is
+        # added to the runner's mirror list. Packages stay verified by the archive's signature, whichever
+        # mirror serves them.
+        run: |
+          need=""
+          command -v ninja >/dev/null || need="$need ninja-build"
+          for p in libcurl4-openssl-dev libssl-dev; do dpkg -s "$p" >/dev/null 2>&1 || need="$need $p"; done
+          if [ -z "$need" ]; then echo "nothing to install"; exit 0; fi
+          echo "installing:$need"
+          for try in 1 2 3; do
+            if sudo apt-get update -o Acquire::Retries=2 && sudo apt-get install -y -o Acquire::Retries=2 $need; then
+              exit 0
+            fi
+            echo "::warning::apt attempt $try failed (the package mirror did not answer)"
+            if [ "$try" = 1 ] && [ -f /etc/apt/apt-mirrors.txt ]; then
+              printf 'http://mirrors.kernel.org/ubuntu/\tpriority:4\n' | sudo tee -a /etc/apt/apt-mirrors.txt >/dev/null
+              echo "added mirrors.kernel.org to the mirror list"
+            fi
+            sleep 20
+          done
+          echo "::error::no package mirror answered in three tries; not installed:$need"
+          exit 1
       - name: Build
         run: |
           X=""; if [ "$RUNNER_OS" = Windows ]; then X="-DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++"; fi
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release $X
           cmake --build build
-      - name: Kernels against the engine
-        run: ctest --test-dir build -V --output-on-failure
+      - name: Tests (the kernels against the engine, the library without model data; a time limit on each)
+        run: ctest --test-dir build --output-on-failure --timeout 600 -j4
       - name: The README's quick start is examples/quickstart.c (which the build above compiled)
         run: |
           PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
           $PY test/quickstart_check.py
-      - name: The README's compile line (Linux), and the program starts
-        if: runner.os == 'Linux'
+      - name: The README's install (its CMakeLists with this repository as a subproject), and the program starts
         run: |
-          cc examples/quickstart.c -I include -I vendor/zipformer-sdk/tajweed/include -L build -ltajweedformer -o quickstart_readme
-          code=0; LD_LIBRARY_PATH=build ./quickstart_readme || code=$?
+          # the README's first CMake block is the app's CMakeLists; FetchContent takes this checkout instead of the tag
+          mkdir -p "$RUNNER_TEMP/app"
+          awk '/^```cmake/{f=1;next} /^```/{if(f)exit} f' README.md > "$RUNNER_TEMP/app/CMakeLists.txt"
+          grep -q 'FetchContent_Declare(tajweedformer' "$RUNNER_TEMP/app/CMakeLists.txt"
+          cp examples/quickstart.c "$RUNNER_TEMP/app/quickstart.c"
+          X=""; if [ "$RUNNER_OS" = Windows ]; then X="-DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++"; fi
+          cmake -S "$RUNNER_TEMP/app" -B "$RUNNER_TEMP/app/build" -G Ninja -DCMAKE_BUILD_TYPE=Release $X \
+            -DFETCHCONTENT_SOURCE_DIR_TAJWEEDFORMER="$GITHUB_WORKSPACE"
+          cmake --build "$RUNNER_TEMP/app/build"
+          code=0; "$RUNNER_TEMP/app/build/quickstart" || code=$?
           # without a key it prints its usage and exits 2: it linked, and the library loaded
-          [ "$code" -eq 2 ] || { echo "::error::quickstart_readme exited $code, 2 expected"; exit 1; }
+          [ "$code" -eq 2 ] || { echo "::error::the quick start exited $code, 2 expected"; exit 1; }
+      - name: The example app (examples/CMakeLists.txt) builds and starts
+        run: |
+          X=""; if [ "$RUNNER_OS" = Windows ]; then X="-DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++"; fi
+          cmake -S examples -B "$RUNNER_TEMP/example" -G Ninja -DCMAKE_BUILD_TYPE=Release $X
+          cmake --build "$RUNNER_TEMP/example" --target quickstart
+          code=0; "$RUNNER_TEMP/example/quickstart" || code=$?
+          [ "$code" -eq 2 ] || { echo "::error::the example exited $code, 2 expected"; exit 1; }

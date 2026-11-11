@@ -1,0 +1,43 @@
+{
+ "about": "signed 3.0 configs (make_model_configs.py); throwaway key, test only",
+ "public_key_hex": "c0d22fab5de81a19531d1da879778c3c83a59c237abbf2e7c521ffc0a706c0f1",
+ "key_id": "96feced4d284f959",
+ "build": "a4287e7b9c80057dec5df9c1897462ddd7faa326",
+ "configs": [
+  {
+   "name": "no model",
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Api\",\"channel\":\"stable\",\"issued_at\":1794355200,\"expires_at\":4102444800,\"models\":{},\"recommended\":null,\"denylist\":[],\"flags\":{\"analytics\":true,\"issues\":true,\"contributions\":false,\"min_sdk\":\"3.0.0\"},\"sdk_latest\":{\"version\":\"3.0.0\",\"severity\":\"optional\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
+   "signature": "ed25519=2OBmeUuo04zDr8I/BJ+qybnPdgGreM0GXmFTvruh8bzPfyX9lp/g0D3uAZAoN0zWmAoP5Vq8YEpS2Ive/5LOAA=="
+  },
+  {
+   "name": "model",
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Api\",\"channel\":\"stable\",\"issued_at\":1794355200,\"expires_at\":4102444800,\"models\":{\"Quran-Lab/tajweedformer-v4\":{\"revision\":\"a4287e7b9c80057dec5df9c1897462ddd7faa326\",\"version\":\"4.0.0\",\"source\":\"stable\",\"model_id\":\"v4.0\",\"folder\":\"sdk/v4.0\"}},\"recommended\":{\"revision\":\"a4287e7b9c80057dec5df9c1897462ddd7faa326\",\"version\":\"4.0.0\",\"source\":\"stable\",\"model_id\":\"v4.0\",\"folder\":\"sdk/v4.0\",\"model\":\"Quran-Lab/tajweedformer-v4\"},\"denylist\":[],\"flags\":{\"analytics\":true,\"issues\":true,\"contributions\":false,\"min_sdk\":\"3.0.0\"},\"sdk_latest\":{\"version\":\"3.0.0\",\"severity\":\"optional\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
+   "signature": "ed25519=tOrO3QGqacck6BI+Z+gJL7FT6pTYsP0XsYi4UOVj4LlYPPH1wROW93qs1lTo7HJJHGSXOVNms5XPiCGqO6FuCA=="
+  },
+  {
+   "name": "model c24",
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Api\",\"channel\":\"stable\",\"issued_at\":1794355200,\"expires_at\":4102444800,\"models\":{\"Quran-Lab/tajweedformer-v4\":{\"revision\":\"a4287e7b9c80057dec5df9c1897462ddd7faa326\",\"version\":\"4.0.0\",\"source\":\"stable\",\"model_id\":\"v4.0\",\"folder\":\"sdk/v4.0\"}},\"recommended\":{\"revision\":\"a4287e7b9c80057dec5df9c1897462ddd7faa326\",\"version\":\"4.0.0\",\"source\":\"stable\",\"model_id\":\"v4.0\",\"folder\":\"sdk/v4.0\",\"model\":\"Quran-Lab/tajweedformer-v4\"},\"denylist\":[],\"flags\":{\"analytics\":true,\"issues\":true,\"contributions\":false,\"min_sdk\":\"3.0.0\"},\"sdk_latest\":{\"version\":\"3.0.0\",\"severity\":\"optional\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"},\"inference\":{\"context\":\"c24_l72\"}}",
+   "signature": "ed25519=xUvmrU+iq3q95YAY22/+ZWRAAjPBAREEhQLlDDWkQoR7pBbQfIywuYtJh4eGiAI9ubXeVUdGw0bbFRLwSME1Aw=="
+  },
+  {
+   "name": "model unknown context",
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Api\",\"channel\":\"stable\",\"issued_at\":1794355200,\"expires_at\":4102444800,\"models\":{\"Quran-Lab/tajweedformer-v4\":{\"revision\":\"a4287e7b9c80057dec5df9c1897462ddd7faa326\",\"version\":\"4.0.0\",\"source\":\"stable\",\"model_id\":\"v4.0\",\"folder\":\"sdk/v4.0\"}},\"recommended\":{\"revision\":\"a4287e7b9c80057dec5df9c1897462ddd7faa326\",\"version\":\"4.0.0\",\"source\":\"stable\",\"model_id\":\"v4.0\",\"folder\":\"sdk/v4.0\",\"model\":\"Quran-Lab/tajweedformer-v4\"},\"denylist\":[],\"flags\":{\"analytics\":true,\"issues\":true,\"contributions\":false,\"min_sdk\":\"3.0.0\"},\"sdk_latest\":{\"version\":\"3.0.0\",\"severity\":\"optional\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"},\"inference\":{\"context\":\"c99_l1\"}}",
+   "signature": "ed25519=Z9jHCQtc1cmZIXSar/Ob5ahhhd0+LS9QJl2JI/KnKj96FbWVZMe7HbMRGO8F9h/3vrFS23zdd+4gHh5p/5VCCw=="
+  },
+  {
+   "name": "model pin unavailable",
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Api\",\"channel\":\"stable\",\"issued_at\":1794355200,\"expires_at\":4102444800,\"models\":{\"Quran-Lab/tajweedformer-v4\":{\"revision\":\"a4287e7b9c80057dec5df9c1897462ddd7faa326\",\"version\":\"4.0.0\",\"source\":\"stable\",\"model_id\":\"v4.0\",\"folder\":\"sdk/v4.0\"}},\"recommended\":{\"revision\":\"a4287e7b9c80057dec5df9c1897462ddd7faa326\",\"version\":\"4.0.0\",\"source\":\"stable\",\"model_id\":\"v4.0\",\"folder\":\"sdk/v4.0\",\"model\":\"Quran-Lab/tajweedformer-v4\"},\"denylist\":[],\"flags\":{\"analytics\":true,\"issues\":true,\"contributions\":false,\"min_sdk\":\"3.0.0\"},\"sdk_latest\":{\"version\":\"3.0.0\",\"severity\":\"optional\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"},\"pin\":{\"version\":\"9.9.9\",\"status\":\"unavailable\"}}",
+   "signature": "ed25519=fbxLDgFL9PLVrRo88K/jQMAj28ONfd718qXTEcSB7Hi2VkOPqKeK1NfNaLi1HuxwUMo8ZC4ENmEnVglaXUZ/DQ=="
+  },
+  {
+   "name": "model other build",
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Api\",\"channel\":\"stable\",\"issued_at\":1794355200,\"expires_at\":4102444800,\"models\":{\"Quran-Lab/tajweedformer-v4\":{\"revision\":\"0123456789abcdef0123456789abcdef01234567\",\"version\":\"4.0.0\",\"source\":\"stable\",\"model_id\":\"v4.0\",\"folder\":\"sdk/v4.0\"}},\"recommended\":{\"revision\":\"0123456789abcdef0123456789abcdef01234567\",\"version\":\"4.0.0\",\"source\":\"stable\",\"model_id\":\"v4.0\",\"folder\":\"sdk/v4.0\",\"model\":\"Quran-Lab/tajweedformer-v4\"},\"denylist\":[],\"flags\":{\"analytics\":true,\"issues\":true,\"contributions\":false,\"min_sdk\":\"3.0.0\"},\"sdk_latest\":{\"version\":\"3.0.0\",\"severity\":\"optional\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
+   "signature": "ed25519=3z55SxWw7Wv5h4EqoheRCB3re5Iy2r8JdFKeKhZHx/Jxp4jfiyCa/dYWMMsskew+GwbMmX2Q73lL9GJj/IXTDA=="
+  },
+  {
+   "name": "model other version",
+   "body": "{\"v\":1,\"app\":\"linux:org.example.Api\",\"channel\":\"stable\",\"issued_at\":1794355200,\"expires_at\":4102444800,\"models\":{\"Quran-Lab/tajweedformer-v4\":{\"revision\":\"a4287e7b9c80057dec5df9c1897462ddd7faa326\",\"version\":\"4.1.0\",\"source\":\"stable\",\"model_id\":\"v4.0\",\"folder\":\"sdk/v4.0\"}},\"recommended\":{\"revision\":\"a4287e7b9c80057dec5df9c1897462ddd7faa326\",\"version\":\"4.1.0\",\"source\":\"stable\",\"model_id\":\"v4.0\",\"folder\":\"sdk/v4.0\",\"model\":\"Quran-Lab/tajweedformer-v4\"},\"denylist\":[],\"flags\":{\"analytics\":true,\"issues\":true,\"contributions\":false,\"min_sdk\":\"3.0.0\"},\"sdk_latest\":{\"version\":\"3.0.0\",\"severity\":\"optional\",\"url\":\"https://github.com/Quran-Lab/tajweedformer-c/releases\"}}",
+   "signature": "ed25519=IfVXcCbj/gTAw8JHUnLUJQMkqT7fEMousPBcFA7HAwRnMMRjcvmN4eVHuylV2gLfBTL+Ob3q/xY7A9cHHMXNBA=="
+  }
+ ]
+}

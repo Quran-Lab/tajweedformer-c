@@ -1,16 +1,21 @@
 /* tajweedformer: the command-line tool and server tier of the TajweedFormer SDK (Windows, Linux).
  *
- *   tajweedformer info     <folder> [--key HEX | --unsigned]
- *   tajweedformer decode   <folder> <audio> [--ayah S:A] [--context C] [--heads default|all|name,name]
- *                          [--frames] [--settings JSON] [--rate HZ] [--threads N] [--key HEX | --unsigned]
- *   tajweedformer serve    <folder> [options as decode]       JSON lines: {"audio": "...", "ayah": "S:A"} in, results out
- *   tajweedformer bench    <folder> <list.txt> [--workers N] [--threads N] [--pin | --no-pin] [options]   N worker processes
- *   (pinning: the engine's platform default (desktop: not pinned) unless --pin or --no-pin sets it; every command)
- *   tajweedformer download --key KEY --revision REV --dest DIR [--repo R] [--folder F] [--contexts c16_l64,...]
- *   tajweedformer portal   --key KEY --app-id ID --storage DIR [--api URL]   register + verified config
+ *   tajweedformer info     <folder>                             the model's info JSON
+ *   tajweedformer decode   <folder> <audio> [--context C] [--heads all|name,name] [--top-k K] [--frames] [--values]
+ *                          [--end-on-silence MS] [--threads N] [--pin | --no-pin]
+ *   tajweedformer serve    <folder> [options as decode]         JSON lines in: {"audio": "<path>"}; one result line each
+ *   tajweedformer bench    <folder> <list.txt> [--workers N] [--threads N] [--pin | --no-pin]   N worker processes
+ *   tajweedformer download --key KEY --app-id ID --storage DIR [--version X.Y.Z]   the model for this app, verified
+ *   tajweedformer diagnose --key KEY --app-id ID --storage DIR                     the client's report as JSON
+ *   (every command that opens a folder: --trusted-key HEX for a folder signed with a test key)
  *
- * Audio: WAV (PCM 16-bit or float 32-bit, mono, any rate 8 to 48 kHz) or raw float32 16 kHz (.pcm/.f32/.raw).
- * One engine stream per process (the engine's rule): the server tier scales with worker processes. */
+ * A decode line: {"audio","audio_s","compute_s","chunks","heads":[{"name","kind","frame_ms","frames","classes",
+ * "values"?}],"greedy":{"<ctc head>":[ids]},"decoded":{...}}. --values adds each head's numbers; --frames the
+ * decoded layer's per-frame top-1 and runner-up (and the top K with --top-k).
+ *
+ * Audio: WAV (PCM 16-bit or float 32-bit, the first channel, any rate 8 to 48 kHz) or raw float32 16 kHz
+ * (.pcm/.f32/.raw). One take at a time per process (the engine's rule): the server tier scales with worker
+ * processes. */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -44,9 +49,9 @@ static double now_s(void) {
 }
 
 typedef struct {
-  const char *folder, *key, *context, *settings, *heads, *ayah;
-  int unsigned_ok, frames, rate, threads, workers;
-  int no_pin; /* -1: the engine's platform default; 0: --pin; 1: --no-pin */
+  const char *folder, *key, *context, *heads;
+  int frames, values, top_k, threads, workers, end_ms;
+  int pin; /* 0: the engine's default; 1: --pin; -1: --no-pin */
 } Opts;
 
 static const char *arg(int argc, char **argv, const char *name) {
@@ -59,58 +64,34 @@ static int flag(int argc, char **argv, const char *name) {
     if (!strcmp(argv[i], name)) return 1;
   return 0;
 }
+static int num(int argc, char **argv, const char *name, int dflt) { return arg(argc, argv, name) ? atoi(arg(argc, argv, name)) : dflt; }
 static void parse(Opts *o, int argc, char **argv) {
   memset(o, 0, sizeof *o);
-  o->key = arg(argc, argv, "--key");
+  o->key = arg(argc, argv, "--trusted-key");
   o->context = arg(argc, argv, "--context");
-  o->settings = arg(argc, argv, "--settings");
   o->heads = arg(argc, argv, "--heads");
-  o->ayah = arg(argc, argv, "--ayah");
-  o->unsigned_ok = flag(argc, argv, "--unsigned");
   o->frames = flag(argc, argv, "--frames");
-  o->rate = arg(argc, argv, "--rate") ? atoi(arg(argc, argv, "--rate")) : 0;
-  o->threads = arg(argc, argv, "--threads") ? atoi(arg(argc, argv, "--threads")) : 0;
-  o->workers = arg(argc, argv, "--workers") ? atoi(arg(argc, argv, "--workers")) : 1;
-  /* core pinning: the engine's platform default (engine d0bb2b3: Windows, Linux and macOS do not pin, which is
-   * what a server running many streams wants) unless --pin (0) or --no-pin (1) sets it */
-  o->no_pin = flag(argc, argv, "--pin") ? 0 : flag(argc, argv, "--no-pin") ? 1 : -1;
+  o->values = flag(argc, argv, "--values");
+  o->top_k = num(argc, argv, "--top-k", 0);
+  o->threads = num(argc, argv, "--threads", 0);
+  o->workers = num(argc, argv, "--workers", 1);
+  o->end_ms = num(argc, argv, "--end-on-silence", 0);
+  o->pin = flag(argc, argv, "--pin") ? 1 : flag(argc, argv, "--no-pin") ? -1 : 0;
 }
 
-static unsigned heads_mask(const char *s) {
-  if (!s || !strcmp(s, "default")) return 0;
-  if (!strcmp(s, "all")) return TF_HEADS_ALL;
-  unsigned m = 0;
-  char buf[512];
-  snprintf(buf, sizeof buf, "%s", s);
-  for (char *t = strtok(buf, ","); t; t = strtok(NULL, ",")) {
-    const int h = tf_head_from_name(t);
-    if (h < 0) {
-      fprintf(stderr, "unknown head %s\n", t);
-      exit(2);
-    }
-    m |= TF_HEAD_BIT(h);
-  }
-  return m | TF_HEADS_DEFAULT;
+static int fail(const char *what) {
+  fprintf(stderr, "tajweedformer: %s: %s (%s)\n  %s\n  %s\n", what, tf_last_error(), tf_error_name(tf_last_error_code()), tf_last_error_fix(),
+          tf_error_docs(tf_last_error_code()));
+  return 1;
 }
 
-static TfModel *open_model(const Opts *o, int rate, int engine) {
-  TfModelOptions mo = tf_model_default_options();
+static TfModel *open_model(const Opts *o) {
+  TfModelOptions mo = {0};
   mo.trusted_key_hex = o->key;
-  mo.require_signature = !o->unsigned_ok;
-  mo.context = o->context;
   mo.threads = o->threads;
-  mo.sample_rate = rate == 16000 ? 0 : rate;
-  mo.load_engine = engine;
-  mo.no_pin = o->no_pin;
+  mo.pin = o->pin;
   TfModel *m = tf_model_open(o->folder, &mo);
-  if (!m) {
-    fprintf(stderr, "tajweedformer: %s (%s)\n", tf_last_error(), tf_error_name(tf_last_error_code()));
-    exit(1);
-  }
-  if (o->settings && tf_settings_set_app_json(m, o->settings)) {
-    fprintf(stderr, "tajweedformer: settings: %s\n", tf_last_error());
-    exit(2);
-  }
+  if (!m) exit(fail(o->folder));
   return m;
 }
 
@@ -121,7 +102,7 @@ static float *read_audio(const char *path, int *n, int *rate) {
   fseek(f, 0, SEEK_END);
   const long sz = ftell(f);
   fseek(f, 0, SEEK_SET);
-  unsigned char *d = (unsigned char *)malloc((size_t)sz);
+  unsigned char *d = (unsigned char *)malloc((size_t)sz + 1);
   if (!d || fread(d, 1, (size_t)sz, f) != (size_t)sz) {
     fclose(f);
     free(d);
@@ -142,7 +123,7 @@ static float *read_audio(const char *path, int *n, int *rate) {
       } else if (!memcmp(d + at, "data", 4)) {
         const long bytes = (long)len > sz - at - 8 ? sz - at - 8 : (long)len;
         const unsigned char *p = d + at + 8;
-        if (ch < 1) break;
+        if (ch < 1 || bits < 8) break;
         const int bps = bits / 8;
         *n = (int)(bytes / (bps * ch));
         out = (float *)malloc(sizeof(float) * (size_t)(*n + 1));
@@ -166,95 +147,117 @@ static float *read_audio(const char *path, int *n, int *rate) {
   return out;
 }
 
-/* one take through the stream, every layer printed as one JSON line */
-static int run_take(TfStream *s, const char *audio, const char *ayah, int frames, FILE *out, double *audio_s,
-                    double *wall_s) {
+static void json_path(FILE *out, const char *s) {
+  for (const char *p = s; *p; ++p) fprintf(out, *p == '\\' || *p == '"' ? "\\%c" : "%c", *p);
+}
+
+/* one take through a Session, every layer printed as one JSON line */
+static int run_take(TfModel *m, const Opts *o, const char *audio, FILE *out, double *audio_s, double *wall_s) {
   int n = 0, rate = 16000;
   float *pcm = read_audio(audio, &n, &rate);
   if (!pcm) {
-    fprintf(out, "{\"audio\":\"%s\",\"error\":\"cannot read the audio\"}\n", audio);
+    fprintf(out, "{\"audio\":\"");
+    json_path(out, audio);
+    fprintf(out, "\",\"error\":\"cannot read the audio\"}\n");
+    fflush(out);
     return 1;
   }
-  tf_stream_reset(s);
+  TfSessionOptions so = {0};
+  so.context = o->context;
+  so.sample_rate = rate;
+  so.heads = o->heads;
+  so.top_k = o->top_k;
+  so.end_on_silence_ms = o->end_ms;
+  TfSession *s = tf_session_create(m, &so);
+  int chunks = 0;
   const double t0 = now_s();
-  const int step = rate / 50;
-  for (int at = 0; at < n; at += step)
-    if (tf_stream_push_audio(s, pcm + at, n - at < step ? n - at : step) < 0) break;
-  tf_stream_finish(s);
+  const int step = rate / 50; /* 20 ms a push */
+  for (int at = 0; s && at < n; at += step) {
+    const int r = tf_session_push(s, pcm + at, n - at < step ? n - at : step);
+    if (r < 0) break; /* the take ended on silence (session_closed), or failed */
+    chunks += r;
+  }
+  const int last = s ? tf_session_finish(s) : -1;
+  if (last > 0) chunks += last;
   const double t1 = now_s();
   free(pcm);
+  const TfHeads *h = s ? tf_session_heads(s) : NULL;
+  fprintf(out, "{\"audio\":\"");
+  json_path(out, audio);
+  if (!h) {
+    fprintf(out, "\",\"error\":\"%s\"}\n", tf_error_name(tf_last_error_code()));
+    fflush(out);
+    tf_session_destroy(s);
+    return 1;
+  }
   if (audio_s) *audio_s += (double)n / rate;
   if (wall_s) *wall_s += t1 - t0;
-  TfDecoded *d = tf_stream_decode(s);
-  fprintf(out, "{\"audio\":\"");
-  for (const char *p = audio; *p; ++p) fprintf(out, *p == '\\' || *p == '"' ? "\\%c" : "%c", *p);
-  fprintf(out, "\",\"audio_s\":%.3f,\"compute_s\":%.3f,\"decoded\":%s", (double)n / rate, t1 - t0, d ? tf_decoded_json(d, frames) : "null");
-  int su = 0, ay = 0;
-  if (ayah && sscanf(ayah, "%d:%d", &su, &ay) == 2) {
-    TfResult *r = tf_stream_score(s, su, ay);
-    fprintf(out, ",\"tajweed\":%s", r ? tf_result_json(r) : "null");
-    if (!r) fprintf(out, ",\"error\":\"%s\"", tf_error_name(tf_last_error_code()));
-    tf_result_free(r);
+  fprintf(out, "\",\"audio_s\":%.3f,\"compute_s\":%.3f,\"chunks\":%d,\"heads\":[", (double)n / rate, t1 - t0, chunks);
+  for (int i = 0; i < tf_heads_count(h); ++i) {
+    TfHead hd;
+    tf_heads_get(h, tf_heads_name(h, i), &hd);
+    fprintf(out, "%s{\"name\":\"%s\",\"kind\":\"%s\",\"frame_ms\":%d,\"frames\":%d,\"classes\":%d", i ? "," : "", hd.name, hd.kind, hd.frame_ms,
+            hd.frames, hd.classes);
+    if (o->values) {
+      fprintf(out, ",\"values\":[");
+      for (int f = 0; f < hd.frames; ++f) {
+        fprintf(out, f ? ",[" : "[");
+        for (int k = 0; k < hd.classes; ++k) fprintf(out, k ? ",%.9g" : "%.9g", (double)hd.values[(size_t)f * hd.classes + k]);
+        fprintf(out, "]");
+      }
+      fprintf(out, "]");
+    }
+    fprintf(out, "}");
   }
-  fprintf(out, "}\n");
+  fprintf(out, "],\"greedy\":{");
+  for (int i = 0, first = 1; i < tf_heads_count(h); ++i) {
+    TfHead hd;
+    const TfToken *tk = NULL;
+    tf_heads_get(h, tf_heads_name(h, i), &hd);
+    if (strcmp(hd.kind, "ctc")) continue;
+    const int nt = tf_heads_greedy(h, hd.name, &tk);
+    fprintf(out, "%s\"%s\":[", first ? "" : ",", hd.name);
+    for (int k = 0; k < nt; ++k) fprintf(out, k ? ",%d" : "%d", tk[k].id);
+    fprintf(out, "]");
+    first = 0;
+  }
+  const TfDecoded *d = tf_heads_decoded(h);
+  fprintf(out, "},\"decoded\":%s}\n", d ? tf_decoded_json(d, o->frames) : "null");
   fflush(out);
-  tf_decoded_free(d);
+  tf_session_destroy(s);
   return 0;
 }
 
 static int cmd_decode(int argc, char **argv, const Opts *o) {
   if (argc < 4) return 2;
-  int n = 0, rate = o->rate ? o->rate : 16000;
-  float *probe = read_audio(argv[3], &n, &rate);
-  if (!probe) {
-    fprintf(stderr, "cannot read %s\n", argv[3]);
-    return 1;
-  }
-  free(probe);
-  TfModel *m = open_model(o, rate, 1);
-  TfStreamOptions so = tf_stream_default_options();
-  so.heads = heads_mask(o->heads);
-  TfStream *s = tf_stream_create(m, &so);
-  if (!s) {
-    fprintf(stderr, "%s\n", tf_last_error());
-    return 1;
-  }
-  const int rc = run_take(s, argv[3], o->ayah, o->frames, stdout, NULL, NULL);
-  tf_stream_destroy(s);
+  TfModel *m = open_model(o);
+  const int rc = run_take(m, o, argv[3], stdout, NULL, NULL);
   tf_model_close(m);
   return rc;
 }
 
-/* JSON lines on stdin: {"audio": "<path>", "ayah": "S:A"}; one result line each (16 kHz or WAV input) */
+/* JSON lines on stdin: {"audio": "<path>"}; one result line each */
 static int cmd_serve(const Opts *o) {
-  TfModel *m = open_model(o, o->rate ? o->rate : 16000, 1);
-  TfStreamOptions so = tf_stream_default_options();
-  so.heads = heads_mask(o->heads);
-  TfStream *s = tf_stream_create(m, &so);
-  if (!s) return 1;
+  TfModel *m = open_model(o);
   char line[8192];
   while (fgets(line, sizeof line, stdin)) {
-    char audio[4096] = "", ayah[32] = "";
-    const char *a = strstr(line, "\"audio\""), *y = strstr(line, "\"ayah\"");
+    char audio[4096] = "";
+    const char *a = strstr(line, "\"audio\"");
     if (a && (a = strchr(a + 7, '"'))) sscanf(a + 1, "%4095[^\"]", audio);
-    if (y && (y = strchr(y + 6, '"'))) sscanf(y + 1, "%31[^\"]", ayah);
     if (!*audio) {
       printf("{\"error\":\"expected {\\\"audio\\\": path}\"}\n");
       fflush(stdout);
       continue;
     }
-    run_take(s, audio, *ayah ? ayah : o->ayah, o->frames, stdout, NULL, NULL);
+    run_take(m, o, audio, stdout, NULL, NULL);
   }
-  tf_stream_destroy(s);
   tf_model_close(m);
   return 0;
 }
 
 /* worker: decode every line of a list (one per line), print a summary line */
 static int cmd_worker(const Opts *o, const char *list, int shard, int shards) {
-  TfModel *m = open_model(o, 16000, 1);
-  TfStream *s = tf_stream_create(m, NULL);
-  if (!s) return 1;
+  TfModel *m = open_model(o);
   FILE *f = fopen(list, "r");
   if (!f) return 1;
   char line[4096];
@@ -267,17 +270,16 @@ static int cmd_worker(const Opts *o, const char *list, int shard, int shards) {
       "/dev/null",
 #endif
       "w");
-  while (fgets(line, sizeof line, f)) {
+  while (sink && fgets(line, sizeof line, f)) {
     size_t len = strlen(line);
     while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
     if (!len || (k++ % shards) != shard) continue;
-    run_take(s, line, o->ayah, 0, sink, &audio, &wall);
+    run_take(m, o, line, sink, &audio, &wall);
     done++;
   }
   fclose(f);
   if (sink) fclose(sink);
   printf("{\"worker\":%d,\"clips\":%d,\"audio_s\":%.3f,\"compute_s\":%.3f}\n", shard, done, audio, wall);
-  tf_stream_destroy(s);
   tf_model_close(m);
   return 0;
 }
@@ -312,11 +314,10 @@ static int cmd_bench(int argc, char **argv, const Opts *o) {
     av[k++] = shs;
     av[k++] = "--threads";
     av[k++] = th;
-    if (o->unsigned_ok) av[k++] = "--unsigned";
-    if (o->no_pin == 0) av[k++] = "--pin";
-    if (o->no_pin == 1) av[k++] = "--no-pin";
+    if (o->pin > 0) av[k++] = "--pin";
+    if (o->pin < 0) av[k++] = "--no-pin";
     if (o->key) {
-      av[k++] = "--key";
+      av[k++] = "--trusted-key";
       av[k++] = o->key;
     }
     if (o->context) {
@@ -348,14 +349,27 @@ static int cmd_bench(int argc, char **argv, const Opts *o) {
   return 0;
 }
 
-static void progress(void *u, const char *path, long long done, long long total) {
+static void progress(void *u, long long done, long long total) {
   (void)u;
-  fprintf(stderr, "  %s %lld/%lld\n", path, done, total);
+  fprintf(stderr, "\r  %lld / %lld bytes", done, total);
+  if (done >= total) fprintf(stderr, "\n");
+}
+
+static TfClient *client(int argc, char **argv) {
+  TfClientOptions co = {0};
+  co.key = arg(argc, argv, "--key");
+  co.app_id = arg(argc, argv, "--app-id");
+  co.storage = arg(argc, argv, "--storage");
+  co.app_version = "cli";
+  co.trusted_key_hex = arg(argc, argv, "--trusted-key");
+  TfClient *c = tf_client_create(&co);
+  if (!c) exit(fail("client"));
+  return c;
 }
 
 int main(int argc, char **argv) {
   if (argc < 2 || flag(argc, argv, "--help")) {
-    fprintf(stderr, "tajweedformer %s: info | decode | serve | bench | download | portal (see the comment at the top of cli/tajweedformer.c)\n",
+    fprintf(stderr, "tajweedformer %s: info | decode | serve | bench | download | diagnose (see the comment at the top of cli/tajweedformer.c)\n",
             tf_version());
     return argc < 2 ? 2 : 0;
   }
@@ -363,45 +377,28 @@ int main(int argc, char **argv) {
   parse(&o, argc, argv);
   const char *c = argv[1];
   if (!strcmp(c, "download")) {
-    TfDownloadOptions d = tf_download_default_options();
-    d.key = arg(argc, argv, "--key");
-    d.revision = arg(argc, argv, "--revision");
-    d.dest = arg(argc, argv, "--dest");
-    if (arg(argc, argv, "--repo")) d.repo = arg(argc, argv, "--repo");
-    if (arg(argc, argv, "--folder")) d.folder = arg(argc, argv, "--folder");
-    if (arg(argc, argv, "--cdn")) d.cdn_url = arg(argc, argv, "--cdn");
-    d.contexts = arg(argc, argv, "--contexts");
-    d.progress = progress;
-    const int rc = tf_download_model(&d);
-    if (rc) fprintf(stderr, "download: %s\n", tf_last_error());
-    return rc ? 1 : 0;
-  }
-  if (!strcmp(c, "portal")) {
-    TfClientOptions co = tf_client_default_options();
-    co.key = arg(argc, argv, "--key");
-    co.app_id = arg(argc, argv, "--app-id");
-    co.storage_dir = arg(argc, argv, "--storage");
-    co.api_url = arg(argc, argv, "--api");
-    co.app_version = "cli";
-    co.trusted_key_hex = arg(argc, argv, "--config-key");
-    TfClient *cl = tf_client_create(&co);
-    if (!cl) {
-      fprintf(stderr, "portal: %s\n", tf_last_error());
-      return 1;
-    }
-    const int rc = tf_client_launch(cl);
-    if (rc) fprintf(stderr, "portal: %s\n", tf_last_error());
-    const char *cfg = tf_client_config_json(cl);
-    printf("%s\n", cfg ? cfg : "null");
+    TfClient *cl = client(argc, argv);
+    TfPrefetchOptions po = {0};
+    po.version = arg(argc, argv, "--version");
+    po.on_progress = progress;
+    const int rc = tf_client_prefetch(cl, &po);
+    if (rc) fail("download");
+    else printf("%s\n", tf_client_storage_json(cl));
     tf_client_destroy(cl);
     return rc ? 1 : 0;
+  }
+  if (!strcmp(c, "diagnose")) {
+    TfClient *cl = client(argc, argv);
+    const char *report = tf_client_diagnose_json(cl);
+    printf("%s\n", report ? report : "null");
+    tf_client_destroy(cl);
+    return report ? 0 : 1;
   }
   if (argc < 3) return 2;
   o.folder = argv[2];
   if (!strcmp(c, "info")) {
-    TfModel *m = open_model(&o, 16000, 0);
+    TfModel *m = open_model(&o);
     printf("%s\n", tf_model_info_json(m));
-    printf("%s\n", tf_settings_json(m));
     tf_model_close(m);
     return 0;
   }
