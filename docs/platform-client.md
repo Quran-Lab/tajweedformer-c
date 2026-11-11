@@ -1,4 +1,4 @@
-# How the SDK talks to Quran Lab (2.0.2)
+# How the SDK talks to Quran Lab (3.0.0)
 
 This page is the same in every TajweedFormer SDK (Android, iOS and macOS, web, Windows and Linux). It describes
 what the SDK sends to Quran Lab, when, and what an app can change. Names of the API differ per platform; the
@@ -63,11 +63,36 @@ answers "Share", and a learner who never answers never shares.
 
 The audio of each recitation session while the SDK listens (Opus in one Ogg stream, cut into segments of
 10, 20, 40, then 60 s, uploaded during and after the session), and one session description: the model
-version and backend, the SDK version, the device family and system major version, the capture sample rate
+version, its build and the backend, the SDK version, the device family and system major version, the capture sample rate
 and input kind (built in, wired, Bluetooth, ...), the UTC day, a random code for this install (with the
 public half of its deletion key and the hash of its recovery code at the first session), the consent
-version, and, for your own wording, `consent_text_sha256`. Not sent: which ayah was recited, names,
+version, for your own wording `consent_text_sha256`, and, since 3.0.0, the count of this install's shared
+recordings so far (`take_seq`: 1, 2, ...) and the time from the end of its previous recording to the start of
+this one, rounded to a tenth of a second and left out after more than an hour (`gap_ms_prev`). Not sent: which
+ayah was recited (an app-reported recited range is analytics only and never goes with a recording), names,
 accounts, contacts, location, device identifiers.
+
+### Takes in a row are one recording
+
+An app often stops and starts its takes while the learner keeps reciting. So when a take ends, the shared
+recording stays open for a few seconds (3 s, or what Quran Lab's signed config sets): if the next take starts
+in that time, its audio continues the same recording, one Ogg stream with no new headers, and the time between
+the takes is simply left out (no audio is made up for it). The recording closes when no take follows in time,
+when the app goes to the background, when sharing is turned off, after 20 minutes, or when the next take has
+another sample rate. For a recording of several takes the SDK sends, after its last segment, where each take
+starts in the stream and how long the pause before it was (in tenths of a second), so the takes can be told
+apart. If the server refuses that list as a bad request, the SDK keeps it and sends it again later (until it is
+accepted, sharing is turned off, or seven days pass) and reports the refusal once.
+
+### Lead-in and tail (3.0.0)
+
+A take that the SDK captures itself (`listen`) records only between its start and its end. An app that pushes
+its own audio and keeps capturing between takes can hand that audio to the SDK's sharing feed. While sharing
+is on and the learner said yes, the SDK keeps the last second of it in memory only, puts it before the next
+take (when the feed ran until at most half a second before the take), and adds up to half a second of it
+after a take, so a shared recording does not begin or end in the middle of a word. Without a yes, with
+sharing off, in the background and after "Delete what I shared" the fed audio is dropped at once and
+nothing of it is kept. The SDK never opens the microphone for this and the model never sees the feed.
 
 ### Bitrate on bad networks
 
@@ -102,16 +127,15 @@ sends the same body with the same `report_id`, which the server counts once. 202
 it; 401 renews the token and retries; 429, 5xx, 503 and network errors keep it for a retry with backoff.
 
 The body is telemetry v2 (`"v": 2`, `day`, `product`, `platform`, `sdk_version`, `app_version`, `device`,
-`cohorts` (may be `[]`), `coverage`, `downloads`) with these fields added, each left out when zero:
+`cohorts` (may be `[]`), `downloads`) with these fields added, each left out when zero:
 
 | Field | Meaning |
 | --- | --- |
 | `report_id` | random per delta, always sent |
 | `launches` | app launches: cold starts and returns from the background |
-| `ayahs` | ayahs the learner completed (scored) |
-| `surah_ayahs` | per surah, `"1"` to `"114"`, the ayahs completed |
-| `words` | words scored |
-| `rule_checks`, `rule_flags` | per tajweed rule or class id (`vowel_sub` ... `insertion`, `madd`, `qalqalah`, `gemination`, `word`), how many were checked and how many of those were flagged |
+| `ayahs`, `surah_ayahs`, `coverage` | REPORTED BY THE APP (3.0.0): the ayahs the app said the learner recited, in all and per surah (`"1"` to `"114"`). No ayah numbers, no order |
+| `rule_checks`, `rule_flags`, `words` | REPORTED BY THE APP (3.0.0): per rule name of the app's own judge, how many were checked and how many of those were flagged; `words` is the count checked under the rule `word` |
+| `reported` | which of the six fields above this body carries, so the dashboard labels them as reported by the app |
 | `share_asked`, `share_yes`, `share_no` | the sharing sheet was shown, the learner chose to share, the learner declined |
 | `promotions` | iOS, macOS and Android only: per accelerator, model revision and context, the promotions that ended and the failovers (below) |
 
@@ -198,7 +222,18 @@ the day; a day stamp on the device), not at every launch, so the server counts d
    once the app has configured Quran Lab with its key and the network is there; an app that never configures
    Quran Lab sends none.
 
-## Tajweed settings
+## What 3.0.0 measures, and what it no longer knows
 
-Unchanged: the app's settings win over the portal's tajweed block, which wins over the model's
-calibration.json.
+A cohort is one model version, its build, the context and the backend (`revision` carries the version, `build`
+the build id). Per cohort the SDK measures: sessions and how many were cancelled or failed, minutes, chunks,
+latency and real-time factor, load times, the margin and confidence of the tokens the model emitted, and since
+3.0.0 `takes`, `audio_s`, `speech_s` and `silence_s` (a 40 ms frame is speech when the model emitted a token
+within half a second of it), `tokens` per head, and `compute_s`. The SDK has no scorer since 3.0.0, so it
+sends no preset, no word level and no count of flags of its own: those numbers exist only when the app reports
+them (the table above), and nothing is sent when it does not.
+
+## Response time
+
+The response time chosen for an app on sdk.quranlab.ai reaches the SDK in the signed config
+(`inference.context`). The app's own choice in code wins over it, and the model's default applies when neither
+is set. There are no tajweed settings in 3.0.0: the SDK does not judge a recitation.

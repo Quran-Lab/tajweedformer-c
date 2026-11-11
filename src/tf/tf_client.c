@@ -24,22 +24,27 @@
 #include "tf_thread.h"
 
 extern const char *const TF_QURANLAB_KEY_HEX;
-char *tf__settings_json_alloc(TfModel *m);
 void tf__sharing_session(TfClient *c, int feedback, double audio_s);
 void tf__sharing_init(TfClient *c);
 void tf__sharing_free(TfClient *c);
 void tf__share_init(TfClient *c);
 void tf__share_free(TfClient *c);
-int tf_sharing_outbox_resume(TfClient *c);
+void tf__share_background(TfClient *c);
+void tf__share_window_check(TfClient *c);
+int tf__sharing_outbox_resume(TfClient *c);
 void tf__telemetry_add(TfClient *c, const char *field, long long n);
 int tf__client_telemetry_on(const TfClient *c);
 
-static int g_contrib_default;
-void zf_platform_set_contributions(int on) { g_contrib_default = on ? 1 : 0; }
-
 struct TfClient {
-  TfClientOptions o;
-  char *key, *app_id, *platform, *app_name, *app_version, *api, *dir, *language;
+  TfClientConfig o;
+  char *key, *app_id, *platform, *app_name, *app_version, *api, *cdn, *dir, *language;
+  char trusted_hex[65]; /* the config and manifest signing key in force */
+  char pin[24];         /* the model version the app pinned (sent as model_version), "" for none */
+  char config_pin[24];  /* the pin the stored config was asked with */
+  char stop_code[48];   /* the server's error code that stopped the network calls of this launch */
+  char stop_detail[48]; /* sdk_too_old: the version the answer names */
+  int last_error;       /* the catalogue code of the last failure a public call raised */
+  void *api_state;      /* tf_api.c's state */
   uint8_t pk[32];
   char kid[17];
   int bucket;
@@ -47,6 +52,7 @@ struct TfClient {
   char token[1024];
   long long token_exp;
   int stopped;         /* a stop code this launch: no more network calls */
+  volatile int cancel; /* the client is being destroyed: requests in flight are abandoned */
   char *config;        /* the last verified config body */
   char etag[80];
   long long config_exp;
@@ -59,12 +65,15 @@ struct TfClient {
   long long last_seal; /* when the last delta was sealed (the 15-minute send point) */
   long long next_try;  /* backoff of the timer's sends after a failure (in memory) */
   int fails;
-  /* the timer: a thread started by tf_client_launch */
+  /* the timer: a thread started by tf__client_launch */
   TfMutex tm;
   TfCond tcv;
   TfThread tth;
   int t_on, t_quit, t_send;
   int latest_logged;   /* the sdk_latest line was logged (once per client) */
+  char latest[24];     /* the SDK release the config in force names (sdk_latest.version), "" when none */
+  int answered;        /* the server answered an authenticated request of this client with a success */
+  int config_fresh;    /* the config in force was fetched or confirmed (304) by this client */
 };
 
 /* ------------------------------------------------------------------ small helpers */
@@ -92,7 +101,24 @@ const char *tf__client_dir(const TfClient *c) { return c->dir; }
 const char *tf__client_app(const TfClient *c) { return c->app_id; }
 const char *tf__client_platform(const TfClient *c) { return c->platform; }
 const char *tf__client_api(const TfClient *c) { return c->api; }
-const TfClientOptions *tf__client_options(const TfClient *c) { return &c->o; }
+const char *tf__client_cdn(const TfClient *c) { return c->cdn; }
+const char *tf__client_key(const TfClient *c) { return c->key; }
+const char *tf__client_trusted_hex(const TfClient *c) { return c->trusted_hex; }
+const char *tf__model_key_override;
+const char *tf__client_model_key(const TfClient *c) { return tf__model_key_override ? tf__model_key_override : c->trusted_hex; }
+void **tf__client_api_slot(TfClient *c) { return &c->api_state; }
+void tf__client_note_error(TfClient *c, int code) {
+  if (c) c->last_error = code;
+}
+int tf__client_last_error(const TfClient *c) { return c->last_error; }
+/* why the network calls of this launch stopped: the server's code ("invalid_key", "sdk_too_old", ...), or "" */
+const char *tf__client_stop_code(const TfClient *c) { return c->stop_code; }
+const char *tf__client_latest(const TfClient *c) { return c->latest[0] ? c->latest : NULL; }
+int tf__client_stopped(const TfClient *c) { return c->stopped; }
+int tf__client_answered(const TfClient *c) { return c->answered; }
+const char *tf__client_stop_detail(const TfClient *c) { return c->stop_detail; }
+void tf__client_set_pin(TfClient *c, const char *version) { snprintf(c->pin, sizeof c->pin, "%s", version ? version : ""); }
+const TfClientConfig *tf__client_options(const TfClient *c) { return &c->o; }
 void **tf__client_sharing_slot(TfClient *c) { return &c->sharing; }
 void **tf__client_share_slot(TfClient *c) { return &c->share; }
 int tf__client_os_major(void);
@@ -140,15 +166,62 @@ typedef struct {
   const char *extra_header;
 } Call;
 
-static int classify_stop(const TfHttpResponse *r) {
+static int classify_stop(TfClient *c, const TfHttpResponse *r);
+/* A 403 on a route a model needs (token, registration, config) whose code this SDK does not know (a newer
+ * server): it is a refusal all the same, so the app gets server_rejected with the code in the message, and the
+ * launch makes no more network calls. Codes the error table gives another meaning are not refusals of the app. */
+static void note_refusal(TfClient *c, const TfHttpResponse *r) {
+  if (r->status != 403 || c->stopped || !r->body) return;
+  static const char *const other[] = {"app_mismatch", "attestation_required", "contributions_disabled", "turnstile_required",
+                                      "turnstile_failed", "segment_cap", "contributor_revoked", "credential_not_accepted"};
+  TfJson *j = tf_json_parse(r->body, r->body_n, NULL);
+  const char *e = tf_json_str(tf_json_get(j, "error"));
+  int ok = e && *e && strlen(e) < sizeof c->stop_code;
+  for (const char *q = e; ok && *q; ++q) ok = (*q >= 'a' && *q <= 'z') || (*q >= '0' && *q <= '9') || *q == '_';
+  for (size_t i = 0; ok && i < sizeof other / sizeof other[0]; ++i) ok = strcmp(e, other[i]) != 0;
+  if (ok) {
+    snprintf(c->stop_code, sizeof c->stop_code, "%s", e);
+    c->stop_detail[0] = 0;
+    c->stopped = 1;
+  }
+  tf_json_free(j);
+}
+
+static int classify_stop(TfClient *c, const TfHttpResponse *r) {
   if (!r->body) return 0;
+  /* The answer's "reason" first: the server answers an origin, key-type or allow-list refusal as a bad key (401
+   * invalid_key, the code released SDKs stop on) and names the check that refused in "reason". When the
+   * catalogue has that refusal, it is the code the app is told; a bad key has no reason and reads as before. */
+  {
+    TfJson *j = tf_json_parse(r->body, r->body_n, NULL);
+    const char *why = tf_json_str(tf_json_get(j, "reason"));
+    const int known = why && strlen(why) < sizeof c->stop_code && tf__reason_known(why);
+    if (known) {
+      snprintf(c->stop_code, sizeof c->stop_code, "%s", why);
+      c->stop_detail[0] = 0;
+    }
+    tf_json_free(j);
+    if (known) return 1;
+  }
   static const char *const stops[] = {"invalid_key", "developer_not_approved", "not_a_member", "key_type_mismatch",
                                       "origin_not_allowed", "app_not_allowed", "app_blocked", "environment_mismatch",
                                       "sdk_too_old", "unauthorized"};
   for (size_t i = 0; i < sizeof stops / sizeof stops[0]; ++i) {
     char pat[64];
     snprintf(pat, sizeof pat, "\"error\":\"%s\"", stops[i]);
-    if (strstr(r->body, pat)) return 1;
+    if (!strstr(r->body, pat)) continue;
+    snprintf(c->stop_code, sizeof c->stop_code, "%s", stops[i]);
+    c->stop_detail[0] = 0;
+    if (!strcmp(stops[i], "sdk_too_old")) {
+      /* the answer names the version this key needs (min_sdk, or min_sdk_version) */
+      TfJson *j = tf_json_parse(r->body, r->body_n, NULL);
+      const char *v = tf_json_str(tf_json_get(j, "min_sdk"));
+      if (!v) v = tf_json_str(tf_json_get(j, "min_sdk_version"));
+      if (!v) v = tf_json_str(tf_json_get(j, "required"));
+      if (v && tf__version_at_least(v, "0")) snprintf(c->stop_detail, sizeof c->stop_detail, "%s", v);
+      tf_json_free(j);
+    }
+    return 1;
   }
   return 0;
 }
@@ -163,10 +236,10 @@ static int call(TfClient *c, const Call *k, TfHttpResponse *r) {
   return rc;
 }
 static int call_locked(TfClient *c, const Call *k, TfHttpResponse *r) {
-  if (c->stopped) return tf__fail(TF_ERR_NOT_AVAILABLE, "network calls are stopped for this launch");
-  if (!c->key) return tf__fail(TF_ERR_NOT_AVAILABLE, "no developer key");
+  if (c->stopped) return tf__fail(TF__ERR_NOT_AVAILABLE, "network calls are stopped for this launch");
+  if (!c->key) return tf__fail(TF__ERR_NOT_AVAILABLE, "no developer key");
   for (int attempt = 0; attempt < 2; ++attempt) {
-    if (k->auth && ensure_token(c)) return tf_last_error_code();
+    if (k->auth && ensure_token(c)) return tf__error_code();
     char url[2048], auth[1200];
     snprintf(url, sizeof url, "%s%s", c->api, k->path);
     const char *hdr[6];
@@ -185,7 +258,8 @@ static int call_locked(TfClient *c, const Call *k, TfHttpResponse *r) {
     q.body = k->body;
     q.body_n = k->body ? strlen(k->body) : 0;
     q.timeout_s = 30;
-    if (tf_http(&q, r)) return tf_last_error_code() ? tf_last_error_code() : TF_ERR_NETWORK;
+    q.cancel = &c->cancel;
+    if (tf_http(&q, r)) return tf__error_code() ? tf__error_code() : TF__ERR_NETWORK;
     if (r->status == 401 && k->auth && attempt == 0 && r->body && strstr(r->body, "invalid_token")) {
       c->token[0] = 0;
       c->token_exp = 0;
@@ -194,7 +268,8 @@ static int call_locked(TfClient *c, const Call *k, TfHttpResponse *r) {
     }
     break;
   }
-  if (r->status >= 400 && classify_stop(r)) c->stopped = 1;
+  if (r->status >= 400 && classify_stop(c, r)) c->stopped = 1;
+  if (r->status >= 200 && r->status < 400) c->answered = 1;
   return 0;
 }
 
@@ -202,6 +277,13 @@ int tf__client_call(TfClient *c, const char *method, const char *path, const cha
                     TfHttpResponse *r) {
   Call k = {method, path, body, auth, extra};
   return call(c, &k, r);
+}
+/* the app token was refused (a 401 whatever its error code): the next call with a token asks for a new one */
+void tf__client_token_forget(TfClient *c) {
+  tf_mutex_lock(&c->lock);
+  c->token[0] = 0;
+  c->token_exp = 0;
+  tf_mutex_unlock(&c->lock);
 }
 
 /* ------------------------------------------------------------------ state */
@@ -215,6 +297,8 @@ static void save_state(TfClient *c) {
   tf_buf_json_str(&b, c->etag);
   tf_buf_printf(&b, ",\"config_exp\":%lld,\"register_day\":", c->config_exp);
   tf_buf_json_str(&b, c->register_day);
+  tf_buf_puts(&b, ",\"config_pin\":");
+  tf_buf_json_str(&b, c->config_pin);
   tf_buf_puts(&b, "}");
   char *p = spath(c, "client.json");
   if (p && b.p) tf_write_file(p, b.p, b.n);
@@ -242,6 +326,8 @@ static void load_state(TfClient *c) {
     c->config_exp = ce && ce->type == TJ_NUM ? (long long)ce->num : 0;
     const char *rd = tf_json_str(tf_json_get(j, "register_day"));
     if (rd && strlen(rd) == 10) snprintf(c->register_day, sizeof c->register_day, "%s", rd);
+    const char *cp0 = tf_json_str(tf_json_get(j, "config_pin"));
+    if (cp0) snprintf(c->config_pin, sizeof c->config_pin, "%s", cp0);
     tf_json_free(j);
   } else {
     c->bucket = -1;
@@ -262,21 +348,18 @@ static void load_state(TfClient *c) {
   free(cp);
 }
 
-TfClientOptions tf_client_default_options(void) {
-  TfClientOptions o;
+TfClientConfig tf__client_default_config(void) {
+  TfClientConfig o;
   memset(&o, 0, sizeof o);
-  o.struct_size = sizeof o;
   o.telemetry = 1;
-  o.contributions = g_contrib_default;
   return o;
 }
 
-TfClient *tf_client_create(const TfClientOptions *opt) {
+TfClient *tf__client_open(const TfClientConfig *opt) {
   tf__clear_error();
-  TfClientOptions o = tf_client_default_options();
-  if (opt) memcpy(&o, opt, opt->struct_size && opt->struct_size < sizeof o ? opt->struct_size : sizeof o);
+  TfClientConfig o = opt ? *opt : tf__client_default_config();
   if (!o.storage_dir || !o.app_id) {
-    tf__fail(TF_ERR_ARGUMENT, "storage_dir and app_id are required");
+    tf__fail(TF_ERR_INVALID_ARGUMENT, "a storage folder and an app id are required");
     return NULL;
   }
   TfClient *c = (TfClient *)calloc(1, sizeof *c);
@@ -293,6 +376,7 @@ TfClient *tf_client_create(const TfClientOptions *opt) {
   c->app_name = dupstr(o.app_name);
   c->app_version = dupstr(o.app_version ? o.app_version : "0");
   c->api = dupstr(o.api_url ? o.api_url : "https://api.quranlab.ai");
+  c->cdn = dupstr(o.cdn_url ? o.cdn_url : "https://cdn.quranlab.ai/models");
   c->dir = dupstr(o.storage_dir);
   c->language = dupstr(o.language ? o.language : "en");
   c->o.key = c->key;
@@ -301,14 +385,16 @@ TfClient *tf_client_create(const TfClientOptions *opt) {
   c->o.app_name = c->app_name;
   c->o.app_version = c->app_version;
   c->o.api_url = c->api;
+  c->o.cdn_url = c->cdn;
   c->o.storage_dir = c->dir;
   c->o.language = c->language;
   c->o.trusted_key_hex = NULL;
   {
     uint8_t h[32];
-    if (tf_hex_decode(opt && opt->trusted_key_hex ? opt->trusted_key_hex : TF_QURANLAB_KEY_HEX, c->pk, 32)) {
-      tf__fail(TF_ERR_ARGUMENT, "trusted_key_hex is not 64 hex digits");
-      tf_client_destroy(c);
+    snprintf(c->trusted_hex, sizeof c->trusted_hex, "%s", opt && opt->trusted_key_hex ? opt->trusted_key_hex : TF_QURANLAB_KEY_HEX);
+    if (strlen(opt && opt->trusted_key_hex ? opt->trusted_key_hex : TF_QURANLAB_KEY_HEX) != 64 || tf_hex_decode(c->trusted_hex, c->pk, 32)) {
+      tf__fail(TF_ERR_INVALID_ARGUMENT, "trusted_key_hex is not 64 hex digits");
+      tf__client_close(c);
       return NULL;
     }
     tf_sha256(c->pk, 32, h);
@@ -317,8 +403,8 @@ TfClient *tf_client_create(const TfClientOptions *opt) {
   size_t n = strlen(c->api);
   while (n && c->api[n - 1] == '/') c->api[--n] = 0;
   if (tf_mkdirs(c->dir)) {
-    tf__fail(TF_ERR_IO, "cannot create the storage directory");
-    tf_client_destroy(c);
+    tf__fail(TF_ERR_STORAGE_FAILED, "cannot create %s", c->dir);
+    tf__client_close(c);
     return NULL;
   }
   load_state(c);
@@ -334,9 +420,15 @@ TfClient *tf_client_create(const TfClientOptions *opt) {
 static void timer_stop(TfClient *c);
 static int telemetry_send_point(TfClient *c);
 
-void tf_client_destroy(TfClient *c) {
+void tf__client_cancel_calls(TfClient *c, int on) {
+  if (on) tf__http_cancel(&c->cancel);
+  else c->cancel = 0;
+}
+
+void tf__client_close(TfClient *c) {
   if (!c) return;
   timer_stop(c);
+  c->cancel = 0; /* the last send point below is a request of its own */
   /* closing the client is a send point (what is not sent stays on disk for the next launch) */
   if (c->key && tf__client_telemetry_on(c)) telemetry_send_point(c);
   tf__share_free(c);
@@ -347,6 +439,7 @@ void tf_client_destroy(TfClient *c) {
   free(c->app_name);
   free(c->app_version);
   free(c->api);
+  free(c->cdn);
   free(c->dir);
   free(c->language);
   free(c->config);
@@ -374,14 +467,15 @@ static int ensure_token(TfClient *c) {
   tf_buf_free(&b);
   if (rc) return rc;
   if (r.status != 200) {
-    rc = tf__fail(TF_ERR_HTTP, "token: HTTP %d %s", r.status, r.body ? r.body : "");
+    note_refusal(c, &r);
+    rc = tf__fail(TF__ERR_HTTP, "token: HTTP %d %s", r.status, r.body ? r.body : "");
     tf_http_response_free(&r);
     return rc;
   }
   TfJson *j = tf_json_parse(r.body, r.body_n, NULL);
   const char *t = tf_json_str(tf_json_get(j, "token"));
   const TfJson *e = tf_json_get(j, "expires_in");
-  if (!t || strlen(t) >= sizeof c->token) rc = tf__fail(TF_ERR_HTTP, "token: no token in the answer");
+  if (!t || strlen(t) >= sizeof c->token) rc = tf__fail(TF__ERR_HTTP, "token: no token in the answer");
   else {
     snprintf(c->token, sizeof c->token, "%s", t);
     c->token_exp = now_unix() + (e && e->type == TJ_NUM ? (long long)e->num : 3600);
@@ -395,9 +489,9 @@ static int ensure_token(TfClient *c) {
 /* ------------------------------------------------------------------ register */
 /* Once per UTC day per install (2.0.1: the server counts daily active installs; launches go in the telemetry): the
  * day stamp is written only after a 200, so a failed attempt is tried again (and new_install survives it). */
-int tf_client_register(TfClient *c) {
+int tf__client_register(TfClient *c) {
   tf__clear_error();
-  if (!c) return tf__fail(TF_ERR_ARGUMENT, "no client");
+  if (!c) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
   char today[11];
   day_utc(today, 0);
   if (!strcmp(c->register_day, today)) return 0;
@@ -426,7 +520,8 @@ int tf_client_register(TfClient *c) {
     save_state(c);
     tf_mutex_unlock(&c->lock);
   } else {
-    rc = tf__fail(TF_ERR_HTTP, "register: HTTP %d %s", r.status, r.body ? r.body : "");
+    note_refusal(c, &r);
+    rc = tf__fail(TF__ERR_HTTP, "register: HTTP %d %s", r.status, r.body ? r.body : "");
   }
   tf_http_response_free(&r);
   return rc;
@@ -434,32 +529,35 @@ int tf_client_register(TfClient *c) {
 
 /* ------------------------------------------------------------------ config */
 /* Verify a config body as received: kid pinned, Ed25519 over the exact bytes, v 1, expires_at in the future.
- * Returns 0 and the expiry, or TF_ERR_CONFIG. Exposed for the tests (the recorded fixtures). */
+ * Returns 0 and the expiry, or TF__ERR_CONFIG. Exposed for the tests (the recorded fixtures). */
 int tf__verify_config(const uint8_t pk[32], const char *kid_pinned, const char *body, size_t n, const char *sig_header,
                       const char *kid, long long now, long long *expires) {
-  if (!kid || _tf_strnicmp(kid, kid_pinned, 17)) return tf__fail(TF_ERR_CONFIG, "config: unknown key id %s", kid ? kid : "");
-  if (!sig_header || strncmp(sig_header, "ed25519=", 8)) return tf__fail(TF_ERR_CONFIG, "config: no ed25519 signature");
+  if (!kid || _tf_strnicmp(kid, kid_pinned, 17)) return tf__fail(TF__ERR_CONFIG, "config: unknown key id %s", kid ? kid : "");
+  if (!sig_header || strncmp(sig_header, "ed25519=", 8)) return tf__fail(TF__ERR_CONFIG, "config: no ed25519 signature");
   uint8_t sig[70];
-  if (tf_base64_decode(sig_header + 8, sig, sizeof sig) != 64) return tf__fail(TF_ERR_CONFIG, "config: malformed signature");
-  if (!tf_ed25519_verify(sig, (const uint8_t *)body, n, pk)) return tf__fail(TF_ERR_CONFIG, "config: the signature does not verify");
+  if (tf_base64_decode(sig_header + 8, sig, sizeof sig) != 64) return tf__fail(TF__ERR_CONFIG, "config: malformed signature");
+  if (!tf_ed25519_verify(sig, (const uint8_t *)body, n, pk)) return tf__fail(TF__ERR_CONFIG, "config: the signature does not verify");
   TfJson *j = tf_json_parse(body, n, NULL);
   const TfJson *v = tf_json_get(j, "v"), *e = tf_json_get(j, "expires_at");
   int rc = 0;
-  if (!v || v->type != TJ_NUM || v->num != 1) rc = tf__fail(TF_ERR_CONFIG, "config: v is not 1");
-  else if (!e || e->type != TJ_NUM || (long long)e->num <= now) rc = tf__fail(TF_ERR_CONFIG, "config: expired");
+  if (!v || v->type != TJ_NUM || v->num != 1) rc = tf__fail(TF__ERR_CONFIG, "config: v is not 1");
+  else if (!e || e->type != TJ_NUM || (long long)e->num <= now) rc = tf__fail(TF__ERR_CONFIG, "config: expired");
   else if (expires) *expires = (long long)e->num;
   tf_json_free(j);
   return rc;
 }
 
-static void check_sdk_latest(TfClient *c);
-int tf_client_refresh_config(TfClient *c) {
+void tf__client_check_latest(TfClient *c);
+static void check_pin(TfClient *c);
+int tf__client_refresh_config(TfClient *c) {
   tf__clear_error();
-  if (!c) return tf__fail(TF_ERR_ARGUMENT, "no client");
+  if (!c) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
   char path[256], inm[120];
-  snprintf(path, sizeof path, "/v1/config?bucket=%d&sdk=%s", c->bucket, TF_SDK_VERSION);
+  /* SPEC 2a: a pinned model version goes with the request; the server answers that version's build for this SDK */
+  if (c->pin[0]) snprintf(path, sizeof path, "/v1/config?bucket=%d&sdk=%s&model_version=%s", c->bucket, TF_SDK_VERSION, c->pin);
+  else snprintf(path, sizeof path, "/v1/config?bucket=%d&sdk=%s", c->bucket, TF_SDK_VERSION);
   /* within 1 h of expiry: ask without If-None-Match for a freshly signed body */
-  const int conditional = c->config && c->etag[0] && c->config_exp - now_unix() > 3600;
+  const int conditional = c->config && c->etag[0] && c->config_exp - now_unix() > 3600 && !strcmp(c->pin, c->config_pin);
   snprintf(inm, sizeof inm, "if-none-match: %s", c->etag);
   Call k = {"GET", path, NULL, 1, conditional ? inm : NULL};
   TfHttpResponse r;
@@ -467,17 +565,19 @@ int tf_client_refresh_config(TfClient *c) {
   if (rc) return rc;
   if (r.status == 304 && c->config) {
     tf_http_response_free(&r);
+    c->config_fresh = 1;
     return 0;
   }
   if (r.status != 200) {
-    rc = tf__fail(TF_ERR_HTTP, "config: HTTP %d", r.status);
+    note_refusal(c, &r);
+    rc = tf__fail(TF__ERR_HTTP, "config: HTTP %d", r.status);
     tf_http_response_free(&r);
     return rc;
   }
   long long exp = 0;
   rc = tf__verify_config(c->pk, c->kid, r.body, r.body_n, r.signature, r.key_id, now_unix(), &exp);
   if (rc) {
-    tf_client_report_issue(c, "signature_invalid", "config", NULL);
+    tf__client_report_issue(c, "signature_invalid", "config", NULL);
     tf_http_response_free(&r);
     return rc; /* the last good config stays */
   }
@@ -486,19 +586,25 @@ int tf_client_refresh_config(TfClient *c) {
   c->config = r.body;
   r.body = NULL;
   c->config_exp = exp;
+  c->config_fresh = 1;
   snprintf(c->etag, sizeof c->etag, "%s", r.etag);
+  snprintf(c->config_pin, sizeof c->config_pin, "%s", c->pin);
   char *p = spath(c, "config.body");
   if (p) tf_write_file(p, c->config, strlen(c->config));
   free(p);
   save_state(c);
   tf_mutex_unlock(&c->lock);
   tf_http_response_free(&r);
-  check_sdk_latest(c);
+  tf__client_check_latest(c);
+  check_pin(c);
+  /* 2.0.3: a config that turns sharing off, or sets another join window, reaches a recording that waits for its
+   * next take now, not at the end of the window it started with */
+  tf__share_window_check(c);
   return 0;
 }
 
 /* ------------------------------------------------------------------ the developer's log and sdk_latest */
-/* debug builds only (the app's TfClientOptions.debug_build: the library itself is always a release build, so its
+/* debug builds only (the app's TfClientConfig.debug_build: the library itself is always a release build, so its
  * own NDEBUG says nothing about the app); the app's callback, or stderr without one */
 void tf__client_log(TfClient *c, int level, const char *message) {
   if (!c || !c->o.debug_build || !message) return;
@@ -537,8 +643,7 @@ static int version_newer(const char *a, const char *b) {
  * (not an object, a version that is not dotted numbers, severity not a short lower-case word, url not https) is
  * ignored without an error. Tried and rejected: an error code or a callback of its own (the app needs nothing
  * more than the line in its debug log). */
-static void check_sdk_latest(TfClient *c) {
-  if (c->latest_logged || !c->o.debug_build) return;
+void tf__client_check_latest(TfClient *c) {
   tf_mutex_lock(&c->lock);
   TfJson *j = c->config && c->config_exp > now_unix() ? tf_json_parse(c->config, strlen(c->config), NULL) : NULL;
   tf_mutex_unlock(&c->lock);
@@ -548,26 +653,60 @@ static void check_sdk_latest(TfClient *c) {
   int ok = l && l->type == TJ_OBJ && v && sev && url && *sev && strlen(sev) <= 32 && !strncmp(url, "https://", 8) && strlen(url) < 512;
   for (const char *p = sev; ok && *p; ++p) ok = (*p >= 'a' && *p <= 'z') || *p == '_' || *p == '-';
   for (const char *p = url; ok && *p; ++p) ok = (unsigned char)*p > 0x20 && (unsigned char)*p < 0x7f;
-  if (ok && version_newer(v, TF_SDK_VERSION)) {
+  if (ok && version_newer(v, TF_SDK_VERSION) && !c->latest_logged && c->o.debug_build) {
     char line[700];
     snprintf(line, sizeof line, "Quran Lab SDK %s is available (%s), you have %s: %s", v, sev, TF_SDK_VERSION, url);
     tf__client_log(c, TF_LOG_WARNING, line);
     c->latest_logged = 1;
   }
+  /* kept for tf_client_diagnose, whatever the build */
+  snprintf(c->latest, sizeof c->latest, "%s", ok && tf__is_model_version(v) ? v : "");
   tf_json_free(j);
 }
 
-const char *tf_client_config_json(TfClient *c) {
+const char *tf__client_config_json(TfClient *c) {
   if (!c || !c->config) return NULL;
   if (c->config_exp <= now_unix()) return NULL;
   return c->config;
 }
 
-int tf_client_apply_config(TfClient *c, TfModel *m) {
-  const char *cfg = tf_client_config_json(c);
-  if (!m) return tf__fail(TF_ERR_ARGUMENT, "no model");
-  const int d = tf_settings_set_remote_json(m, cfg, cfg ? strlen(cfg) : 0);
-  return d < 0 ? d : 0;
+/* SPEC 2a: when the server cannot give the pinned version to this SDK it answers its normal choice plus
+ * "pin": {"version", "status": "unavailable"}; a debug build logs that once per answer. */
+static void check_pin(TfClient *c) {
+  if (!c->pin[0] || !c->o.debug_build) return;
+  char status[32];
+  if (tf__client_pin_status(c, status, sizeof status) && strcmp(status, "ok")) {
+    char line[160];
+    snprintf(line, sizeof line, "the pinned model version %s is %s for this SDK; Quran Lab's choice is used", c->pin, status);
+    tf__client_log(c, TF_LOG_WARNING, line);
+  }
+}
+/* the config's answer to the pin: its status ("unavailable", ...) copied into out and 1; 0 when the config has no
+ * "pin" entry (the pin was honoured, or none was sent) */
+int tf__client_pin_status(TfClient *c, char *out, size_t n) {
+  tf_mutex_lock(&c->lock);
+  TfJson *j = c->config && c->config_exp > now_unix() ? tf_json_parse(c->config, strlen(c->config), NULL) : NULL;
+  tf_mutex_unlock(&c->lock);
+  const char *st = tf_json_str(tf_json_get(tf_json_get(j, "pin"), "status"));
+  if (st) snprintf(out, n, "%s", st);
+  tf_json_free(j);
+  return st != NULL;
+}
+/* the signed config's inference.context (SPEC section 3): the portal's Response time setting. Any string here; the
+ * Model ignores one its build does not have. */
+const char *tf__client_inference_context(TfClient *c, char *out, size_t n) {
+  tf_mutex_lock(&c->lock);
+  TfJson *j = c->config && c->config_exp > now_unix() ? tf_json_parse(c->config, strlen(c->config), NULL) : NULL;
+  tf_mutex_unlock(&c->lock);
+  const char *ctx = tf_json_str(tf_json_get(tf_json_get(j, "inference"), "context"));
+  const int ok = ctx && *ctx && strlen(ctx) < n;
+  if (ok) snprintf(out, n, "%s", ctx);
+  tf_json_free(j);
+  return ok ? out : NULL;
+}
+const char *tf__client_config_state(TfClient *c) {
+  if (c->config && c->config_exp > now_unix()) return "fresh"; /* a verified config that has not expired is in force */
+  return c->config_exp > 0 ? "stale" : "none";                 /* the stored config is past its expires_at */
 }
 
 /* flags.<name> of the verified config; `dflt` when absent */
@@ -581,6 +720,21 @@ int tf__client_flag(const TfClient *c, const char *name, int dflt) {
   tf_mutex_unlock((TfMutex *)&c->lock);
   const TfJson *f = tf_json_get(tf_json_get(j, "flags"), name);
   const int v = f && f->type == TJ_BOOL ? f->boolean : dflt;
+  tf_json_free(j);
+  return v;
+}
+/* flags.<name> of the verified config when it is a whole number lo to hi; `dflt` when it is absent, anything else (a
+ * boolean, a string, a fraction, a number outside the range) or no config is in force */
+int tf__client_flag_int(const TfClient *c, const char *name, int lo, int hi, int dflt) {
+  tf_mutex_lock((TfMutex *)&c->lock);
+  if (!c->config || c->config_exp <= now_unix()) {
+    tf_mutex_unlock((TfMutex *)&c->lock);
+    return dflt;
+  }
+  TfJson *j = tf_json_parse(c->config, strlen(c->config), NULL);
+  tf_mutex_unlock((TfMutex *)&c->lock);
+  const TfJson *f = tf_json_get(tf_json_get(j, "flags"), name);
+  const int v = tf_json_is_int(f) && f->num >= lo && f->num <= hi ? (int)f->num : dflt;
   tf_json_free(j);
   return v;
 }
@@ -600,6 +754,13 @@ void tf__client_upload_trust(const TfClient *c, char *out, size_t n) {
 }
 
 /* ------------------------------------------------------------------ telemetry v2 */
+/* SDK 3.0.0 (SPEC section 6). What the SDK measures itself, per cohort (one per model version, build, context and
+ * backend): sessions, minutes, chunks, aborted, fallbacks, self_test, latency_ms, rtf, cold_start_ms,
+ * model_load_ms, thermal, margin, confidence (6.1, kept from 2.x), and takes, audio_s, speech_s, silence_s, tokens
+ * per head and compute_s (6.2, each left out when zero). Nothing derived from scoring or settings is left: no
+ * preset, word level, classes, madd or words per cohort. What the app reports through tf_session_report_recited
+ * and tf_client_report_checks (6.3): ayahs, surah_ayahs, coverage, words, rule_checks, rule_flags, named in the
+ * body's "reported" list so the portal labels them. Never audio, text, ids or times. */
 #define NB(a) ((int)(sizeof(a) / sizeof((a)[0])))
 static const char *const kFb[] = {"non_finite", "deadline", "ane_unavailable", "npu_unavailable", "model_load", "thermal", "memory", "other"};
 static const char *const kLat[] = {"le_5", "le_10", "le_20", "le_40", "le_80", "le_160", "le_320", "gt_320"};
@@ -608,38 +769,44 @@ static const char *const kRtf[] = {"le_0_1", "le_0_25", "le_0_5", "le_1", "gt_1"
 static const double kRtfV[] = {0.1, 0.25, 0.5, 1};
 static const char *const kMs[] = {"le_250", "le_500", "le_1000", "le_2000", "le_4000", "gt_4000"};
 static const double kMsV[] = {250, 500, 1000, 2000, 4000};
-static const char *const kChecks[] = {"letters", "vowels", "length", "madd", "gemination", "qalqalah", "lazim"};
-static const char *const kClasses[] = {"vowel_sub", "vowel_del", "vowel_ins", "short_to_long", "long_to_short", "cons_sub", "cons_del", "insertion"};
-static const char *const kPct[] = {"le_1", "le_2", "le_5", "le_10", "le_20", "gt_20"};
-static const double kPctV[] = {1, 2, 5, 10, 20};
 static const char *const kMargin[] = {"le_0_5", "le_1", "le_2", "le_4", "le_8", "gt_8"};
 static const double kMarginV[] = {0.5, 1, 2, 4, 8};
 static const char *const kConf[] = {"le_0_5", "le_0_7", "le_0_8", "le_0_9", "le_0_95", "gt_0_95"};
 static const double kConfV[] = {0.5, 0.7, 0.8, 0.9, 0.95};
-static const char *const kMadd[] = {"c2", "c4", "c6", "flagged"};
 
 typedef struct {
-  char revision[64], context[16], backend[16], preset[16], word_level[12], word_bucket[8];
-  long long site_overrides, sessions, chunks, aborted;
+  char revision[32], build[41], context[16], backend[16];
+  long long sessions, chunks, aborted, takes;
   double minutes;
-  long long fb[8], st[2], lat[8], rtf[5], cold[6], load[6], thermal[2], checks[7], cls[8][2], sfp[6], margin[6], conf[6],
-      madd[4], words[2];
+  /* 6.2, whole units so that sums stay exact: ms of audio, of speech and of silence; microseconds of compute */
+  long long audio_ms, speech_ms, silence_ms, compute_us;
+  long long fb[8], st[2], lat[8], rtf[5], cold[6], load[6], thermal[2], margin[6], conf[6];
+  long long tokens[TF_HEAD_COUNT];
 } Cohort;
-/* the 2.0.1 rule keys: each site class, then madd, qalqalah, gemination and word */
-static const char *const kRule[] = {"vowel_sub", "vowel_del", "vowel_ins", "short_to_long", "long_to_short", "cons_sub", "cons_del",
-                                    "insertion", "madd", "qalqalah", "gemination", "word"};
-enum { R_MADD = 8, R_QALQALAH = 9, R_GEMINATION = 10, R_WORD = 11, N_RULE = 12 };
+#define MAX_RULES 32 /* distinct rules a day; later ones are dropped (SPEC 6.3) */
+#define MAX_DOWNLOADS 8 /* builds with a download a day (the server takes at most 8 entries) */
+typedef struct {
+  char name[25];
+  long long checks, flags;
+} Rule;
 typedef struct {
   Cohort co[16];
   int n;
-  long long coverage[115];
-  /* 2.0.1 */
-  long long launches, ayahs, words, surah_ayahs[115], rule[N_RULE][2], share_asked, share_yes, share_no;
+  long long launches, share_asked, share_yes, share_no;
+  /* app-reported */
+  long long ayahs, words, surah_ayahs[115];
+  Rule rules[MAX_RULES];
+  int n_rules;
+  /* model downloads: per build, the attempts that ended and the bytes fetched */
+  struct {
+    char revision[32], build[41];
+    long long bytes, success, failed, resumed;
+  } dl[MAX_DOWNLOADS];
+  int n_dl;
 } Day;
 static int day_empty(const Day *d) {
-  long long any = d->n + d->launches + d->ayahs + d->words + d->share_asked + d->share_yes + d->share_no;
-  for (int s = 1; s <= 114; ++s) any += d->coverage[s] + d->surah_ayahs[s];
-  for (int k = 0; k < N_RULE; ++k) any += d->rule[k][0];
+  long long any = d->n + d->launches + d->ayahs + d->words + d->share_asked + d->share_yes + d->share_no + d->n_rules + d->n_dl;
+  for (int s = 1; s <= 114; ++s) any += d->surah_ayahs[s];
   return any == 0;
 }
 
@@ -667,6 +834,27 @@ static long long num(const TfJson *o, const char *k) {
   const TfJson *v = tf_json_get(o, k);
   return v && v->type == TJ_NUM ? (long long)v->num : 0;
 }
+static double numd(const TfJson *o, const char *k) {
+  const TfJson *v = tf_json_get(o, k);
+  return v && v->type == TJ_NUM ? v->num : 0;
+}
+/* 1 when name is a rule id: ^[a-z][a-z0-9_]{0,23}$ */
+int tf__rule_name_ok(const char *name) {
+  if (!name || !(name[0] >= 'a' && name[0] <= 'z')) return 0;
+  size_t n = 1;
+  for (; name[n]; ++n)
+    if (n >= 24 || !((name[n] >= 'a' && name[n] <= 'z') || (name[n] >= '0' && name[n] <= '9') || name[n] == '_')) return 0;
+  return 1;
+}
+static Rule *day_rule(Day *d, const char *name, int add) {
+  for (int i = 0; i < d->n_rules; ++i)
+    if (!strcmp(d->rules[i].name, name)) return &d->rules[i];
+  if (!add || d->n_rules >= MAX_RULES || !tf__rule_name_ok(name)) return NULL;
+  Rule *r = &d->rules[d->n_rules++];
+  memset(r, 0, sizeof *r);
+  snprintf(r->name, sizeof r->name, "%s", name);
+  return r;
+}
 
 static void day_load_file(const TfClient *c, const char *name, Day *d) {
   memset(d, 0, sizeof *d);
@@ -684,17 +872,18 @@ static void day_load_file(const TfClient *c, const char *name, Day *d) {
     const TfJson *o = &cs->kids[i];
     Cohort *x = &d->co[d->n++];
     copy_str(x->revision, sizeof x->revision, o, "revision");
+    copy_str(x->build, sizeof x->build, o, "build");
     copy_str(x->context, sizeof x->context, o, "context");
     copy_str(x->backend, sizeof x->backend, o, "backend");
-    copy_str(x->preset, sizeof x->preset, o, "preset");
-    copy_str(x->word_level, sizeof x->word_level, o, "word_level");
-    copy_str(x->word_bucket, sizeof x->word_bucket, o, "word_bucket");
-    x->site_overrides = num(o, "site_overrides");
     x->sessions = num(o, "sessions");
     x->chunks = num(o, "chunks");
     x->aborted = num(o, "aborted");
-    const TfJson *mi = tf_json_get(o, "minutes");
-    x->minutes = mi && mi->type == TJ_NUM ? mi->num : 0;
+    x->takes = num(o, "takes");
+    x->minutes = numd(o, "minutes");
+    x->audio_ms = num(o, "audio_ms");
+    x->speech_ms = num(o, "speech_ms");
+    x->silence_ms = num(o, "silence_ms");
+    x->compute_us = num(o, "compute_us");
     read_arr(tf_json_get(o, "fallbacks"), kFb, 8, x->fb);
     static const char *const stn[] = {"pass", "fail"};
     read_arr(tf_json_get(o, "self_test"), stn, 2, x->st);
@@ -704,28 +893,28 @@ static void day_load_file(const TfClient *c, const char *name, Day *d) {
     read_arr(tf_json_get(o, "model_load_ms"), kMs, 6, x->load);
     static const char *const thn[] = {"transitions", "throttled_sessions"};
     read_arr(tf_json_get(o, "thermal"), thn, 2, x->thermal);
-    read_arr(tf_json_get(o, "checks_on"), kChecks, 7, x->checks);
-    for (int k = 0; k < 8; ++k) {
-      const TfJson *cl = tf_json_get(tf_json_get(o, "classes"), kClasses[k]);
-      x->cls[k][0] = num(cl, "sites");
-      x->cls[k][1] = num(cl, "flagged");
-    }
-    read_arr(tf_json_get(o, "session_flag_pct"), kPct, 6, x->sfp);
     read_arr(tf_json_get(o, "margin"), kMargin, 6, x->margin);
     read_arr(tf_json_get(o, "confidence"), kConf, 6, x->conf);
-    read_arr(tf_json_get(o, "madd"), kMadd, 4, x->madd);
-    static const char *const wn[] = {"scored", "flagged"};
-    read_arr(tf_json_get(o, "words"), wn, 2, x->words);
-  }
-  const TfJson *cov = tf_json_get(j, "coverage");
-  for (int i = 0; cov && cov->type == TJ_OBJ && i < cov->n; ++i) {
-    const int s = atoi(cov->kids[i].key);
-    if (s >= 1 && s <= 114 && cov->kids[i].type == TJ_NUM) d->coverage[s] = (long long)cov->kids[i].num;
+    for (int h = 0; h < TF_HEAD_COUNT; ++h) x->tokens[h] = num(tf_json_get(o, "tokens"), tf_head_info(h)->name);
   }
   d->launches = num(j, "launches");
   d->ayahs = num(j, "ayahs");
   d->words = num(j, "words");
   d->share_asked = num(j, "share_asked");
+  const TfJson *dls = tf_json_get(j, "downloads");
+  for (int i = 0; dls && dls->type == TJ_ARR && i < dls->n && d->n_dl < MAX_DOWNLOADS; ++i) {
+    const TfJson *x = &dls->kids[i];
+    const char *rv = tf_json_str(tf_json_get(x, "revision")), *bd = tf_json_str(tf_json_get(x, "build"));
+    if (!rv || !bd) continue;
+    memset(&d->dl[d->n_dl], 0, sizeof d->dl[0]);
+    snprintf(d->dl[d->n_dl].revision, sizeof d->dl[0].revision, "%s", rv);
+    snprintf(d->dl[d->n_dl].build, sizeof d->dl[0].build, "%s", bd);
+    d->dl[d->n_dl].bytes = num(x, "bytes");
+    d->dl[d->n_dl].success = num(x, "success");
+    d->dl[d->n_dl].failed = num(x, "failed");
+    d->dl[d->n_dl].resumed = num(x, "resumed");
+    d->n_dl++;
+  }
   d->share_yes = num(j, "share_yes");
   d->share_no = num(j, "share_no");
   const TfJson *sa = tf_json_get(j, "surah_ayahs");
@@ -733,9 +922,12 @@ static void day_load_file(const TfClient *c, const char *name, Day *d) {
     const int s = atoi(sa->kids[i].key);
     if (s >= 1 && s <= 114 && sa->kids[i].type == TJ_NUM) d->surah_ayahs[s] = (long long)sa->kids[i].num;
   }
-  for (int k = 0; k < N_RULE; ++k) {
-    d->rule[k][0] = num(tf_json_get(j, "rule_checks"), kRule[k]);
-    d->rule[k][1] = num(tf_json_get(j, "rule_flags"), kRule[k]);
+  const TfJson *rc = tf_json_get(j, "rule_checks"), *rf = tf_json_get(j, "rule_flags");
+  for (int i = 0; rc && rc->type == TJ_OBJ && i < rc->n; ++i) {
+    Rule *r = rc->kids[i].type == TJ_NUM ? day_rule(d, rc->kids[i].key, 1) : NULL;
+    if (!r) continue;
+    r->checks = (long long)rc->kids[i].num;
+    r->flags = num(rf, r->name);
   }
   tf_json_free(j);
 }
@@ -749,8 +941,16 @@ static void day_load(const TfClient *c, const char *day, Day *d) {
 static void write_count(TfBuf *b, const char *key, long long v) {
   if (v) tf_buf_printf(b, ",\"%s\":%lld", key, v);
 }
-/* the v2 body for a day (closed schema: exactly these fields, the 2.0.1 ones each left out when zero);
- * report_id NULL: the pending counts on disk, not a delta to send */
+/* whole milliseconds sent as seconds (ms / 1000); left out when zero */
+static void write_ms_as_s(TfBuf *b, const char *key, long long ms) {
+  if (ms <= 0) return;
+  tf_buf_printf(b, ",\"%s\":", key);
+  tf_buf_num(b, (double)ms / 1000.0);
+}
+/* the v2 body for a day (closed schema: exactly these fields; zero counts and empty objects are left out, the
+ * vectors' telemetry_30.json). report_id NULL: the pending counts on disk, not a delta to send; there the 6.2
+ * sums are kept in their whole units (audio_ms, speech_ms, silence_ms, compute_us) so that a day's deltas add up
+ * exactly, and a sealed delta carries them as seconds. */
 static char *day_body(const TfClient *c, const char *day, const Day *d, const char *report_id) {
   TfBuf b;
   tf_buf_init(&b);
@@ -763,19 +963,18 @@ static char *day_body(const TfClient *c, const char *day, const Day *d, const ch
   for (int i = 0; i < d->n; ++i) {
     const Cohort *x = &d->co[i];
     if (i) tf_buf_puts(&b, ",");
+    /* SPEC 2a: "revision" carries the model version, "build" the build id */
     tf_buf_puts(&b, "{\"revision\":");
     tf_buf_json_str(&b, x->revision);
+    if (x->build[0]) {
+      tf_buf_puts(&b, ",\"build\":");
+      tf_buf_json_str(&b, x->build);
+    }
     tf_buf_puts(&b, ",\"context\":");
     tf_buf_json_str(&b, x->context);
     tf_buf_puts(&b, ",\"backend\":");
     tf_buf_json_str(&b, x->backend);
-    tf_buf_puts(&b, ",\"preset\":");
-    tf_buf_json_str(&b, x->preset);
-    tf_buf_puts(&b, ",\"word_level\":");
-    tf_buf_json_str(&b, x->word_level);
-    tf_buf_puts(&b, ",\"word_bucket\":");
-    tf_buf_json_str(&b, x->word_bucket);
-    tf_buf_printf(&b, ",\"site_overrides\":%lld,\"sessions\":%lld,\"minutes\":", x->site_overrides, x->sessions);
+    tf_buf_printf(&b, ",\"sessions\":%lld,\"minutes\":", x->sessions);
     tf_buf_num(&b, round(x->minutes * 100) / 100);
     tf_buf_printf(&b, ",\"chunks\":%lld,\"aborted\":%lld", x->chunks, x->aborted);
     write_arr(&b, "fallbacks", kFb, 8, x->fb);
@@ -787,51 +986,84 @@ static char *day_body(const TfClient *c, const char *day, const Day *d, const ch
     write_arr(&b, "model_load_ms", kMs, 6, x->load);
     static const char *const thn[] = {"transitions", "throttled_sessions"};
     write_arr(&b, "thermal", thn, 2, x->thermal);
-    write_arr(&b, "checks_on", kChecks, 7, x->checks);
-    tf_buf_puts(&b, ",\"classes\":{");
-    for (int k = 0; k < 8; ++k)
-      tf_buf_printf(&b, "%s\"%s\":{\"sites\":%lld,\"flagged\":%lld}", k ? "," : "", kClasses[k], x->cls[k][0], x->cls[k][1]);
-    tf_buf_puts(&b, "}");
-    write_arr(&b, "session_flag_pct", kPct, 6, x->sfp);
     write_arr(&b, "margin", kMargin, 6, x->margin);
     write_arr(&b, "confidence", kConf, 6, x->conf);
-    write_arr(&b, "madd", kMadd, 4, x->madd);
-    static const char *const wn[] = {"scored", "flagged"};
-    write_arr(&b, "words", wn, 2, x->words);
-    tf_buf_puts(&b, "}");
-  }
-  tf_buf_puts(&b, "],\"coverage\":{");
-  int first = 1;
-  for (int s = 1; s <= 114; ++s)
-    if (d->coverage[s]) {
-      tf_buf_printf(&b, "%s\"%d\":%lld", first ? "" : ",", s, d->coverage[s]);
-      first = 0;
+    write_count(&b, "takes", x->takes);
+    if (report_id) {
+      write_ms_as_s(&b, "audio_s", x->audio_ms);
+      write_ms_as_s(&b, "speech_s", x->speech_ms);
+      write_ms_as_s(&b, "silence_s", x->silence_ms);
+    } else {
+      write_count(&b, "audio_ms", x->audio_ms);
+      write_count(&b, "speech_ms", x->speech_ms);
+      write_count(&b, "silence_ms", x->silence_ms);
+      write_count(&b, "compute_us", x->compute_us);
     }
-  tf_buf_puts(&b, "},\"downloads\":[]");
-  if (report_id) tf_buf_printf(&b, ",\"report_id\":\"%s\"", report_id);
-  write_count(&b, "launches", d->launches);
-  write_count(&b, "ayahs", d->ayahs);
-  write_count(&b, "words", d->words);
-  first = 1;
-  for (int s = 1; s <= 114; ++s)
-    if (d->surah_ayahs[s]) {
-      tf_buf_printf(&b, "%s\"%d\":%lld", first ? ",\"surah_ayahs\":{" : ",", s, d->surah_ayahs[s]);
-      first = 0;
-    }
-  if (!first) tf_buf_puts(&b, "}");
-  /* every flags key is a checks key with a count no larger (flags are counted only with their check) */
-  for (int f = 0; f < 2; ++f) {
-    first = 1;
-    for (int k = 0; k < N_RULE; ++k)
-      if (d->rule[k][f]) {
-        tf_buf_printf(&b, "%s\"%s\":%lld", first ? (f ? ",\"rule_flags\":{" : ",\"rule_checks\":{") : ",", kRule[k], d->rule[k][f]);
+    int first = 1;
+    for (int h = 0; h < TF_HEAD_COUNT; ++h)
+      if (x->tokens[h]) {
+        tf_buf_printf(&b, "%s\"%s\":%lld", first ? ",\"tokens\":{" : ",", tf_head_info(h)->name, x->tokens[h]);
         first = 0;
       }
+    if (!first) tf_buf_puts(&b, "}");
+    if (report_id) write_ms_as_s(&b, "compute_s", (x->compute_us + 500) / 1000); /* microseconds, rounded to ms */
+    tf_buf_puts(&b, "}");
+  }
+  tf_buf_puts(&b, "]");
+  int first = 1, any_surah = 0;
+  /* downloads: revision carries the model version, build the build id; left out when there was none */
+  for (int i = 0; i < d->n_dl; ++i)
+    tf_buf_printf(&b, "%s{\"revision\":\"%s\",\"build\":\"%s\",\"profile\":\"%s-cpu\",\"bytes\":%lld,\"success\":%lld,\"failed\":%lld,\"resumed\":%lld}",
+                  i ? "," : ",\"downloads\":[", d->dl[i].revision, d->dl[i].build, tf__client_platform(c), d->dl[i].bytes, d->dl[i].success, d->dl[i].failed,
+                  d->dl[i].resumed);
+  if (d->n_dl) tf_buf_puts(&b, "]");
+  if (report_id) tf_buf_printf(&b, ",\"report_id\":\"%s\"", report_id);
+  write_count(&b, "launches", d->launches);
+  write_count(&b, "ayahs", d->ayahs > 0 ? d->ayahs : 0);
+  write_count(&b, "words", d->words > 0 ? d->words : 0);
+  /* surah_ayahs, and coverage with the same values (kept for readers of 2.x) */
+  for (int pass = 0; pass < 2; ++pass) {
+    first = 1;
+    for (int s = 1; s <= 114; ++s)
+      if (d->surah_ayahs[s] > 0) {
+        tf_buf_printf(&b, "%s\"%d\":%lld", first ? (pass ? ",\"coverage\":{" : ",\"surah_ayahs\":{") : ",", s, d->surah_ayahs[s]);
+        first = 0;
+        any_surah = 1;
+      }
+    if (!first) tf_buf_puts(&b, "}");
+  }
+  /* every flags key is a checks key with a count no larger (the report call refuses flagged > checked) */
+  int any_checks = 0, any_flags = 0;
+  for (int f = 0; f < 2; ++f) {
+    first = 1;
+    for (int k = 0; k < d->n_rules; ++k) {
+      const long long v = f ? d->rules[k].flags : d->rules[k].checks;
+      if (v <= 0) continue;
+      tf_buf_printf(&b, "%s\"%s\":%lld", first ? (f ? ",\"rule_flags\":{" : ",\"rule_checks\":{") : ",", d->rules[k].name, v);
+      first = 0;
+      if (f) any_flags = 1;
+      else any_checks = 1;
+    }
     if (!first) tf_buf_puts(&b, "}");
   }
   write_count(&b, "share_asked", d->share_asked);
   write_count(&b, "share_yes", d->share_yes);
   write_count(&b, "share_no", d->share_no);
+  /* which of the fields above the app reported (only those present) */
+  {
+    const struct {
+      const char *name;
+      int present;
+    } rep[] = {{"ayahs", d->ayahs > 0},   {"surah_ayahs", any_surah}, {"coverage", any_surah},
+               {"words", d->words > 0},   {"rule_checks", any_checks}, {"rule_flags", any_flags}};
+    first = 1;
+    for (int i = 0; i < NB(rep); ++i)
+      if (rep[i].present) {
+        tf_buf_printf(&b, "%s\"%s\"", first ? ",\"reported\":[" : ",", rep[i].name);
+        first = 0;
+      }
+    if (!first) tf_buf_puts(&b, "]");
+  }
   tf_buf_puts(&b, "}");
   return tf_buf_take(&b);
 }
@@ -863,10 +1095,81 @@ void tf__telemetry_add(TfClient *c, const char *field, long long n) {
   tf_mutex_unlock(&c->tlock);
 }
 
+void tf__client_count_download(TfClient *c, const char *version, const char *build, long long bytes, int ok, int resumed) {
+  if (!c || !version || !build || !tf__client_telemetry_on(c)) return;
+  tf_mutex_lock(&c->tlock);
+  char day[11];
+  day_utc(day, 0);
+  Day d;
+  day_load(c, day, &d);
+  int k = 0;
+  while (k < d.n_dl && (strcmp(d.dl[k].revision, version) || strcmp(d.dl[k].build, build))) ++k;
+  if (k == d.n_dl && d.n_dl < MAX_DOWNLOADS) {
+    memset(&d.dl[k], 0, sizeof d.dl[k]);
+    snprintf(d.dl[k].revision, sizeof d.dl[k].revision, "%s", version);
+    snprintf(d.dl[k].build, sizeof d.dl[k].build, "%s", build);
+    d.n_dl++;
+  }
+  if (k < d.n_dl) {
+    d.dl[k].bytes += bytes > 0 ? bytes : 0;
+    d.dl[k].success += ok != 0;
+    d.dl[k].failed += ok == 0;
+    d.dl[k].resumed += resumed != 0;
+    day_save(c, day, &d);
+  }
+  tf_mutex_unlock(&c->tlock);
+}
+
+/* App-reported (SPEC 6.3), counted into today's sums: where the learner recited. Validated by the caller. */
+void tf__client_count_recited(TfClient *c, int surah, int ayah_from, int ayah_to) {
+  if (!c || !tf__client_telemetry_on(c) || surah < 1 || surah > 114 || ayah_to < ayah_from) return;
+  tf_mutex_lock(&c->tlock);
+  char day[11];
+  day_utc(day, 0);
+  Day d;
+  day_load(c, day, &d);
+  d.ayahs += ayah_to - ayah_from + 1;
+  d.surah_ayahs[surah] += ayah_to - ayah_from + 1;
+  day_save(c, day, &d);
+  tf_mutex_unlock(&c->tlock);
+}
+/* App-reported (SPEC 6.3): the app's own judge checked `checked` items of a rule and flagged `flagged` of them.
+ * Validated by the caller. A call with checked 0 counts nothing and takes no place among the day's rules; a 33rd
+ * rule of the day is dropped. Returns 1 when the report was dropped, else 0. */
+int tf__client_count_checks(TfClient *c, const char *rule, int checked, int flagged) {
+  if (!c || !tf__client_telemetry_on(c) || checked <= 0) return 0;
+  tf_mutex_lock(&c->tlock);
+  char day[11];
+  day_utc(day, 0);
+  Day d;
+  day_load(c, day, &d);
+  Rule *r = day_rule(&d, rule, 1);
+  if (r) {
+    r->checks += checked;
+    r->flags += flagged;
+    if (!strcmp(rule, "word")) d.words += checked;
+    day_save(c, day, &d);
+  }
+  tf_mutex_unlock(&c->tlock);
+  return r ? 0 : 1;
+}
+
+/* today's counts as the delta that would be sent now (a fixed report id of zeros), for the tests; caller frees */
+char *tf__client_day_body(TfClient *c) {
+  tf_mutex_lock(&c->tlock);
+  char day[11];
+  day_utc(day, 0);
+  Day d;
+  day_load(c, day, &d);
+  char *body = day_body(c, day, &d, "00000000000000000000000000000000");
+  tf_mutex_unlock(&c->tlock);
+  return body;
+}
+
 #define TF_DELTA_S (15 * 60) /* a delta every 15 minutes while a client is open (Quran Lab, 11-09) */
 static void seal(TfClient *c, int include_today);
 
-void tf_client_session_finished(TfClient *c, const TfSessionStats *st) {
+void tf__client_session_finished(TfClient *c, const TfSessionStats *st) {
   if (!c || !st) return;
   tf__sharing_session(c, st->feedback_shown, st->audio_s);
   if (!tf__client_telemetry_on(c)) return;
@@ -875,62 +1178,22 @@ void tf_client_session_finished(TfClient *c, const TfSessionStats *st) {
   day_utc(day, 0);
   Day d;
   day_load(c, day, &d);
-  /* the cohort: revision, context, backend, preset, word level */
+  /* the cohort: model version, build, context, backend (always the CPU engine here) */
   Cohort key;
   memset(&key, 0, sizeof key);
   snprintf(key.backend, sizeof key.backend, "cpu");
-  snprintf(key.word_level, sizeof key.word_level, "off");
-  long long checks[7] = {0};
   if (st->model) {
-    TfModel *m = (TfModel *)st->model;
-    TfJson *info = tf_json_parse(tf_model_info_json(m), strlen(tf_model_info_json(m)), NULL);
-    snprintf(key.revision, sizeof key.revision, "%s+%s", tf_json_str(tf_json_get(info, "model_id")) ? tf_json_str(tf_json_get(info, "model_id")) : "",
-             tf_json_str(tf_json_get(info, "revision")) ? tf_json_str(tf_json_get(info, "revision")) : "");
-    snprintf(key.context, sizeof key.context, "%s", tf_model_context(m));
-    tf_json_free(info);
-    char *sj = tf__settings_json_alloc(m);
-    TfJson *s = sj ? tf_json_parse(sj, strlen(sj), NULL) : NULL;
-    free(sj);
-    snprintf(key.preset, sizeof key.preset, "%s", tf_json_str(tf_json_get(s, "preset")) ? tf_json_str(tf_json_get(s, "preset")) : "");
-    const TfJson *sites = tf_json_get(s, "sites");
-    for (int i = 0; sites && i < sites->n; ++i) {
-      const char *src = tf_json_str(tf_json_get(&sites->kids[i], "source"));
-      const TfJson *th = tf_json_get(&sites->kids[i], "threshold");
-      const char *pr = tf_json_str(tf_json_get(&sites->kids[i], "preset"));
-      if (src && strcmp(src, "calibration") && pr && strcmp(pr, key.preset)) key.site_overrides++;
-      if (th && th->type == TJ_NUM && !pr) snprintf(key.preset, sizeof key.preset, "custom");
-    }
-    const TfJson *w = tf_json_get(s, "word");
-    if (w && tf_json_get(w, "enabled") && tf_json_get(w, "enabled")->boolean) {
-      const char *wp = tf_json_str(tf_json_get(w, "preset"));
-      snprintf(key.word_level, sizeof key.word_level, "%s", wp ? wp : "custom");
-      if (wp && !strcmp(wp, "custom")) {
-        static const char *const wb[] = {"le_3", "le_4", "le_5", "le_6", "le_7", "gt_7"};
-        static const double wv[] = {3, 4, 5, 6, 7};
-        const TfJson *t = tf_json_get(w, "threshold");
-        snprintf(key.word_bucket, sizeof key.word_bucket, "%s", wb[bucket(t && t->type == TJ_NUM ? t->num : 0, wv, 5)]);
-      }
-    }
-    for (int k = 0; k < 7; ++k) {
-      const char *ck = kChecks[k];
-      const TfJson *e = NULL;
-      if (!strcmp(ck, "madd") || !strcmp(ck, "gemination") || !strcmp(ck, "qalqalah") || !strcmp(ck, "lazim")) e = tf_json_get(tf_json_get(s, ck), "enabled");
-      else {
-        /* a site check is on when any of its classes is enabled */
-        for (int i = 0; sites && i < sites->n; ++i) {
-          const int cls = zf_tajweed_class_from_name(sites->kids[i].key);
-          const TfJson *en = tf_json_get(&sites->kids[i], "enabled");
-          if (cls >= 0 && zf_tajweed_class_check(cls) == k && en && en->boolean) e = en;
-        }
-      }
-      checks[k] = e && e->type == TJ_BOOL && e->boolean;
-    }
-    tf_json_free(s);
+    snprintf(key.revision, sizeof key.revision, "%s", tf_model_version(st->model));
+    snprintf(key.build, sizeof key.build, "%s", tf_model_build(st->model));
+  } else {
+    snprintf(key.revision, sizeof key.revision, "%s", st->version ? st->version : "");
+    snprintf(key.build, sizeof key.build, "%s", st->build ? st->build : "");
   }
+  snprintf(key.context, sizeof key.context, "%s", st->context ? st->context : "");
   Cohort *x = NULL;
   for (int i = 0; i < d.n; ++i)
-    if (!strcmp(d.co[i].revision, key.revision) && !strcmp(d.co[i].context, key.context) && !strcmp(d.co[i].backend, key.backend) &&
-        !strcmp(d.co[i].preset, key.preset) && !strcmp(d.co[i].word_level, key.word_level))
+    if (!strcmp(d.co[i].revision, key.revision) && !strcmp(d.co[i].build, key.build) && !strcmp(d.co[i].context, key.context) &&
+        !strcmp(d.co[i].backend, key.backend))
       x = &d.co[i];
   if (!x) {
     if (d.n < 16) x = &d.co[d.n++];
@@ -945,6 +1208,15 @@ void tf_client_session_finished(TfClient *c, const TfSessionStats *st) {
   x->minutes += st->audio_s / 60.0;
   x->chunks += st->chunks;
   x->aborted += st->aborted != 0;
+  if (!st->aborted) {
+    /* 6.2: a take counts when it ended with its Heads; a cancelled or failed one adds nothing here */
+    x->takes++;
+    x->audio_ms += st->audio_ms;
+    x->speech_ms += 40LL * st->speech_frames;
+    x->silence_ms += 40LL * st->silence_frames;
+    x->compute_us += st->compute_us;
+    for (int h = 0; h < TF_HEAD_COUNT; ++h) x->tokens[h] += st->tokens[h];
+  }
   if (st->fallback > 0) {
     static const int map[] = {0, 0, 1, 4, 6, 5, 7};
     x->fb[map[st->fallback < 7 ? st->fallback : 6]]++;
@@ -955,86 +1227,13 @@ void tf_client_session_finished(TfClient *c, const TfSessionStats *st) {
   }
   if (st->cold_start && st->model_load_ms > 0) x->cold[bucket(st->model_load_ms, kMsV, 5)]++;
   if (st->model_load_ms > 0) x->load[bucket(st->model_load_ms, kMsV, 5)]++;
-  for (int k = 0; k < 7; ++k) x->checks[k] += checks[k];
   if (st->decoded) {
-    const TfToken *t;
-    const int nt = tf_decoded_tokens(st->decoded, &t);
-    for (int i = 0; i < nt; ++i) {
-      x->margin[bucket(t[i].margin, kMarginV, 5)]++;
-      if (t[i].confidence == t[i].confidence) x->conf[bucket(t[i].confidence, kConfV, 5)]++;
+    /* margin and confidence per emitted token, from the decoded layer */
+    for (int i = 0; i < st->decoded->n_tokens; ++i) {
+      const TfToken *t = &st->decoded->tokens[i];
+      x->margin[bucket(t->margin, kMarginV, 5)]++;
+      if (t->confidence == t->confidence) x->conf[bucket(t->confidence, kConfV, 5)]++;
     }
-  }
-  if (st->result) {
-    const ZfTajweedResult *r = tf_result_engine(st->result);
-    const ZfTajweedSite *s;
-    const int ns = zf_tajweed_result_sites(r, &s);
-    int flagged = 0, windows = 0;
-    for (int i = 0; i < ns; ++i) {
-      x->cls[s[i].cls][0]++;
-      x->cls[s[i].cls][1] += s[i].flagged;
-      flagged += s[i].flagged;
-    }
-    ZfTajweedSummary sum;
-    if (zf_tajweed_result_summary(r, &sum) == 0) windows = sum.n_sites;
-    if (windows > 0) x->sfp[bucket(100.0 * flagged / windows, kPctV, 5)]++;
-    const ZfTajweedMadd *md;
-    const int nm = zf_tajweed_result_madd(r, &md);
-    for (int i = 0; i < nm; ++i) {
-      if (md[i].count == 2) x->madd[0]++;
-      else if (md[i].count == 4) x->madd[1]++;
-      else if (md[i].count == 6) x->madd[2]++;
-      x->madd[3] += md[i].flagged;
-    }
-    const TfWordScore *w;
-    const int nw = tf_result_words(st->result, &w);
-    for (int i = 0; i < nw; ++i) {
-      x->words[0] += w[i].has_score;
-      x->words[1] += w[i].flagged == 1;
-    }
-    TfJson *rj = tf_json_parse(tf_result_json((TfResult *)st->result), strlen(tf_result_json((TfResult *)st->result)), NULL);
-    const TfJson *su = tf_json_get(rj, "surah");
-    if (su && su->type == TJ_NUM && su->num >= 1 && su->num <= 114) {
-      d.coverage[(int)su->num]++;
-      d.surah_ayahs[(int)su->num]++;
-    }
-    /* 2.0.1: one scored ayah, its words, and per rule the verdicts whose check ran (enabled in the settings the
-     * result was scored with) and how many of those were flagged */
-    d.ayahs++;
-    const TfJson *set = tf_json_get(rj, "settings");
-    const TfJson *sites = tf_json_get(set, "sites");
-    for (int i = 0; i < ns; ++i) {
-      if (s[i].cls < 0 || s[i].cls >= 8) continue;
-      const TfJson *en = tf_json_get(tf_json_get(sites, kClasses[s[i].cls]), "enabled");
-      if (!en || en->type != TJ_BOOL || !en->boolean) continue;
-      d.rule[s[i].cls][0]++;
-      d.rule[s[i].cls][1] += s[i].flagged != 0;
-    }
-    const TfJson *me = tf_json_get(tf_json_get(set, "madd"), "enabled"), *le = tf_json_get(tf_json_get(set, "lazim"), "enabled");
-    for (int i = 0; i < nm; ++i) {
-      const TfJson *en = md[i].madd_class == ZF_TJ_MADD_LAZIM ? le : me;
-      if (!en || en->type != TJ_BOOL || !en->boolean) continue;
-      d.rule[R_MADD][0]++;
-      d.rule[R_MADD][1] += md[i].flagged != 0;
-    }
-    static const struct { const char *check; int rule; } letters[] = {{"qalqalah", R_QALQALAH}, {"gemination", R_GEMINATION}};
-    for (int k = 0; k < 2; ++k) {
-      const TfJson *en = tf_json_get(tf_json_get(set, letters[k].check), "enabled");
-      if (!en || en->type != TJ_BOOL || !en->boolean) continue;
-      const ZfTajweedLetter *lt;
-      const int nl = k == 0 ? zf_tajweed_result_qalqalah(r, &lt) : zf_tajweed_result_gemination(r, &lt);
-      for (int i = 0; i < nl; ++i) {
-        d.rule[letters[k].rule][0]++;
-        d.rule[letters[k].rule][1] += lt[i].flagged != 0;
-      }
-    }
-    for (int i = 0; i < nw; ++i) {
-      d.words += w[i].has_score;
-      if (w[i].has_score && w[i].flagged >= 0) { /* -1: the word check off or no word calibration */
-        d.rule[R_WORD][0]++;
-        d.rule[R_WORD][1] += w[i].flagged == 1;
-      }
-    }
-    tf_json_free(rj);
   }
   day_save(c, day, &d);
   tf_mutex_unlock(&c->tlock);
@@ -1207,7 +1406,7 @@ static int send_reports(TfClient *c) {
       sent++;
     } else if (st == 400 || st == 413) {
       remove_named(c, names[i]);
-      if (st == 400) tf_client_report_issue(c, "other", "bad_request:events", NULL);
+      if (st == 400) tf__client_report_issue(c, "other", "bad_request:events", NULL);
     } else {
       kept = 1;
       break;
@@ -1225,9 +1424,9 @@ static int send_reports(TfClient *c) {
   return sent;
 }
 
-int tf_client_flush(TfClient *c, int include_today) {
+int tf__client_flush(TfClient *c, int include_today) {
   tf__clear_error();
-  if (!c) return tf__fail(TF_ERR_ARGUMENT, "no client");
+  if (!c) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
   if (tf__client_telemetry_on(c)) seal(c, include_today);
   const int sent = send_reports(c);
   /* queued issues */
@@ -1276,16 +1475,16 @@ int tf_client_flush(TfClient *c, int include_today) {
 }
 
 /* ------------------------------------------------------------------ issues (no free text; deduped per day) */
-int tf_client_report_issue(TfClient *c, const char *kind, const char *code, const char *message) {
+int tf__client_report_issue(TfClient *c, const char *kind, const char *code, const char *message) {
   (void)message; /* the SDK never sends free text */
   static const char *const kinds[] = {"engine_failed", "model_load", "checksum_mismatch", "signature_invalid", "update_failed",
                                       "fallback", "self_test_failed", "audio_input", "other"};
-  if (!c || !kind || !code) return tf__fail(TF_ERR_ARGUMENT, "kind and code are required");
+  if (!c || !kind || !code) return tf__fail(TF_ERR_INVALID_ARGUMENT, "kind and code are required");
   int ok = 0;
   for (int i = 0; i < NB(kinds); ++i) ok |= !strcmp(kind, kinds[i]);
   for (const char *p = code; *p; ++p)
     if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || strchr("_.:-", *p))) ok = 0;
-  if (!ok || !*code || strlen(code) > 64) return tf__fail(TF_ERR_ARGUMENT, "kind or code is not allowed");
+  if (!ok || !*code || strlen(code) > 64) return tf__fail(TF_ERR_INVALID_ARGUMENT, "kind or code is not allowed");
   char day[11];
   day_utc(day, 0);
   char sig[160];
@@ -1344,9 +1543,11 @@ static int telemetry_send_point(TfClient *c) {
   return send_reports(c);
 }
 
-int tf_client_background(TfClient *c) {
+int tf__client_background(TfClient *c) {
   tf__clear_error();
-  if (!c) return tf__fail(TF_ERR_ARGUMENT, "no client");
+  if (!c) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
+  /* 2.0.3: the shared recording does not wait for another take while the app is in the background */
+  tf__share_background(c);
   if (!tf__client_telemetry_on(c)) {
     send_reports(c); /* drops the queue */
     return 0;
@@ -1354,8 +1555,8 @@ int tf_client_background(TfClient *c) {
   return telemetry_send_point(c);
 }
 
-/* The client's timer (started by tf_client_launch): every 15 minutes while the client is open it seals and sends a
- * delta (and registers once the UTC day changed); a seal by tf_client_session_finished wakes it to send. Failed
+/* The client's timer (started by tf__client_launch): every 15 minutes while the client is open it seals and sends a
+ * delta (and registers once the UTC day changed); a seal by tf__client_session_finished wakes it to send. Failed
  * sends wait 1, then 10 minutes. */
 static void timer_thread(void *arg) {
   TfClient *c = (TfClient *)arg;
@@ -1373,7 +1574,7 @@ static void timer_thread(void *arg) {
       }
       char today[11];
       day_utc(today, 0);
-      if (strcmp(c->register_day, today) && c->key) tf_client_register(c);
+      if (strcmp(c->register_day, today) && c->key) tf__client_register(c);
       tf_mutex_lock(&c->tm);
       continue;
     }
@@ -1385,7 +1586,7 @@ static void timer_thread(void *arg) {
   tf_mutex_unlock(&c->tm);
 }
 int tf__client_no_timer; /* tests: no timer thread (the replayed exchanges run on one thread) */
-static void timer_start(TfClient *c) {
+void tf__client_timer_start(TfClient *c) {
   if (tf__client_no_timer) return;
   tf_mutex_lock(&c->tm);
   if (!c->t_on && !tf_thread_start(&c->tth, timer_thread, c)) c->t_on = 1;
@@ -1402,16 +1603,16 @@ static void timer_stop(TfClient *c) {
 }
 
 /* ------------------------------------------------------------------ launch */
-int tf_client_launch(TfClient *c) {
-  if (!c) return tf__fail(TF_ERR_ARGUMENT, "no client");
+int tf__client_launch(TfClient *c) {
+  if (!c) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
   int rc = 0;
-  if (tf_client_register(c)) rc = tf_last_error_code();
-  if (tf_client_refresh_config(c) && !rc) rc = tf_last_error_code();
-  check_sdk_latest(c); /* the config in force (a stored one when the refresh failed) */
+  if (tf__client_register(c)) rc = tf__error_code();
+  if (tf__client_refresh_config(c) && !rc) rc = tf__error_code();
+  tf__client_check_latest(c); /* the config in force (a stored one when the refresh failed) */
   /* launch is a send point: this launch and what earlier runs left */
-  tf_client_flush(c, 1);
-  timer_start(c);
+  tf__client_flush(c, 1);
+  tf__client_timer_start(c);
   /* shared sessions a previous run left (crash, restart, offline) go up in the background */
-  if (tf_client_sharing_state(c)) tf_sharing_outbox_resume(c);
+  if (tf__client_sharing_state(c)) tf__sharing_outbox_resume(c);
   return rc;
 }

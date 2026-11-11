@@ -1,5 +1,120 @@
 # Changelog
 
+## 3.0.0
+
+A breaking release. The SDK is now a pure inference engine: recitation audio in, the model's own output out. The
+tajweed layer of 2.x (verdicts, madd counts, word scores, presets and settings) is no longer in the SDK; an app
+that used it builds its own judge on the output, with the calibration and the expected units of each ayah as
+read-only data. Every call has a new name. The guide: [docs/migrating-to-3.md](docs/migrating-to-3.md). The
+guide also says what staying on 2.x means.
+
+- **Five names, the same in the Android, Apple, web and C SDKs:** Client, Model, Session, Heads, Backend
+  (`TfClient`, `TfModel`, `TfSession`, `TfHeads`, `TfBackend`). `tf_client_create`, `tf_client_model` (downloads on
+  first use, verifies, opens and warms), `tf_session_create`, `tf_session_push`, `tf_session_finish`,
+  `tf_session_heads`. A Session is one take; `TfStream` and the `tf_stream_*` calls are gone.
+- **One header, no engine type.** `include/tajweedformer.h` includes only `<stddef.h>`; the shared library exports
+  exactly its 67 functions. Options structs may be NULL or zeroed (the `tf_*_default_options()` calls are gone).
+- **One Client per process** (`client_exists` for a second). It never waits for the network at creation.
+  `tf_client_prefetch` downloads ahead with progress in bytes and resumes a cut download (its `unmetered_only`
+  option cannot be honoured here: the library cannot tell the kind of connection, so it downloads); `tf_client_storage_json` and `tf_client_remove_models` manage what is on disk.
+- **Model versions.** A model is addressed by version (`4.0.0`): `tf_model_version`, `tf_model_build`, and
+  `TfModelOptions.version` to pin one. SDK 3.0.0 opens 3.0 builds only (`model_incompatible` otherwise).
+- **Heads and the decoded layer.** `tf_heads_get` by name, `tf_heads_greedy`, `tf_heads_decoded`. `TfDecoded` is
+  a plain struct (nothing to free) with the same numbers as 2.x, plus `settled` (the tokens that will not change
+  any more in this take) and `is_final`. `TfSessionOptions.top_k` (1 to 38) ranks the best K tokens per frame,
+  each with its log-prob and its margin to the next rank.
+- **Events and the end of a take.** `on_event` reports `speechStarted`, `speechEnded` and `ended`, from what the
+  model heard; `chunk->speech` says whether a chunk holds speech. A frame is speech when the token head or the
+  timing head hears something, so a held sound (a long madd) does not end a take. With `end_on_silence_ms` (500
+  to 60000) a take ends by itself after that much silence following speech. A take holds at most 20 minutes of
+  audio and then ends by itself with `ended(limit)`.
+- **Without a microphone.** `tf_session_listen` runs a sample clip that ships in the model folder through the same
+  path as pushed audio (`tf_model_sample_clip`), at the clip's pace or as fast as possible.
+- **Calibration and reference data, read-only.** `tf_model_calibration_json`, `tf_model_calibration`,
+  `tf_model_calibration_number`; `tf_model_reference`, `tf_reference_fetch`, `tf_reference_units` (the expected
+  units of every ayah, downloaded only when the app asks). The SDK applies neither.
+- **Errors.** `TfError` has the 26 codes of the catalogue shared by the four SDKs; `tf_last_error`,
+  `tf_last_error_fix` and `tf_error_docs` give the message, what to do and the link
+  (`https://sdk.quranlab.ai/docs/errors#<code>`). A call on a NULL object keeps the first error.
+- **A refusal says what to do.** When Quran Lab's server refuses the app, `server_rejected` carries the message
+  and the fix of that refusal, with the server's code in brackets: an account without access yet, a key of the
+  wrong type, a blocked app, and a key that belongs to another app. A key works for the first app id that used
+  it; another id reads "This key belongs to another app" with the fix (a key for this app, or this id allowed on
+  the key's page). `examples/quickstart.c` registers `com.example.quickstart`: give it a key of its own or put
+  your app's id there.
+- **Diagnose.** `tf_client_diagnose` and `tf_client_diagnose_json`: one report (SDK, key, config, model, context,
+  backend, storage, last error), safe to paste into an issue. `tajweedformer diagnose` prints it.
+- **Telemetry.** The SDK counts what it sees (takes, seconds of audio, speech and silence, tokens per head, per
+  model version and build). What only the app knows it reports as counts: `tf_session_report_recited` and
+  `tf_client_report_checks`. Still anonymous, still off with `TF_ANALYTICS_OFF`.
+- **Sharing.** The calls are `tf_sharing_*` (`tf_sharing_status`, `tf_sharing_set_on`, `tf_sharing_ask`,
+  `tf_sharing_answer`, `tf_sharing_delete`, ...). A take of a Session whose Model came from `tf_client_model` is
+  shared by the SDK when the learner said yes; the `tf_sharing_session_*` calls are gone. Takes in a row share one
+  recording: when a take ends, the recording stays open for a few seconds (3 s, or the signed config's
+  `flags.share_join_ms`), and a take that starts in that time at the same sample rate continues the same Ogg
+  stream; a recording of several takes then sends where each take starts. `tf_sharing_feed` takes audio the app
+  already captures outside takes: the last second before a take and the half second after it go into the
+  recording, so it does not begin or end inside a word (kept in memory only, dropped at once without a yes). A
+  recording holds at most 20 minutes; a longer take goes on in a new recording. What a learner agreed to does
+  not change and nobody is asked again.
+- **Sharing off during an upload.** Turning sharing off while a recording was being uploaded could leave that recording on the device: the
+  queue was deleted while the uploader still held the file open (Windows cannot delete an open file) and wrote
+  the recording's state back on its way out. It was never uploaded while sharing stayed off, and was deleted
+  after 7 days, but turning sharing on again within those days would have sent it. The SDK now stops the
+  upload, waits for the uploader to let go (at most 3 s) and then deletes. In the library since 2.0.0; found
+  by the Windows CI run of this release.
+- **The example app.** `examples/quickstart.c` is one console program: the model loading with download progress,
+  a sample clip without a microphone, reciting from standard input, the tokens with tentative ones marked, and
+  the diagnose report. `examples/CMakeLists.txt` builds it as an app's own project.
+- **Command line.** `info`, `decode`, `serve`, `bench`, `download` and the new `diagnose`. `--ayah`, `--settings`
+  and the `portal` command are gone.
+- **The developer site** is [sdk.quranlab.ai](https://sdk.quranlab.ai).
+- **Tests.** Every test has a time limit and the test program caps its own memory at 2 GB. The ranking behind
+  `top_k` is held to shared vectors: 26 rows in `ctest` (ties, a flat row, a margin a float cannot hold) and, where
+  the model is, the 35 conformance clips at two contexts through a Session, ids, log-probs and margins exact. The
+  README's "Verify it yourself" says what the public CI covers and what only the local proof runs.
+
+## 2.0.3
+
+Takes in a row share one recording. An app often stops and starts its takes while the learner is still reciting,
+so shared recordings began or ended in the middle of speech. A take (`tf_sharing_session_begin` to `tf_sharing_session_finish`, or one take of a `TfStream` made with a client), your code and what a learner is asked do not
+change.
+
+- The join window. When a take ends while the learner shares, the shared recording (its Ogg stream, its item in the
+  outbox, its upload) stays open for a few seconds: `flags.share_join_ms` of Quran Lab's signed config, a whole number
+  from 0 to 10000 ms; 3000 when the flag is absent; 0 never joins, which is 2.0.2's behaviour. A take that starts
+  within the window at the same input sample rate, with the same contributor, consent and model, continues the same
+  stream: no new headers, the encoder and the resampler keep their state, segments are cut by the same plan counted
+  across the takes, the bitrate ladder applies as before. The pause between the takes gets no audio. The bytes are
+  those of one continuous encode of the same audio.
+- Otherwise the recording closes as a session ended in 2.0.2 and the take starts a new one. It also closes at once
+  when the window passes (a timer thread of the client; the wall clock decides), at `tf_client_background`, at the
+  new `tf_sharing_recording_close(c)`, at `tf_client_destroy`, when sharing is turned off (the queue is deleted,
+  the open recording with it), and at 20 minutes of audio or 256 takes. `completed` is the last take's; the 2 s
+  minimum of a cancelled session counts the whole recording.
+- The 20 minute cap never cuts a take. With 30 s or less of room, a joining take is held in memory until it ends: it
+  joins when it fits, else the recording closes without it and the take starts a new one with all its audio.
+- Take boundaries. A recording of two or more takes keeps where each take starts in the stream and the pause before
+  it (rounded to 100 ms), and sends them once after its last segment: `POST /v1/uploads/{id}/takes`. The recording is
+  uploaded when its segments are, whatever becomes of that list: a server without the route (404) or a deleted
+  upload (410) drops it, a refused list (400) drops it with an issue report, 401 renews the token, and 429, 5xx or
+  no answer keep it for a retry with the same body, also after a restart. A recording of one take sends nothing.
+- A process that died between takes or inside one: the recording is closed at its last whole page, as before, and its take list keeps the takes that
+  start inside what was recovered.
+- API: `tf_sharing_recording_close(c)` (no take follows: close the recording now; with a take running, when it
+  ends); `tf_sharing_session_finish` returns the take's milliseconds that went into a recording;
+  `tf_sharing_outbox_json` adds `takes`; `TF_SHARING_JOIN_MS_DEFAULT`, `TF_SHARING_JOIN_MS_MAX` and
+  `TF_SHARING_RECORDING_MAX_S`. The calls are in `docs/api.md`.
+- Fixed: a session recovered after a crash reported a duration of 0; it now has its real duration.
+- Usable as a CMake subproject: an app can take the repository by tag with `FetchContent` (or `add_subdirectory`)
+  and link `tajweedformer`. Nothing is built unless the app links it, the engine's release configuration is the
+  default there, and the tests and checks stay with builds of the repository itself. Before, the project only
+  configured as the top-level one. The README's install is now that `CMakeLists.txt`, and CI builds it.
+- Unchanged: consent (a yes is never asked again, at most three asks; the ask after a finished take leaves the
+  recording open), one upload at a time and in order, the bitrate ladder, stopping and deleting. Telemetry counts a
+  session per take.
+- `docs/platform-client.md`: the 2.0.3 text.
+
 ## 2.0.2
 
 - Fixed: model manifests with a `golden_tolerance` field did not verify. `tf_model_open` and the model download built the signed text without the

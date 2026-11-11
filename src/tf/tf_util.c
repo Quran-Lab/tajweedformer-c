@@ -25,58 +25,198 @@
 #include "tf_internal.h"
 
 /* ------------------------------------------------------------------ errors */
+/* One catalogue for the four SDKs (the contract's sdk_3.0.0/errors.json, embedded by tools/gen_errors.py): a
+ * TfError is the entry's index (entry i is -(i + 1)); the message is the entry's with its placeholders filled, the
+ * fix likewise. */
+#include "tf_error_catalogue.h"
 #if defined(_MSC_VER) && !defined(__clang__)
 #define TF_TLS __declspec(thread)
 #else
 #define TF_TLS _Thread_local
 #endif
-static TF_TLS char g_msg[512];
+static TF_TLS char g_msg[640];
+static TF_TLS char g_fix[640];
+static TF_TLS char g_raw[512]; /* the text given to tf__fail, as given */
 static TF_TLS int g_code;
+
+static const TfErrorEntry *entry(int code) { return code <= -1 && code >= -TF_ERRORS_COUNT ? &kTfErrors[-code - 1] : NULL; }
+
+/* tmpl with each {name} replaced: names[i] -> values[i]; a placeholder without a value becomes "" */
+static void fill(char *out, size_t n, const char *tmpl, const char *const *names, const char *const *values, int count) {
+  size_t at = 0;
+  for (const char *p = tmpl; *p && at + 1 < n;) {
+    const char *close = *p == '{' ? strchr(p, '}') : NULL;
+    if (close) {
+      const char *v = "";
+      for (int i = 0; i < count; ++i)
+        if (strlen(names[i]) == (size_t)(close - p - 1) && !strncmp(names[i], p + 1, (size_t)(close - p - 1))) v = values[i];
+      const size_t k = strlen(v) < n - 1 - at ? strlen(v) : n - 1 - at;
+      memcpy(out + at, v, k);
+      at += k;
+      p = close + 1;
+    } else {
+      out[at++] = *p++;
+    }
+  }
+  out[at] = 0;
+}
+
+static int set_error(int code, const char *const *names, const char *const *values, int count) {
+  const TfErrorEntry *e = entry(code);
+  g_code = code;
+  if (e) {
+    fill(g_msg, sizeof g_msg, e->message, names, values, count);
+    fill(g_fix, sizeof g_fix, e->fix, names, values, count);
+  } else {
+    snprintf(g_msg, sizeof g_msg, "%s", g_raw);
+    g_fix[0] = 0;
+  }
+  return code;
+}
 
 int tf__fail(int code, const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
-  vsnprintf(g_msg, sizeof g_msg, fmt, ap);
+  vsnprintf(g_raw, sizeof g_raw, fmt ? fmt : "", ap);
   va_end(ap);
-  g_code = code;
-  return code;
+  /* a detail ends without a full stop: the catalogue's sentence brings its own */
+  size_t n = strlen(g_raw);
+  while (n && (g_raw[n - 1] == '.' || g_raw[n - 1] == '\n' || g_raw[n - 1] == ' ')) g_raw[--n] = 0;
+  static const char *const names[] = {"detail", "file", "sdk", "minimum"};
+  const char *values[] = {g_raw, g_raw, TF_SDK_VERSION, TF_RUNTIME_MINIMUM};
+  return set_error(code, names, values, 4);
+}
+int tf__runtime_check(void) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__amd64__)
+  return 0;
+#else
+  return tf__fail(TF_ERR_RUNTIME_UNSUPPORTED, "this build of the library is not for x86-64");
+#endif
+}
+/* The server refused this app with `code` (a 403 of the error table). When the catalogue has that refusal, the
+ * error's message and fix are the refusal's own, so a developer reads what to do; any other code gives the
+ * entry's own sentence with the code in it. {origin} is the app's identifier (a page's origin on the web). */
+/* 1 when the catalogue has a refusal of this code under server_rejected (its `reasons`) */
+int tf__reason_known(const char *code) {
+  for (int i = 0; code && i < TF_REASONS_COUNT; ++i)
+    if (!strcmp(kTfReasons[i].code, code)) return 1;
+  return 0;
+}
+int tf__fail_rejected(const char *code, const char *app) {
+  char given[64]; /* a copy: tf__fail below formats into g_raw, so g_raw cannot also be its argument */
+  snprintf(given, sizeof given, "%s", code && *code ? code : "refused");
+  snprintf(g_raw, sizeof g_raw, "%s", given);
+  for (int i = 0; i < TF_REASONS_COUNT; ++i) {
+    if (strcmp(kTfReasons[i].code, given)) continue;
+    static const char *const names[] = {"origin"};
+    const char *values[] = {app && *app ? app : "this app"};
+    g_code = TF_ERR_SERVER_REJECTED;
+    fill(g_msg, sizeof g_msg, kTfReasons[i].message, names, values, 1);
+    fill(g_fix, sizeof g_fix, kTfReasons[i].fix, names, values, 1);
+    return g_code;
+  }
+  return tf__fail(TF_ERR_SERVER_REJECTED, "%s", given);
+}
+int tf__fail_sdk_too_old(const char *version) {
+  snprintf(g_raw, sizeof g_raw, "%s", version && *version ? version : "a newer version");
+  static const char *const names[] = {"version", "sdk"};
+  const char *values[] = {g_raw, TF_SDK_VERSION};
+  return set_error(TF_ERR_SDK_TOO_OLD, names, values, 2);
+}
+int tf__fail_storage_full(long long needed, long long available) {
+  char a[32], b[32];
+  snprintf(a, sizeof a, "%lld", needed);
+  snprintf(b, sizeof b, "%lld", available < 0 ? 0 : available);
+  snprintf(g_raw, sizeof g_raw, "%s bytes needed, %s free", a, b);
+  static const char *const names[] = {"needed", "available"};
+  const char *values[] = {a, b};
+  return set_error(TF_ERR_STORAGE_FULL, names, values, 2);
 }
 void tf__clear_error(void) {
-  g_msg[0] = 0;
+  g_msg[0] = g_fix[0] = g_raw[0] = 0;
   g_code = 0;
 }
-const char *tf_last_error(void) { return g_msg[0] ? g_msg : NULL; }
-int tf_last_error_code(void) { return g_code; }
-
-const char *tf_error_name(int code) {
+int tf__error_code(void) { return g_code; }
+const char *tf__error_text(void) { return g_msg; }
+int tf__error_as(int code) {
+  if (!g_code || entry(g_code)) return g_code;
+  char keep[sizeof g_raw];
+  snprintf(keep, sizeof keep, "%s", g_raw);
+  return tf__fail(code, "%s", keep);
+}
+/* An internal code never reaches the app: one that was left on the thread reads as the nearest catalogue code. */
+static int public_code(int code) {
   switch (code) {
-    case TF_OK: return "ok";
-    case TF_ERR_ARGUMENT: return "invalid_argument";
-    case TF_ERR_IO: return "io";
-    case TF_ERR_MANIFEST: return "manifest_invalid";
-    case TF_ERR_SIGNATURE: return "signature_invalid";
-    case TF_ERR_SIGNATURE_REQUIRED: return "signature_required";
-    case TF_ERR_CHECKSUM: return "checksum_mismatch";
-    case TF_ERR_NOT_LISTED: return "not_listed";
-    case TF_ERR_SDK_TOO_OLD: return "sdk_too_old";
-    case TF_ERR_UNSUPPORTED_MODEL: return "unsupported_model";
-    case TF_ERR_CALIBRATION: return "calibration_invalid";
-    case TF_ERR_ENGINE: return "engine";
-    case TF_ERR_SETTINGS: return "invalid_settings";
-    case TF_ERR_BUSY: return "stream_busy";
-    case TF_ERR_NETWORK: return "network";
-    case TF_ERR_HTTP: return "http";
-    case TF_ERR_NO_MEMORY: return "no_memory";
-    case TF_ERR_NOT_AVAILABLE: return "not_available";
-    case TF_ERR_CONFIG: return "config_invalid";
-    default: return "unknown";
+    case TF__ERR_NETWORK: return TF_ERR_DOWNLOAD_FAILED;
+    case TF__ERR_HTTP: return TF_ERR_SERVER_REJECTED;
+    case TF__ERR_CONFIG: return TF_ERR_SERVER_REJECTED;
+    case TF__ERR_NOT_AVAILABLE: return TF_ERR_SHARING_UNAVAILABLE;
+    case TF__ERR_IO: return TF_ERR_STORAGE_FAILED;
+    case TF__ERR_NO_MEMORY: return TF_ERR_ENGINE_FAILED;
+    default: return entry(code) ? code : TF_ERR_ENGINE_FAILED;
   }
 }
+int tf_last_error_code(void) {
+  if (g_code && !entry(g_code)) tf__error_as(public_code(g_code));
+  return g_code;
+}
+const char *tf_last_error(void) {
+  tf_last_error_code();
+  return g_msg[0] ? g_msg : NULL;
+}
+const char *tf_last_error_fix(void) {
+  tf_last_error_code();
+  return g_fix[0] ? g_fix : NULL;
+}
+const char *tf_error_name(int code) {
+  if (code == TF_OK) return "ok";
+  const TfErrorEntry *e = entry(code);
+  return e ? e->code : NULL;
+}
+const char *tf_error_fix(int code) {
+  const TfErrorEntry *e = entry(code);
+  return e ? e->fix : NULL;
+}
+const char *tf_error_docs(int code) {
+  /* docs_base + code, written once per code (the same bytes whichever thread writes them) */
+  static char urls[TF_ERRORS_COUNT][96];
+  const TfErrorEntry *e = entry(code);
+  if (!e) return NULL;
+  char *u = urls[-code - 1];
+  if (!u[0]) {
+    char tmp[96];
+    snprintf(tmp, sizeof tmp, "%s%s", TF_ERRORS_DOCS_BASE, e->code);
+    memcpy(u + 1, tmp + 1, sizeof tmp - 1);
+    u[0] = tmp[0];
+  }
+  return u;
+}
+/* A public call was given no object (a NULL Client, Model, Session or Heads). When an earlier call of the chain
+ * failed, its error stays: the first failure is the one tf_last_error reports (the quick start checks only its
+ * last call). Otherwise it is an invalid argument. */
+int tf__null_handle(const char *what) {
+  if (g_code) return tf_last_error_code();
+  return tf__fail(TF_ERR_INVALID_ARGUMENT, "no %s", what);
+}
+/* the last error a public call raised in this process (any thread), for tf_client_diagnose */
+static volatile int g_last_raised;
+int tf__raise(int rc) {
+  if (rc < 0) {
+    const int code = tf_last_error_code();
+    if (code) __atomic_store_n(&g_last_raised, code, __ATOMIC_SEQ_CST);
+    return code ? code : rc;
+  }
+  return rc;
+}
+int tf__last_raised(void) { return __atomic_load_n(&g_last_raised, __ATOMIC_SEQ_CST); }
+
+const unsigned char *tf__errors_json(size_t *n) {
+  if (n) *n = TF_ERRORS_JSON_SIZE;
+  return kTfErrorsJson;
+}
+const char *tf__errors_sha256(void) { return TF_ERRORS_JSON_SHA256; }
 
 const char *tf_version(void) { return TF_SDK_VERSION; }
-int tf_api_version(void) { return TF_API_VERSION; }
-
-void tf_free(void *p) { free(p); }
 
 /* ------------------------------------------------------------------ buffers */
 void tf_buf_init(TfBuf *b) { memset(b, 0, sizeof *b); }
@@ -562,5 +702,107 @@ const char *tf__platform_name(void) {
   return "macos";
 #else
   return "linux";
+#endif
+}
+
+/* ------------------------------------------------------------------ folders */
+#ifndef _WIN32
+#include <dirent.h>
+#include <sys/statvfs.h>
+#endif
+
+int tf__list_dir(const char *path, char (*names)[256], int max) {
+  int n = 0;
+#ifdef _WIN32
+  char *pat = tf_path_join(path, "*");
+  WIN32_FIND_DATAA fd;
+  HANDLE h = pat ? FindFirstFileA(pat, &fd) : INVALID_HANDLE_VALUE;
+  free(pat);
+  if (h == INVALID_HANDLE_VALUE) return 0;
+  do {
+    if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..") || strlen(fd.cFileName) > 255) continue;
+    if (n < max) snprintf(names[n++], 256, "%s", fd.cFileName);
+  } while (FindNextFileA(h, &fd));
+  FindClose(h);
+#else
+  DIR *d = opendir(path);
+  struct dirent *e;
+  while (d && (e = readdir(d))) {
+    if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") || strlen(e->d_name) > 255) continue;
+    if (n < max) snprintf(names[n++], 256, "%s", e->d_name);
+  }
+  if (d) closedir(d);
+#endif
+  return n;
+}
+
+static int is_dir(const char *path) {
+#ifdef _WIN32
+  const DWORD a = GetFileAttributesA(path);
+  return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+#else
+  struct stat st;
+  return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+static long long file_bytes(const char *path) {
+#ifdef _WIN32
+  WIN32_FILE_ATTRIBUTE_DATA d;
+  if (!GetFileAttributesExA(path, GetFileExInfoStandard, &d)) return 0;
+  return ((long long)d.nFileSizeHigh << 32) | d.nFileSizeLow;
+#else
+  struct stat st;
+  return stat(path, &st) == 0 ? (long long)st.st_size : 0;
+#endif
+}
+
+/* walks a tree (at most 4096 entries a folder): sums the files' bytes and, with `rm`, removes everything */
+static long long walk(const char *path, int rm, int depth) {
+  if (!is_dir(path)) {
+    const long long n = file_bytes(path);
+    if (rm) remove(path);
+    return n;
+  }
+  long long total = 0;
+  if (depth < 16) {
+    char (*names)[256] = (char (*)[256])malloc(4096 * 256);
+    const int n = names ? tf__list_dir(path, names, 4096) : 0;
+    for (int i = 0; i < n; ++i) {
+      char *sub = tf_path_join(path, names[i]);
+      if (sub) total += walk(sub, rm, depth + 1);
+      free(sub);
+    }
+    free(names);
+  }
+  if (rm) {
+#ifdef _WIN32
+    RemoveDirectoryA(path);
+#else
+    rmdir(path);
+#endif
+  }
+  return total;
+}
+long long tf__dir_bytes(const char *path) { return path && (is_dir(path) || tf_file_exists(path)) ? walk(path, 0, 0) : 0; }
+int tf__remove_tree(const char *path) {
+  if (!path || !*path) return -1;
+  if (is_dir(path) || tf_file_exists(path)) walk(path, 1, 0);
+  return is_dir(path) || tf_file_exists(path) ? -1 : 0;
+}
+long long tf__free_bytes(const char *path) {
+#ifdef _WIN32
+  ULARGE_INTEGER avail;
+  return GetDiskFreeSpaceExA(path, &avail, NULL, NULL) ? (long long)avail.QuadPart : -1;
+#else
+  struct statvfs v;
+  return statvfs(path, &v) == 0 ? (long long)v.f_bavail * (long long)v.f_frsize : -1;
+#endif
+}
+void tf__sleep_ms(int ms) {
+  if (ms <= 0) return;
+#ifdef _WIN32
+  Sleep((DWORD)ms);
+#else
+  usleep((useconds_t)ms * 1000);
 #endif
 }

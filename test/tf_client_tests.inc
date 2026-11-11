@@ -43,7 +43,7 @@ static int replay(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
                      : rt == 4 ? "issue (linux)"
                                : (g_rp.last_inm[0] ? "config 304 (unchanged)" : g_rp.config_name);
   const TfJson *e = name ? exchange(name) : NULL;
-  if (!e) return tf__fail(TF_ERR_NETWORK, "no recorded exchange");
+  if (!e) return tf__fail(TF__ERR_NETWORK, "no recorded exchange");
   const TfJson *resp = tf_json_get(e, "response"), *hd = tf_json_get(resp, "headers");
   r->status = (int)tf_json_get(resp, "status")->num;
   const char *b = tf_json_str(tf_json_get(resp, "body"));
@@ -92,7 +92,7 @@ static void seed_config(const char *dir, const char *flags) {
   free(pc);
 }
 
-static int client_tests(const char *fx_path, const char *dir, const char *model_dir) {
+static int client_tests(const char *fx_path, const char *dir) {
   char *text = NULL;
   size_t n;
   if (tf_read_file(fx_path, &text, &n)) return 2;
@@ -103,7 +103,7 @@ static int client_tests(const char *fx_path, const char *dir, const char *model_
   tf__now_override = 1794057929 + 60; /* the recorded config's issued_at, plus a minute */
   tf_http_set_transport(replay, NULL);
   const char *key = tf_json_str(tf_json_get(g_rp.fx, "local_public_key_hex"));
-  TfClientOptions o = tf_client_default_options();
+  TfClientConfig o = tf__client_default_config();
   o.key = "qlk_v1_local_test_aaaaaaaaaaaaaaaaaaaaaa";
   o.app_id = "org.example.Clientmw6frljs";
   o.platform = "linux";
@@ -112,89 +112,89 @@ static int client_tests(const char *fx_path, const char *dir, const char *model_
   o.api_url = "http://localhost:8787";
   o.storage_dir = dir;
   o.trusted_key_hex = key;
-  TfClient *c = tf_client_create(&o);
+  TfClient *c = tf__client_open(&o);
   CHECK(c != NULL, "client: %s", tf_last_error());
   if (!c) return 1;
-  CHECK(tf_client_launch(c) == 0, "launch: %s", tf_last_error());
-  CHECK(tf_client_config_json(c) != NULL, "the recorded config was not accepted (signature, key id, expiry)");
+  CHECK(tf__client_launch(c) == 0, "launch: %s", tf_last_error());
+  CHECK(tf__client_config_json(c) != NULL, "the recorded config was not accepted (signature, key id, expiry)");
   TfJson *att = parse_or_null(g_rp.bodies[0]), *reg = parse_or_null(g_rp.bodies[1]);
   keys_within(att, tf_json_get(tf_json_get(exchange("attest unattested (native linux)"), "request"), "body"), "attest", 1);
   keys_within(reg, tf_json_get(tf_json_get(exchange("register (linux)"), "request"), "body"), "register", 0);
   CHECK(reg && tf_json_get(reg, "new_install") && tf_json_get(reg, "new_install")->boolean, "register: new_install on the first launch");
   tf_json_free(att);
   tf_json_free(reg);
-  CHECK(strstr(g_rp.config_path, "sdk=2.0.2") && strstr(g_rp.config_path, "bucket="), "config query %s", g_rp.config_path);
-  CHECK(tf_client_refresh_config(c) == 0 && g_rp.last_inm[0] == '"', "304 refresh (If-None-Match %s)", g_rp.last_inm);
-  CHECK(tf_client_config_json(c) != NULL, "config lost after 304");
+  CHECK(strstr(g_rp.config_path, "sdk=3.0.0") && strstr(g_rp.config_path, "bucket="), "config query %s", g_rp.config_path);
+  CHECK(tf__client_refresh_config(c) == 0 && g_rp.last_inm[0] == '"', "304 refresh (If-None-Match %s)", g_rp.last_inm);
+  CHECK(tf__client_config_json(c) != NULL, "config lost after 304");
   /* within 1 h of expiry: an unconditional fetch; a tampered body and an unknown key id are refused */
   tf__now_override = 1794144329 - 1800;
   g_rp.config_name = "config 200 after a portal change";
   g_rp.tamper = 1;
   {
-    const int rc = tf_client_refresh_config(c);
-    CHECK(rc == TF_ERR_CONFIG, "a tampered config was accepted (%d %s, If-None-Match %s)", rc, tf_last_error() ? tf_last_error() : "", g_rp.last_inm);
+    const int rc = tf__client_refresh_config(c);
+    CHECK(rc == TF__ERR_CONFIG, "a tampered config was accepted (%d %s, If-None-Match %s)", rc, tf_last_error() ? tf_last_error() : "", g_rp.last_inm);
   }
   g_rp.tamper = 0;
   g_rp.wrong_kid = 1;
-  CHECK(tf_client_refresh_config(c) == TF_ERR_CONFIG, "an unknown key id was accepted");
+  CHECK(tf__client_refresh_config(c) == TF__ERR_CONFIG, "an unknown key id was accepted");
   g_rp.wrong_kid = 0;
-  CHECK(tf_client_config_json(c) != NULL, "the last good config was dropped");
-  CHECK(tf_client_refresh_config(c) == 0, "the changed config: %s", tf_last_error());
-  if (model_dir) {
-    /* the verified config's tajweed block reaches a model's portal layer */
-    TfModelOptions mo = tf_model_default_options();
-    mo.require_signature = 0;
-    mo.load_engine = 0;
-    TfModel *m = tf_model_open(model_dir, &mo);
-    CHECK(m && tf_client_apply_config(c, m) == 0, "apply config: %s", tf_last_error());
-    if (m) {
-      CHECK(strstr(tf_settings_json(m), "\"source\":\"remote\"") != NULL || 0,
-            "the tajweed block did not reach the settings");
-      tf_model_close(m);
-    }
-  }
+  CHECK(tf__client_config_json(c) != NULL, "the last good config was dropped");
+  CHECK(tf__client_refresh_config(c) == 0, "the changed config: %s", tf_last_error());
   TfSessionStats st;
   memset(&st, 0, sizeof st);
-  st.struct_size = sizeof st;
   st.audio_s = 6.3;
   st.compute_s = 1.2;
   st.chunks = 20;
-  tf_client_session_finished(c, &st);
-  CHECK(tf_client_report_issue(c, "model_load", "client_e2e", "free text is never sent") == 0, "issue");
-  CHECK(tf_client_report_issue(c, "model_load", "client_e2e", NULL) == 0, "issue dedupe");
-  CHECK(tf_client_report_issue(c, "made_up", "x", NULL) != 0, "an unknown issue kind was accepted");
-  const int sent = tf_client_flush(c, 1);
+  tf__client_session_finished(c, &st);
+  CHECK(tf__client_report_issue(c, "model_load", "client_e2e", "free text is never sent") == 0, "issue");
+  CHECK(tf__client_report_issue(c, "model_load", "client_e2e", NULL) == 0, "issue dedupe");
+  CHECK(tf__client_report_issue(c, "made_up", "x", NULL) != 0, "an unknown issue kind was accepted");
+  const int sent = tf__client_flush(c, 1);
   CHECK(sent == 1, "events: %d deltas sent", sent);
   TfJson *ev = parse_or_null(g_rp.bodies[3]), *is = parse_or_null(g_rp.bodies[4]);
   const TfJson *rec = tf_json_get(tf_json_get(exchange("events v2 (linux)"), "request"), "body");
-  /* the recorded 2.0.0 body's fields, and the 2.0.1 ones (each optional on the server; report_id always sent) */
+  /* The 3.0 wire (a closed schema on the server): every field of the body is one the shared vector's example
+   * payload has (telemetry_30.json beside the fixtures), in the body and in its cohort; the fields 3.0 keeps from
+   * the recorded 2.0.0 body are all there; the ones the scorer and the settings fed are gone. */
   {
-    static const char *const added[] = {"report_id", "launches", "ayahs", "surah_ayahs", "words", "rule_checks", "rule_flags",
-                                        "share_asked", "share_yes", "share_no"};
-    TfBuf wb;
-    tf_buf_init(&wb);
-    tf_json_write(&wb, rec);
-    if (wb.n > 1) wb.n--; /* drop the closing brace */
-    for (size_t i = 0; i < sizeof added / sizeof added[0]; ++i) tf_buf_printf(&wb, ",\"%s\":0", added[i]);
-    tf_buf_puts(&wb, "}");
-    TfJson *rec201 = wb.p ? tf_json_parse(wb.p, wb.n, NULL) : NULL;
-    keys_within(ev, rec201, "events", 0);
-    keys_within(rec, ev, "events (recorded fields present)", 0);
-    tf_json_free(rec201);
-    tf_buf_free(&wb);
+    char vp[1200];
+    snprintf(vp, sizeof vp, "%s", fx_path);
+    char *slash = strrchr(vp, '/');
+    char *bs = strrchr(vp, '\\');
+    if (bs > slash) slash = bs;
+    snprintf(slash ? slash + 1 : vp, sizeof vp - (size_t)(slash ? slash + 1 - vp : 0), "sdk_3.0.0/telemetry_30.json");
+    char *vt = NULL;
+    size_t vn = 0;
+    TfJson *vec = !tf_read_file(vp, &vt, &vn) ? tf_json_parse(vt, vn, NULL) : NULL;
+    free(vt);
+    const TfJson *example = tf_json_get(vec, "example_payload");
+    CHECK(example != NULL, "no example payload in %s", vp);
+    keys_within(ev, example, "events", 0);
+    static const char *const kept[] = {"v", "day", "product", "platform", "sdk_version", "app_version", "device", "cohorts", "report_id"};
+    for (size_t i = 0; i < sizeof kept / sizeof kept[0]; ++i) CHECK(tf_json_get(ev, kept[i]) != NULL, "events.%s missing", kept[i]);
     const char *rid = tf_json_str(tf_json_get(ev, "report_id"));
     CHECK(rid && strlen(rid) == 32 && strspn(rid, "0123456789abcdef") == 32, "report_id %s", rid ? rid : "missing");
+    keys_within(tf_json_get(ev, "device"), tf_json_get(rec, "device"), "events.device", 1);
+    const TfJson *co = tf_json_get(ev, "cohorts"), *eco = tf_json_get(example, "cohorts");
+    CHECK(co && co->n == 1, "events: one cohort");
+    if (co && co->n && eco && eco->n) {
+      keys_within(&co->kids[0], &eco->kids[0], "events.cohort", 0);
+      static const char *const ckept[] = {"revision", "context", "backend", "sessions", "minutes", "chunks", "aborted", "fallbacks", "self_test",
+                                          "latency_ms", "rtf", "cold_start_ms", "model_load_ms", "thermal", "margin", "confidence"};
+      for (size_t i = 0; i < sizeof ckept / sizeof ckept[0]; ++i) CHECK(tf_json_get(&co->kids[0], ckept[i]) != NULL, "events.cohort.%s missing", ckept[i]);
+      const TfJson *gone = tf_json_get(vec, "cohort_fields_removed");
+      for (int i = 0; gone && i < gone->n; ++i)
+        CHECK(!tf_json_get(&co->kids[0], tf_json_str(&gone->kids[i])), "events.cohort.%s is still sent", tf_json_str(&gone->kids[i]));
+    }
+    CHECK(!tf_json_get(ev, "reported") && !tf_json_get(ev, "coverage") && !tf_json_get(ev, "ayahs"), "app-reported fields without a report");
+    tf_json_free(vec);
   }
-  keys_within(tf_json_get(ev, "device"), tf_json_get(rec, "device"), "events.device", 1);
-  const TfJson *co = tf_json_get(ev, "cohorts");
-  CHECK(co && co->n == 1, "events: one cohort");
-  if (co && co->n) keys_within(&co->kids[0], &tf_json_get(rec, "cohorts")->kids[0], "events.cohort", 1);
   CHECK(tf_json_str(tf_json_get(ev, "product")) && !strcmp(tf_json_get(ev, "product")->str, "native"), "product native");
   keys_within(is, tf_json_get(tf_json_get(exchange("issue (linux)"), "request"), "body"), "issue", 0);
   CHECK(is && !tf_json_get(is, "message"), "an issue carried free text");
   tf_json_free(ev);
   tf_json_free(is);
-  tf_client_destroy(c);
+  tf__client_close(c);
   printf("client replay (the portal team fixtures, local key id %s): %s\n", tf_json_str(tf_json_get(g_rp.fx, "local_key_id")), fails ? "FAIL" : "ok");
 
   /* the sharing state machine: never before a session with feedback; the first ask and two re-asks, 7 sessions apart,
@@ -203,7 +203,7 @@ static int client_tests(const char *fx_path, const char *dir, const char *model_
   tf__now_override = 0;
   char sdir[1024];
   snprintf(sdir, sizeof sdir, "%s/sharing", dir);
-  TfClientOptions so = tf_client_default_options();
+  TfClientConfig so = tf__client_default_config();
   so.app_id = "org.example.Sharing";
   /* 2.0.1: the backend decides whether the sheet is offered; the app's option is ignored either way */
   {
@@ -219,61 +219,56 @@ static int client_tests(const char *fx_path, const char *dir, const char *model_
       snprintf(d0, sizeof d0, "%s/offer%d", dir, k);
       seed_config(d0, cases[k].flags);
       so.storage_dir = d0;
-      so.contributions = cases[k].option;
-      TfClient *oc = tf_client_create(&so);
+      TfClient *oc = tf__client_open(&so);
       TfSessionStats ss;
       memset(&ss, 0, sizeof ss);
-      ss.struct_size = sizeof ss;
       ss.feedback_shown = 1;
-      tf_client_session_finished(oc, &ss);
-      asked = oc && strstr(tf_client_sharing_status_json(oc), "\"pendingAsk\":true") != NULL;
-      CHECK(asked == cases[k].want, "%s: %s", cases[k].what, oc ? tf_client_sharing_status_json(oc) : "no client");
+      tf__client_session_finished(oc, &ss);
+      asked = oc && strstr(tf__client_sharing_status_json(oc), "\"pendingAsk\":true") != NULL;
+      CHECK(asked == cases[k].want, "%s: %s", cases[k].what, oc ? tf__client_sharing_status_json(oc) : "no client");
       /* offered is never consent: not sharing until the learner answers */
-      CHECK(oc && tf_client_sharing_state(oc) == 0, "%s: sharing before any answer", cases[k].what);
-      tf_client_destroy(oc);
+      CHECK(oc && tf__client_sharing_state(oc) == 0, "%s: sharing before any answer", cases[k].what);
+      tf__client_close(oc);
     }
   }
   seed_config(sdir, "{\"contributions\":true}");
   so.storage_dir = sdir;
-  so.contributions = 1;
-  TfClient *sc = tf_client_create(&so);
+  TfClient *sc = tf__client_open(&so);
   int asks_at[8], na = 0;
   for (int i = 1; i <= 40 && sc; ++i) {
     TfSessionStats ss;
     memset(&ss, 0, sizeof ss);
-    ss.struct_size = sizeof ss;
     ss.feedback_shown = i != 1;
-    tf_client_session_finished(sc, &ss);
-    if (strstr(tf_client_sharing_status_json(sc), "\"pendingAsk\":true")) {
+    tf__client_session_finished(sc, &ss);
+    if (strstr(tf__client_sharing_status_json(sc), "\"pendingAsk\":true")) {
       if (na < 8) asks_at[na] = i;
       na++;
-      tf_client_sharing_answer(sc, 0);
+      tf__client_sharing_answer(sc, 0);
     }
   }
   CHECK(na == 3 && asks_at[0] == 2 && asks_at[1] == 9 && asks_at[2] == 16, "asks: %d, at %d %d %d", na, na > 0 ? asks_at[0] : -1,
         na > 1 ? asks_at[1] : -1, na > 2 ? asks_at[2] : -1);
-  CHECK(sc && strstr(tf_client_sharing_status_json(sc), "\"consent\":\"final\""), "final after the third Not now");
+  CHECK(sc && strstr(tf__client_sharing_status_json(sc), "\"consent\":\"final\""), "final after the third Not now");
   /* desktop uploads at the capped tier when the config names no tier for it */
-  CHECK(sc && strstr(tf_client_sharing_status_json(sc), "\"uploadTrust\":\"capped\"") && strstr(tf_client_sharing_status_json(sc), "\"mayUpload\":true"),
-        "a desktop install uploads at the capped tier by default: %s", sc ? tf_client_sharing_status_json(sc) : "");
+  CHECK(sc && strstr(tf__client_sharing_status_json(sc), "\"uploadTrust\":\"capped\"") && strstr(tf__client_sharing_status_json(sc), "\"mayUpload\":true"),
+        "a desktop install uploads at the capped tier by default: %s", sc ? tf__client_sharing_status_json(sc) : "");
   /* three sheets per install, ever: none after a restart either, and ask_now asks nothing */
-  tf_client_destroy(sc);
-  sc = tf_client_create(&so);
+  tf__client_close(sc);
+  sc = tf__client_open(&so);
   for (int i = 0; i < 30 && sc; ++i) {
     TfSessionStats ss;
     memset(&ss, 0, sizeof ss);
-    ss.struct_size = sizeof ss;
     ss.feedback_shown = 1;
-    tf_client_session_finished(sc, &ss);
+    tf__client_session_finished(sc, &ss);
   }
-  CHECK(sc && tf_client_sharing_ask_now(sc) == 0 && strstr(tf_client_sharing_status_json(sc), "\"asks\":3,") &&
-            strstr(tf_client_sharing_status_json(sc), "\"pendingAsk\":false"),
-        "a fourth sheet after a restart: %s", sc ? tf_client_sharing_status_json(sc) : "");
-  tf_client_sharing_set(sc, 1);
-  CHECK(tf_client_sharing_state(sc) == 1, "the settings switch turns sharing on");
-  tf_client_destroy(sc);
-  const char *en = tf_sharing_copy_json("en-GB"), *ar = tf_sharing_copy_json("ar");
-  CHECK(en && strstr(en, "\"lang\": \"en\"") && ar && strstr(ar, "\"lang\": \"ar\"") && tf_sharing_copy_json("xx"), "copy decks");
+  CHECK(sc && tf__client_sharing_ask_now(sc) == 0 && strstr(tf__client_sharing_status_json(sc), "\"asks\":3,") &&
+            strstr(tf__client_sharing_status_json(sc), "\"pendingAsk\":false"),
+        "a fourth sheet after a restart: %s", sc ? tf__client_sharing_status_json(sc) : "");
+  tf__client_sharing_set(sc, 1);
+  CHECK(tf__client_sharing_state(sc) == 1, "the settings switch turns sharing on");
+  tf__client_close(sc);
+  const char *en = tf__sharing_deck_json("en-GB"), *ar = tf__sharing_deck_json("ar");
+  CHECK(en && strstr(en, "\"lang\": \"en\"") && ar && strstr(ar, "\"lang\": \"ar\"") && tf__sharing_deck_json("xx"), "copy decks");
   printf("sharing state machine and copy decks: %s\n", fails ? "FAIL" : "ok");
   tf_json_free(g_rp.fx);
   return fails ? 1 : 0;
@@ -359,7 +354,7 @@ static int replay_sharing(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
     if (strstr(q->url, "/contributions/c") || strstr(q->url, "/contributions/d"))
       CHECK(_tf_strnicmp(*h, "x-qlab-key", 10) && _tf_strnicmp(*h, "authorization", 13), "a credential was sent to a deletion route");
   const TfJson *e = name ? exchange(name) : NULL;
-  if (!e) return tf__fail(TF_ERR_NETWORK, "no recorded exchange for %s", q->url);
+  if (!e) return tf__fail(TF__ERR_NETWORK, "no recorded exchange for %s", q->url);
   if (strstr(q->url, "/contributions/delete")) {
     /* the body is the recorded one's fields, and its signature verifies with this install's device key */
     TfJson *b = tf_json_parse((const char *)q->body, q->body_n, NULL);
@@ -432,20 +427,20 @@ static int sharing_tests(const char *vdir, const char *fx_path, const char *dir)
   g_rp.fx = tf_json_parse(text, n, NULL);
   free(text);
   tf_http_set_transport(replay_sharing, NULL);
-  TfClientOptions o = tf_client_default_options();
+  TfClientConfig o = tf__client_default_config();
   o.key = "qlk_v1_local_test_aaaaaaaaaaaaaaaaaaaaaa";
   o.app_id = "org.example.Sharing";
   o.platform = "linux";
   o.storage_dir = dir;
   o.api_url = "http://localhost:8787";
-  TfClient *c = tf_client_create(&o);
+  TfClient *c = tf__client_open(&o);
   char id[33], key[90], rh[65], code[33];
   CHECK(tf__contributor(dir, 1, id, key, rh) == 0 && strlen(id) == 32 && strlen(key) == 87 && strlen(rh) == 64, "contributor made");
-  CHECK(tf_client_sharing_recovery_code(c, code) == 0 && strlen(code) == 32, "recovery code shown");
-  CHECK(tf_client_sharing_summary_json(c) != NULL, "summary");
-  CHECK(tf_client_sharing_delete(c) == 0, "delete: %s", tf_last_error() ? tf_last_error() : "");
-  CHECK(tf_client_sharing_recovery_code(c, code) != 0, "the local contributor survived the deletion");
-  tf_client_destroy(c);
+  CHECK(tf__client_sharing_recovery_code(c, code) == 0 && strlen(code) == 32, "recovery code shown");
+  CHECK(tf__client_sharing_summary_json(c) != NULL, "summary");
+  CHECK(tf__client_sharing_delete(c) == 0, "delete: %s", tf_last_error() ? tf_last_error() : "");
+  CHECK(tf__client_sharing_recovery_code(c, code) != 0, "the local contributor survived the deletion");
+  tf__client_close(c);
   tf_http_set_transport(NULL, NULL);
   tf_json_free(g_rp.fx);
   printf("deletion flow (recorded exchanges): %s\n", fails ? "FAIL" : "ok");
@@ -463,7 +458,7 @@ static int serve_cdn(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
   static const char want[] = "https://cdn.quranlab.ai/models/Quran-Lab/tajweedformer-v4/test/sdk/v4.0/";
   if (strncmp(q->url, want, sizeof want - 1)) g_bad_url++;
   const char *rel = strstr(q->url, "/sdk/v4.0/");
-  if (!rel) return tf__fail(TF_ERR_NETWORK, "unexpected URL");
+  if (!rel) return tf__fail(TF__ERR_NETWORK, "unexpected URL");
   rel += 10;
   char *p = tf_path_join(g_cdn, rel), *data = NULL;
   size_t n = 0;
@@ -492,7 +487,7 @@ static int serve_cdn(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
   fwrite(data + from, 1, len, f);
   fclose(f);
   free(data);
-  if (cut) return tf__fail(TF_ERR_NETWORK, "connection reset (simulated)");
+  if (cut) return tf__fail(TF__ERR_NETWORK, "connection reset (simulated)");
   r->status = from > 0 ? 206 : 200;
   return 0;
 }
@@ -500,15 +495,15 @@ static int download_tests(const char *cdn, const char *dest, const char *key) {
   snprintf(g_cdn, sizeof g_cdn, "%s", cdn);
   tf_http_set_transport(serve_cdn, NULL);
   g_cut_once = 1;
-  TfDownloadOptions d = tf_download_default_options();
+  TfDownload d = tf__download_defaults();
   d.key = "qlk_v1_local_test_aaaaaaaaaaaaaaaaaaaaaa";
   d.revision = "test";
   d.dest = dest;
   d.contexts = "c16_l64";
   d.trusted_key_hex = key;
-  const int first = tf_download_model(&d);
-  CHECK(first == TF_ERR_NETWORK, "the interrupted download: %d", first);
-  const int second = tf_download_model(&d);
+  const int first = tf__download_model(&d);
+  CHECK(first == TF_ERR_DOWNLOAD_FAILED, "the interrupted download: %d", first);
+  const int second = tf__download_model(&d);
   CHECK(second == 0, "the resumed download: %s", tf_last_error() ? tf_last_error() : "");
   CHECK(g_ranged >= 1, "no Range request after the interruption");
   CHECK(g_bad_url == 0, "a download URL is not under https://cdn.quranlab.ai/models/Quran-Lab/tajweedformer-v4/test/sdk/v4.0/");
@@ -531,15 +526,22 @@ static int download_tests(const char *cdn, const char *dest, const char *key) {
   free(c24);
   free(gzleft);
   tf_http_set_transport(NULL, NULL);
-  TfModelOptions mo = tf_model_default_options();
+  TfModelOpen mo;
+  memset(&mo, 0, sizeof mo);
   mo.trusted_key_hex = key;
   mo.context = "c16_l64";
-  TfModel *m = tf_model_open(dest, &mo);
+  TfModel *m = tf__model_open(dest, &mo);
   CHECK(m != NULL, "the downloaded folder does not open: %s", tf_last_error() ? tf_last_error() : "");
   if (m) {
-    TfStream *s = tf_stream_create(m, NULL);
-    CHECK(s != NULL, "no stream on the downloaded folder");
-    tf_stream_destroy(s);
+    TfSession *s = tf_session_create(m, NULL);
+    CHECK(s != NULL, "no session on the downloaded folder");
+    tf_session_destroy(s);
+    /* the reference table (role reference) is not part of the CPU set: listed, not downloaded */
+    TfReference *ref = tf_model_reference(m);
+    CHECK(ref != NULL && !tf_reference_is_downloaded(ref), "the reference table was downloaded with the CPU set");
+    TfUnits u;
+    CHECK(ref && tf_reference_units(ref, 1, 1, &u) == TF_ERR_REFERENCE_MISSING, "units before the fetch: %s", tf_error_name(tf_last_error_code()));
+    CHECK(ref && tf_reference_fetch(ref) == TF_ERR_REFERENCE_MISSING, "a fetch on a folder opened by hand: %s", tf_error_name(tf_last_error_code()));
     tf_model_close(m);
   }
   printf("downloader (layout 3, gzip, Range resume, native profile c16_l64): %s, %d requests\n", fails ? "FAIL" : "ok", g_requests);

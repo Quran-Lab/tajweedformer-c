@@ -130,16 +130,16 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
   uc.lpszExtraInfo = extra;
   uc.dwExtraInfoLength = 4096;
   if (!wurl || !wmethod || !WinHttpCrackUrl(wurl, 0, 0, &uc)) {
-    tf__fail(TF_ERR_ARGUMENT, "bad URL");
+    tf__fail(TF_ERR_INVALID_ARGUMENT, "bad URL");
     goto done;
   }
   wchar_t full[8192];
   _snwprintf(full, 8192, L"%s%s", path, extra);
   full[8191] = 0;
-  ses = WinHttpOpen(L"TajweedFormer-native/2.0.2", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+  ses = WinHttpOpen(L"TajweedFormer-native/" TF_SDK_VERSION, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
                     WINHTTP_NO_PROXY_BYPASS, 0);
   if (!ses) {
-    tf__fail(TF_ERR_NETWORK, "WinHttpOpen failed (%lu)", GetLastError());
+    tf__fail(TF__ERR_NETWORK, "WinHttpOpen failed (%lu)", GetLastError());
     goto done;
   }
   const int to = (q->timeout_s > 0 ? q->timeout_s : 60) * 1000;
@@ -149,13 +149,13 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
                                  uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0)
             : NULL;
   if (!req) {
-    tf__fail(TF_ERR_NETWORK, "cannot open the request (%lu)", GetLastError());
+    tf__fail(TF__ERR_NETWORK, "cannot open the request (%lu)", GetLastError());
     goto done;
   }
   if (q->cancel) {
     slot = slot_add(req, q->cancel);
     if (slot < 0) {
-      tf__fail(TF_ERR_NETWORK, "cancelled");
+      tf__fail(TF__ERR_NETWORK, "cancelled");
       goto done;
     }
   }
@@ -174,15 +174,15 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
   size_t body_n = q->body_n;
   if (q->upload_file) {
     if (tf_read_file(q->upload_file, &upbuf, &body_n)) {
-      tf__fail(TF_ERR_IO, "cannot read the upload file");
+      tf__fail(TF__ERR_IO, "cannot read the upload file");
       goto done;
     }
     body = upbuf;
   }
   if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0, (LPVOID)body, (DWORD)body_n, (DWORD)body_n, 0) ||
       !WinHttpReceiveResponse(req, NULL)) {
-    if (q->cancel && *q->cancel) tf__fail(TF_ERR_NETWORK, "cancelled");
-    else tf__fail(TF_ERR_NETWORK, "the request failed (%lu)", GetLastError());
+    if (q->cancel && *q->cancel) tf__fail(TF__ERR_NETWORK, "cancelled");
+    else tf__fail(TF__ERR_NETWORK, "the request failed (%lu)", GetLastError());
     goto done;
   }
   DWORD st = 0, sz = sizeof st;
@@ -215,7 +215,7 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
   if (to_file) {
     down = fopen(q->download_file, r->status == 206 ? "ab" : "wb");
     if (!down) {
-      tf__fail(TF_ERR_IO, "cannot write the download");
+      tf__fail(TF__ERR_IO, "cannot write the download");
       goto done;
     }
   }
@@ -225,7 +225,7 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
     DWORD avail = 0;
     if (!WinHttpQueryDataAvailable(req, &avail)) {
       tf_buf_free(&b);
-      tf__fail(TF_ERR_NETWORK, "reading the response failed (%lu)", GetLastError());
+      tf__fail(TF__ERR_NETWORK, "reading the response failed (%lu)", GetLastError());
       goto done;
     }
     if (!avail) break;
@@ -235,9 +235,10 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
     if (to_file) {
       if (fwrite(buf, 1, got, down) != got) {
         tf_buf_free(&b);
-        tf__fail(TF_ERR_IO, "writing the download failed");
+        tf__fail(TF__ERR_IO, "writing the download failed");
         goto done;
       }
+      if (q->on_bytes) q->on_bytes(q->bytes_user, (long long)got);
     } else {
       tf_buf_put(&b, buf, got);
     }
@@ -280,7 +281,11 @@ static size_t on_body(char *p, size_t s, size_t n, void *u) {
     c->status_seen = 1;
     (void)code;
   }
-  if (c->file) return fwrite(p, 1, s * n, c->file);
+  if (c->file) {
+    const size_t w = fwrite(p, 1, s * n, c->file);
+    if (w && c->q && c->q->on_bytes) c->q->on_bytes(c->q->bytes_user, (long long)w);
+    return w;
+  }
   tf_buf_put(&c->body, p, s * n);
   return c->body.oom ? 0 : s * n;
 }
@@ -301,7 +306,7 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
     inited = 1;
   }
   CURL *h = curl_easy_init();
-  if (!h) return tf__fail(TF_ERR_NETWORK, "curl_easy_init failed");
+  if (!h) return tf__fail(TF__ERR_NETWORK, "curl_easy_init failed");
   CurlCtx c;
   memset(&c, 0, sizeof c);
   c.r = r;
@@ -332,7 +337,7 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
     if (tf_read_file(q->upload_file, &upbuf, &up_n)) {
       curl_slist_free_all(hs);
       curl_easy_cleanup(h);
-      return tf__fail(TF_ERR_IO, "cannot read the upload file");
+      return tf__fail(TF__ERR_IO, "cannot read the upload file");
     }
   }
   if (strcmp(method, "GET")) {
@@ -352,7 +357,7 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
       curl_slist_free_all(hs);
       curl_easy_cleanup(h);
       free(upbuf);
-      return tf__fail(TF_ERR_IO, "cannot write the download");
+      return tf__fail(TF__ERR_IO, "cannot write the download");
     }
   }
   const CURLcode cc = curl_easy_perform(h);
@@ -365,7 +370,7 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
   free(upbuf);
   if (cc != CURLE_OK) {
     tf_buf_free(&c.body);
-    return tf__fail(TF_ERR_NETWORK, "%s", curl_easy_strerror(cc));
+    return tf__fail(TF__ERR_NETWORK, "%s", curl_easy_strerror(cc));
   }
   r->body_n = c.body.n;
   r->body = tf_buf_take(&c.body);
@@ -378,4 +383,12 @@ int tf_http(const TfHttpRequest *q, TfHttpResponse *r) {
   r->content_length = -1;
   if (g_transport) return g_transport(q, r, g_transport_user);
   return http_native(q, r);
+}
+
+/* ------------------------------------------------------------------ the kind of connection */
+int tf__connection_override = -1;
+int tf__connection(void) { return tf__connection_override >= 0 ? tf__connection_override : TF__CONNECTION_UNKNOWN; }
+const char *tf__connection_name(int kind) {
+  static const char *const names[] = {"unmetered", "metered", "none", "unknown"};
+  return kind >= 0 && kind <= 3 ? names[kind] : "unknown";
 }
