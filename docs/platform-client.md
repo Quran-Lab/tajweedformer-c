@@ -29,8 +29,10 @@ answers "Share", and a learner who never answers never shares.
   everything they shared (signed with a key that never leaves the device; a one-time recovery code works
   at portal.quranlab.ai/delete). Both work whatever wording the learner agreed to.
 - What "at once" means (3.0.1): the request in flight is aborted, whichever it is (a segment, the start of an
-  upload, a batch of upload URLs, a take list); once the call has returned no audio leaves the device; the call
-  returns within 3 seconds even when a request hangs; nothing unsent is left on disk, also when the aborted
+  upload, a batch of upload URLs, a take list); once the call has returned the SDK hands nothing more to the
+  system (what the system had already taken into its send buffer may still go out, and that can be the whole
+  segment that was being sent; nothing after it is sent); the call returns within 3 seconds even when a request
+  hangs; nothing unsent is left on disk, also when the aborted
   request comes back later; and turning sharing on again works right away.
 - A recording made under an earlier consent is never uploaded, whatever happened in between: sharing turned
   off and on again, the process ending between the off and the deletion of the queue, a recording that could

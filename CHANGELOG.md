@@ -3,8 +3,9 @@
 ## 3.0.1
 
 One subject, the same in the Android, Apple, web and C SDKs: what "sharing off" and "delete what I shared" must
-guarantee. The rules, held by one shared test of 17 situations, each run 20 times: after the call returns no audio
-leaves the device, whatever was in flight; the call returns within 3 seconds even when a request hangs; nothing
+guarantee. The rules, held by one shared test of 17 situations, each run 20 times: from the moment the call returns
+the SDK hands nothing more to the system and has ended the request in flight, whatever it was (what the system had
+already buffered may still go out, see below); the call returns within 3 seconds even when a request hangs; nothing
 unsent stays on disk, also when the request that was in flight comes back later; turning sharing on again works
 right away; and a recording made under an earlier consent is never uploaded, whatever happened in between (the
 web SDK holds the first four rules in its 3.0.1 and this last one from its 3.0.2). The API is unchanged (the
@@ -47,9 +48,13 @@ In production the sharing sheet has been on for iOS and macOS only, so no app bu
   is asked, or between its answer and the device's deletes, starts with sharing off and deletes what is left: the
   learner asked for a deletion, so nothing is sent until they say otherwise.
 - **What can still leave after the call.** The request is aborted by closing its handle (WinHTTP) or by stopping
-  the transfer (libcurl). Bytes the system had already taken for the connection may still go out; the SDK hands
-  over nothing more, and a PUT cut short does not complete. In the test, with a stub in place of the network,
-  0 bytes left after the call in every run, before and after this fix: 3.0.0 already aborted a PUT in flight.
+  the transfer (libcurl), and the SDK hands over nothing more. Bytes the system had already taken into its send
+  buffer for the connection may still go out, and that can be the whole segment that was being sent: measured on
+  a phone with another SDK of this family (Android 11), the system's buffer held 2,220,032 bytes when the request
+  was ended, which is more than one segment; the buffers of Windows and Linux are not measured. Nothing after
+  that segment is sent, and a PUT that is cut short does not complete. In the test, against a stub in place of
+  the network, 0 bytes arrived after the call in every run, before and after this fix (3.0.0 already aborted a
+  PUT in flight); that is the test's stub, not a property of a device.
 - **The settings file is written once more after the stop.** A recording that finished uploading at the moment
   of the off call writes the same file (its count) and could, in a narrow window, have written it back with the
   consent it had read before; sharing would then have been on again at the next launch. Not seen in a test.

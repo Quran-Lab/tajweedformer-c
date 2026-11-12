@@ -529,8 +529,9 @@ same page in every TajweedFormer SDK); the C calls are in [docs/api.md](docs/api
   keeps that second in memory only, drops the feed at once without a yes, and the model never sees it. An app
   that captures only during takes gets no pre-roll and no tail.
 - **Stop and delete** at any time (`tf_sharing_set_on(client, 0)`, `tf_sharing_delete`), whatever wording the
-  learner agreed to. Both stop an upload that is in flight: the request is aborted, nothing more is sent once the
-  call has returned, the call returns within 3 seconds, and nothing unsent stays on disk. A deletion the server
+  learner agreed to. Both stop an upload that is in flight: the request is aborted and the SDK hands nothing more
+  to the system once the call has returned (what the system had already buffered may still go out, which can be
+  the segment being sent), the call returns within 3 seconds, and nothing unsent stays on disk. A deletion the server
   took also turns sharing off (the learner turns it on again with the switch and is not asked again); one the
   server did not take changes nothing.
 

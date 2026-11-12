@@ -303,7 +303,7 @@ strings and reports the learner's own tap.
 | - | - |
 | `tf_sharing_status(client, &s)` | `TfSharing`: `is_available`, `is_on`, `asks`, `pending_ask`, `guardian`, `shared`, `consent_version`, `consent_text`, `consent_sha256` |
 | `tf_sharing_is_available(client)`, `tf_sharing_is_on(client)` | the two answers alone |
-| `tf_sharing_set_on(client, on)` | the settings switch. Off stops uploads at once and deletes the unsent queue: the request in flight is aborted, nothing is sent after the call has returned, and it returns within 3 s even when a request hangs |
+| `tf_sharing_set_on(client, on)` | the settings switch. Off stops uploads at once and deletes the unsent queue: the request in flight is aborted and the SDK hands nothing more to the system after the call has returned (what the system had already buffered may still go out, which can be the segment being sent), and it returns within 3 s even when a request hangs |
 | `tf_sharing_ask(client)` | ask now, if an ask is still allowed. `sharing_unavailable` when the config does not offer sharing to this app |
 | `tf_sharing_answer(client, share)` | the learner's answer to a sheet: 1 share, 0 not now |
 | `tf_sharing_copy_json(client)` | the copy deck in the client's language, with the app's own wording applied |
