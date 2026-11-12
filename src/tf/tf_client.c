@@ -45,6 +45,12 @@ struct TfClient {
   char config_pin[24];  /* the pin the stored config was asked with */
   char stop_code[48];   /* the server's error code that stopped the network calls of this launch */
   char stop_detail[48]; /* sdk_too_old: the version the answer names */
+  char gate[48];        /* SPEC 15.3: the refusal that stops the model on this device; kept in client.json until a
+                           later answer accepts the key */
+  int gate_cdn;         /* that refusal came from a model request (the CDN), not from the API */
+  int purge;            /* SPEC 15.3: a refusal stopped the model and the models on this device
+                           are to be removed; kept in client.json until a removal has left none */
+  int purge_try;        /* a refusal has just arrived: the call that got it tries the removal before it returns */
   int last_error;       /* the catalogue code of the last failure a public call raised */
   void *api_state;      /* tf_api.c's state */
   uint8_t pk[32];
@@ -117,6 +123,33 @@ int tf__client_last_error(const TfClient *c) { return c->last_error; }
 const char *tf__client_stop_code(const TfClient *c) { return c->stop_code; }
 const char *tf__client_latest(const TfClient *c) { return c->latest[0] ? c->latest : NULL; }
 int tf__client_stopped(const TfClient *c) { return c->stopped; }
+/* One list (SPEC 15.3, vectors/model_gate.json stop_reasons): the `reason` of an answer that refuses the key or
+ * the app. An answer whose body carries one of these stops a model on the device; an answer without a reason
+ * never does, whatever its status and its error. */
+int tf__stop_reason(const char *code) {
+  static const char *const stop[] = {"key_revoked", "key_unknown", "app_not_allowed", "origin_not_allowed",
+                                     "key_type_mismatch", "app_blocked", "developer_not_approved"};
+  for (size_t i = 0; code && i < sizeof stop / sizeof stop[0]; ++i)
+    if (!strcmp(code, stop[i])) return 1;
+  return 0;
+}
+/* the reasons whose error is invalid_key (the catalogue has no refusal of their own for them) */
+int tf__key_reason(const char *code) { return code && (!strcmp(code, "key_revoked") || !strcmp(code, "key_unknown")); }
+/* the stop reason an answer's body carries, copied to out; 1 when it has one */
+int tf__body_stop_reason(const char *body, size_t n, char out[48]) {
+  out[0] = 0;
+  TfJson *j = body ? tf_json_parse(body, n, NULL) : NULL;
+  const char *why = tf_json_str(tf_json_get(j, "reason"));
+  if (why && strlen(why) < 48 && tf__stop_reason(why)) snprintf(out, 48, "%s", why);
+  tf_json_free(j);
+  return out[0] != 0;
+}
+/* the remembered refusal as the catalogue error the app gets */
+int tf__fail_gate(const TfClient *c) {
+  return tf__key_reason(c->gate) ? tf__fail(TF_ERR_INVALID_KEY, NULL) : tf__fail_rejected(c->gate, c->app_id);
+}
+const char *tf__client_gate(const TfClient *c) { return c->gate; }
+int tf__client_purge_owed(const TfClient *c) { return c->purge; }
 int tf__client_answered(const TfClient *c) { return c->answered; }
 const char *tf__client_stop_detail(const TfClient *c) { return c->stop_detail; }
 void tf__client_set_pin(TfClient *c, const char *version) { snprintf(c->pin, sizeof c->pin, "%s", version ? version : ""); }
@@ -191,6 +224,16 @@ static void note_refusal(TfClient *c, const TfHttpResponse *r) {
 
 static int classify_stop(TfClient *c, const TfHttpResponse *r) {
   if (!r->body) return 0;
+  /* a key Quran Lab revoked or never issued, whatever the error beside the reason (invalid_key, or invalid_token
+   * for a token whose key was revoked after it was issued): the app is told invalid_key */
+  {
+    char why[48];
+    if (tf__body_stop_reason(r->body, r->body_n, why) && tf__key_reason(why)) {
+      snprintf(c->stop_code, sizeof c->stop_code, "invalid_key");
+      c->stop_detail[0] = 0;
+      return 1;
+    }
+  }
   /* The answer's "reason" first: the server answers an origin, key-type or allow-list refusal as a bad key (401
    * invalid_key, the code released SDKs stop on) and names the check that refused in "reason". When the
    * catalogue has that refusal, it is the code the app is told; a bad key has no reason and reads as before. */
@@ -229,6 +272,46 @@ static int classify_stop(TfClient *c, const TfHttpResponse *r) {
 }
 
 static int ensure_token(TfClient *c);
+static void save_state(TfClient *c);
+/* the server refused the key or the app with a reason that stops the model: remembered on the device */
+static void gate_set(TfClient *c, const char *code, int cdn) {
+  if (!tf__stop_reason(code)) return;
+  /* a stop removes the models from the device, and every refusal tries that again */
+  c->purge_try = 1;
+  if (!strcmp(c->gate, code) && c->gate_cdn == cdn && c->purge) return;
+  snprintf(c->gate, sizeof c->gate, "%s", code);
+  c->gate_cdn = cdn;
+  c->purge = 1;
+  save_state(c);
+}
+void tf__client_refuse(TfClient *c, const char *code) {
+  tf_mutex_lock(&c->lock);
+  gate_set(c, code, 1);
+  const int purge = c->purge_try;
+  c->purge_try = 0;
+  tf_mutex_unlock(&c->lock);
+  if (purge) tf__client_purge_models(c);
+}
+/* 0: a removal has left no model on this device, nothing is owed any more. 1: a removal failed, it is owed */
+void tf__client_purge_set(TfClient *c, int owed) {
+  tf_mutex_lock(&c->lock);
+  if (c->purge != (owed != 0)) {
+    c->purge = owed != 0;
+    save_state(c);
+  }
+  tf_mutex_unlock(&c->lock);
+}
+/* A refusal that came from a model request: the API has just accepted the key (a fresh config), so the model
+ * request is asked again and says for itself whether it still refuses. Without a network it holds. */
+void tf__client_gate_retry(TfClient *c) {
+  tf_mutex_lock(&c->lock);
+  if (c->gate[0] && c->gate_cdn) {
+    c->gate[0] = 0;
+    c->gate_cdn = 0;
+    save_state(c);
+  }
+  tf_mutex_unlock(&c->lock);
+}
 
 /* 3.0.1: a thread may name its own abort flag for the calls it makes (the sharing uploader does: turning sharing
  * off aborts its request in flight, whichever it is, without touching the client's other calls). Without one a
@@ -240,7 +323,11 @@ static int call_locked(TfClient *c, const Call *k, TfHttpResponse *r);
 static int call(TfClient *c, const Call *k, TfHttpResponse *r) {
   tf_mutex_lock(&c->lock);
   const int rc = call_locked(c, k, r);
+  const int purge = c->purge_try;
+  c->purge_try = 0;
   tf_mutex_unlock(&c->lock);
+  /* SPEC 15.3: the answer refused the key or the app: the models go in this call, before it returns */
+  if (purge) tf__client_purge_models(c);
   return rc;
 }
 static int call_locked(TfClient *c, const Call *k, TfHttpResponse *r) {
@@ -268,7 +355,10 @@ static int call_locked(TfClient *c, const Call *k, TfHttpResponse *r) {
     q.timeout_s = 30;
     q.cancel = t_cancel ? t_cancel : &c->cancel;
     if (tf_http(&q, r)) return tf__error_code() ? tf__error_code() : TF__ERR_NETWORK;
-    if (r->status == 401 && k->auth && attempt == 0 && r->body && strstr(r->body, "invalid_token")) {
+    char why[48];
+    /* invalid_token without a reason: renew and repeat once. With a reason of the list the key is refused */
+    if (r->status == 401 && k->auth && attempt == 0 && r->body && strstr(r->body, "invalid_token") &&
+        !tf__body_stop_reason(r->body, r->body_n, why)) {
       c->token[0] = 0;
       c->token_exp = 0;
       tf_http_response_free(r);
@@ -276,9 +366,35 @@ static int call_locked(TfClient *c, const Call *k, TfHttpResponse *r) {
     }
     break;
   }
-  if (r->status >= 400 && classify_stop(c, r)) c->stopped = 1;
-  if (r->status >= 200 && r->status < 400) c->answered = 1;
+  if (r->status >= 400) {
+    char why[48];
+    if (classify_stop(c, r)) c->stopped = 1;
+    /* SPEC 15.3: only a reason of the list stops the model on this device */
+    if (tf__body_stop_reason(r->body, r->body_n, why)) gate_set(c, why, 0);
+  }
+  if (r->status >= 200 && r->status < 400) {
+    c->answered = 1;
+    /* an answer that accepts the key clears a remembered refusal of the API (SPEC 15.3); one that came from
+     * a model request is asked again by the next model call (tf__client_gate_retry) */
+    if (c->gate[0] && !c->gate_cdn) {
+      c->gate[0] = 0;
+      save_state(c);
+    }
+  }
   return 0;
+}
+
+int tf__client_model_token(TfClient *c, int renew, char *out, size_t n) {
+  tf_mutex_lock(&c->lock);
+  if (renew) {
+    c->token[0] = 0;
+    c->token_exp = 0;
+  }
+  int rc = c->stopped ? tf__fail(TF__ERR_NOT_AVAILABLE, "network calls are stopped for this launch")
+           : !c->key ? tf__fail(TF__ERR_NOT_AVAILABLE, "no developer key") : ensure_token(c);
+  if (!rc) snprintf(out, n, "%s", c->token);
+  tf_mutex_unlock(&c->lock);
+  return rc;
 }
 
 int tf__client_call(TfClient *c, const char *method, const char *path, const char *body, int auth, const char *extra,
@@ -307,7 +423,9 @@ static void save_state(TfClient *c) {
   tf_buf_json_str(&b, c->register_day);
   tf_buf_puts(&b, ",\"config_pin\":");
   tf_buf_json_str(&b, c->config_pin);
-  tf_buf_puts(&b, "}");
+  tf_buf_puts(&b, ",\"refused\":");
+  tf_buf_json_str(&b, c->gate);
+  tf_buf_printf(&b, ",\"refused_by_cdn\":%s,\"remove_models\":%s}", c->gate_cdn ? "true" : "false", c->purge ? "true" : "false");
   char *p = spath(c, "client.json");
   if (p && b.p) tf_write_file(p, b.p, b.n);
   free(p);
@@ -336,6 +454,14 @@ static void load_state(TfClient *c) {
     if (rd && strlen(rd) == 10) snprintf(c->register_day, sizeof c->register_day, "%s", rd);
     const char *cp0 = tf_json_str(tf_json_get(j, "config_pin"));
     if (cp0) snprintf(c->config_pin, sizeof c->config_pin, "%s", cp0);
+    const char *gr = tf_json_str(tf_json_get(j, "refused"));
+    if (gr && tf__stop_reason(gr)) {
+      snprintf(c->gate, sizeof c->gate, "%s", gr);
+      const TfJson *gc = tf_json_get(j, "refused_by_cdn");
+      c->gate_cdn = gc && gc->type == TJ_BOOL && gc->boolean;
+    }
+    const TfJson *po = tf_json_get(j, "remove_models");
+    c->purge = po && po->type == TJ_BOOL && po->boolean;
     tf_json_free(j);
   } else {
     c->bucket = -1;
@@ -417,6 +543,9 @@ TfClient *tf__client_open(const TfClientConfig *opt) {
   }
   load_state(c);
   save_state(c);
+  /* SPEC 15.3: a start that finds a remembered refusal, or a removal an earlier run owes,
+   * removes the models before the Client does anything else */
+  if (c->gate[0] || c->purge) tf__store_purge(c);
   tf__sharing_init(c);
   tf__share_init(c);
   tf__share_sweep(c); /* 3.0.1: recordings an earlier run's stop left behind (the process died, a file was in use) */

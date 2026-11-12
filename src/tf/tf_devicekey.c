@@ -25,6 +25,7 @@
 #include <openssl/param_build.h>
 #include <openssl/pem.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 #include "tf_internal.h"
@@ -339,4 +340,85 @@ void tf__contributor_forget(const char *dir) {
   char *p = cpath(dir);
   if (p) remove(p);
   free(p);
+}
+
+/* ------------------------------------------------------------------ the install record's device key (SPEC 15.2)
+ * 32 bytes that an app's files cannot carry, for the keyed hash of the model's install record (tf_store.c).
+ * Windows: random bytes protected with DPAPI for this user on this machine, in <storage>/install.key; a file
+ * that DPAPI cannot open here (it came from another machine or user) is no key. Linux has no such store: the
+ * key is SHA-256("quranlab-model-install-key 1\n" + machine id + "\n" + user id); on a machine without a machine
+ * id (some containers) it is random bytes in <storage>/install.key with mode 0600, which a copied storage folder
+ * carries with it (the README says so).
+ * 0 with the key; 1 when there is none (and create is 0); -1 when the store failed: never treated as "no key". */
+int tf__install_key_test;
+int tf__install_key(const char *dir, int create, uint8_t key[32]) {
+  if (tf__install_key_test < 0) return -1;
+  if (tf__install_key_test > 0 && !create) return 1;
+#ifndef _WIN32
+  {
+    char *id = NULL;
+    size_t idn = 0;
+    if (tf_read_file("/etc/machine-id", &id, &idn) && tf_read_file("/var/lib/dbus/machine-id", &id, &idn)) {
+      id = NULL;
+      idn = 0;
+    }
+    while (idn && (id[idn - 1] == '\n' || id[idn - 1] == '\r' || id[idn - 1] == ' ')) idn--;
+    if (idn) {
+      TfBuf b;
+      tf_buf_init(&b);
+      tf_buf_printf(&b, "quranlab-model-install-key 1\n%.*s\n%lu", (int)idn, id, (unsigned long)getuid());
+      const int ok = b.p != NULL;
+      if (ok) tf_sha256(b.p, b.n, key);
+      tf_buf_free(&b);
+      free(id);
+      return ok ? 0 : -1;
+    }
+    free(id);
+  }
+#endif
+  char *p = tf_path_join(dir, "install.key");
+  if (!p) return -1;
+  int rc = 1;
+  if (tf_file_exists(p)) {
+    char *blob = NULL;
+    size_t bn = 0;
+    if (tf_read_file(p, &blob, &bn)) {
+      free(p);
+      return -1;
+    }
+#ifdef _WIN32
+    uint8_t *plain = NULL;
+    size_t pn = 0;
+    if (!protect((const uint8_t *)blob, bn, &plain, &pn, 1) && pn == 32) {
+      memcpy(key, plain, 32);
+      rc = 0;
+    }
+    if (plain) {
+      SecureZeroMemory(plain, pn);
+      free(plain);
+    }
+#else
+    if (bn == 32) {
+      memcpy(key, blob, 32);
+      rc = 0;
+    }
+#endif
+    free(blob);
+  }
+  if (rc == 1 && create) {
+    if (tf_random_bytes(key, 32)) rc = -1;
+    else {
+#ifdef _WIN32
+      uint8_t *enc = NULL;
+      size_t en = 0;
+      rc = !protect(key, 32, &enc, &en, 0) && !tf_write_file(p, enc, en) ? 0 : -1;
+      free(enc);
+#else
+      rc = tf_write_file(p, key, 32) ? -1 : 0;
+      if (!rc) chmod(p, 0600);
+#endif
+    }
+  }
+  free(p);
+  return rc;
 }

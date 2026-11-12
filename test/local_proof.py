@@ -10,7 +10,7 @@ line saying what is missing) when they are not there.
 What it runs, for each of the variants `full` and `prod` that local30.json lists (prod is shaped like the
 production build: tokens-only self-test files, no tolerances):
 
-1. The 35 conformance clips through the public Session API (tf_model_open, tf_session_create, tf_session_push,
+1. The 35 conformance clips through the Session API on a folder (the tests' internal open, tf_session_create, tf_session_push,
    the chunks, tf_session_finish; `tf_tests conformance`), all twelve heads of every chunk, for every context
    the engine has audio-level expected rows for (conformance/v4_<context>_audio_expected.jsonl; the rows made
    from stored features cannot be compared with a take that starts from audio). The engine's own checker

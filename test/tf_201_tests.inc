@@ -456,9 +456,10 @@ static void on_ask(void *u, const TfConsentRequest *r) {
     memcpy(a->copy, r->copy_json, n);
   }
 }
-static TfClient *consent_client(const char *dir, AskRec *rec) {
+static TfClient *consent_client_lang(const char *dir, AskRec *rec, const char *lang) {
   seed_config(dir, "{\"contributions\":true}");
   TfClientConfig o = tf__client_default_config();
+  o.language = lang;
   o.key = "qlk_v1_local_test_aaaaaaaaaaaaaaaaaaaaaa";
   o.app_id = "org.example.Sharing";
   o.platform = "linux";
@@ -471,6 +472,7 @@ static TfClient *consent_client(const char *dir, AskRec *rec) {
   }
   return tf__client_open(&o);
 }
+static TfClient *consent_client(const char *dir, AskRec *rec) { return consent_client_lang(dir, rec, NULL); }
 static void feedback_session(TfClient *c) {
   TfSessionStats ss;
   memset(&ss, 0, sizeof ss);
@@ -593,11 +595,11 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
   TfClient *c = consent_client(d, &rec);
   CHECK(tf__sharing_session_begin(c, 48000, NULL) == NULL, "default path: a capture before any answer");
   feedback_session(c);
-  CHECK(rec.calls == 1 && rec.reask == 0 && !strcmp(rec.version, "share-2026-11-09"), "the first ask: %d calls, version %s", rec.calls, rec.version);
+  CHECK(rec.calls == 1 && rec.reask == 0 && !strcmp(rec.version, "share-2026-11-12"), "the first ask: %d calls, version %s", rec.calls, rec.version);
   CHECK(rec.copy && !strcmp(rec.copy, tf__sharing_deck_json("en")), "the ask's copy is the bundled deck without own wording");
   tf__client_sharing_answer(c, 1);
   CHECK(tf__client_sharing_state(c) == 1, "granted under the deck");
-  CHECK(session_version_is(c, d, "share-2026-11-09", NULL), "without own wording the session JSON has the deck's version and no hash");
+  CHECK(session_version_is(c, d, "share-2026-11-12", NULL), "without own wording the session JSON has the deck's version and no hash");
   static const char *const kw[] = {"sheet.what", "impact.minutes.other"};
   static const char *const tw[] = {"The audio of your recitations in this app and basic technical details. Nothing else.",
                                    "You shared {minutes} minutes. Thank you."};
@@ -620,12 +622,12 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
   for (int i = 0; i < 30; ++i) feedback_session(c);
   CHECK(tf__client_sharing_ask_now(c) == 0, "ask_now after a yes");
   CHECK(rec.calls == 1, "own wording after a deck grant asked again: %d calls", rec.calls);
-  CHECK(tf__client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-09\"") && status_has(c, "\"updateNeeded\":false") &&
+  CHECK(tf__client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-12\"") && status_has(c, "\"updateNeeded\":false") &&
             status_has(c, "\"pendingAsk\":false"),
         "own wording after a deck grant paused sharing: %s", tf__client_sharing_status_json(c));
-  CHECK(session_version_is(c, d, "share-2026-11-09", NULL), "own wording after a deck grant: the session JSON lost the deck's version");
+  CHECK(session_version_is(c, d, "share-2026-11-12", NULL), "own wording after a deck grant: the session JSON lost the deck's version");
   /* clearing the wording again changes nothing for this learner */
-  CHECK(tf_sharing_set_wording(c, NULL, NULL, 0) == 0 && !strcmp(tf__sharing_consent_version(c), "share-2026-11-09") &&
+  CHECK(tf_sharing_set_wording(c, NULL, NULL, 0) == 0 && !strcmp(tf__sharing_consent_version(c), "share-2026-11-12") &&
             tf__sharing_consent_sha256(c) == NULL && tf__sharing_consent_text(c) == NULL,
         "cleared wording");
   CHECK(tf__client_sharing_state(c) == 1 && rec.calls == 1, "a cleared wording paused or asked");
@@ -716,8 +718,8 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
 
   /* 3. upgrades: a 2.0.0 sharing.json (the exact 2.0.0 format; 2.0.0 recorded consentVersion with every grant, and
    * its decks were share-2026-11-07), one without a version, a 2.0.1 grant to an earlier deck, and a recording-fix
-   * build's paused grant. With the 2.0.1 deck in force: no ask before or after sessions, sharing on, the old version
-   * in the session JSON, across a restart. */
+   * build's paused grant, and a 3.0 grant to the deck of 2026-11-09. With this SDK's deck in force: no ask before
+   * or after sessions, sharing on, the old version in the session JSON, across a restart. */
   static const struct {
     const char *name, *state, *want;
   } up[] = {
@@ -733,13 +735,19 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
        "{\"v\":1,\"consent\":\"granted\",\"asks\":1,\"lastAskSession\":1,\"sessions\":3,\"thanked\":false,\"decidedAt\":1762600000,"
        "\"consentVersion\":\"share-2026-11-08\",\"consentTextSha256\":null,\"guardian\":false,\"sharedSessions\":0,\"pendingAsk\":0}",
        "share-2026-11-08"},
+      /* SPEC 11.8: a yes given to the deck before this one (3.0.x, share-2026-11-09) is kept with its version:
+       * not asked again, and the next recording carries share-2026-11-09, not this SDK's share-2026-11-12 */
+      {"a 3.0 grant to the deck of 2026-11-09",
+       "{\"v\":1,\"consent\":\"granted\",\"asks\":1,\"lastAskSession\":1,\"sessions\":3,\"thanked\":false,\"decidedAt\":1762700000,"
+       "\"consentVersion\":\"share-2026-11-09\",\"consentTextSha256\":null,\"guardian\":false,\"sharedSessions\":1,\"pendingAsk\":0}",
+       "share-2026-11-09"},
       {"a recording-fix build's paused grant",
        "{\"v\":1,\"consent\":\"unknown\",\"asks\":0,\"lastAskSession\":1,\"sessions\":4,\"thanked\":false,\"decidedAt\":1762500000,"
        "\"consentVersion\":\"share-2026-11-07\",\"consentTextSha256\":null,\"guardian\":false,\"sharedSessions\":0,\"pendingAsk\":0,\"update\":1}",
        "share-2026-11-07"},
   };
   int up_ok = 0;
-  for (int k = 0; k < 4; ++k) {
+  for (int k = 0; k < 5; ++k) {
     const int f0 = fails;
     snprintf(d, sizeof d, "%s/upgrade%d", dir, k);
     seed_config(d, "{\"contributions\":true}");
@@ -774,15 +782,71 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
       for (int i = 0; i < 20; ++i) feedback_session(c);
       CHECK(status_has(c, "\"pendingAsk\":false") && status_has(c, "\"consent\":\"final\""), "asked after the withdrawal: %s", tf__client_sharing_status_json(c));
       tf__client_sharing_set(c, 1);
-      CHECK(tf__client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-09\""), "the settings switch after an upgrade: %s",
+      CHECK(tf__client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-12\""), "the settings switch after an upgrade: %s",
             tf__client_sharing_status_json(c));
-      CHECK(session_version_is(c, d, "share-2026-11-09", NULL), "the settings switch's grant in the session JSON");
+      CHECK(session_version_is(c, d, "share-2026-11-12", NULL), "the settings switch's grant in the session JSON");
     }
     tf__client_close(c);
     up_ok += fails == f0;
   }
+  /* 3b. SDK 3.1.0 (SPEC 15.3, contract 1.10.0): a refusal that stops the model removes the models and nothing
+   * else. Here with sharing on and one recording not sent yet: after the model host's refusal the sharing state,
+   * the unsent recording, the device key and the remembered refusal are as they were, and the model files are
+   * gone; the same after a restart. (The models are stand-ins; the real download is in the model tests.) */
+  {
+    char sp2[1300], mf[1400], mr[1400], mc[1400];
+    snprintf(d, sizeof d, "%s/stop_removes", dir);
+    seed_config(d, "{\"contributions\":true}");
+    snprintf(sp2, sizeof sp2, "%s/sharing.json", d);
+    tf_write_file(sp2, up[0].state, strlen(up[0].state));
+    c = consent_client(d, NULL);
+    ss = tf__sharing_session_begin(c, 48000, NULL);
+    tf__sharing_session_push(ss, noise, 48000 * 3);
+    tf__sharing_session_finish(ss, 1);
+    snprintf(mf, sizeof mf, "%s/models/cccccccccccccccccccccccccccccccccccccccc", d);
+    tf_mkdirs(mf);
+    snprintf(mf, sizeof mf, "%s/models/cccccccccccccccccccccccccccccccccccccccc/manifest.json", d);
+    tf_write_file(mf, "{}", 2);
+    snprintf(mr, sizeof mr, "%s/models/cccccccccccccccccccccccccccccccccccccccc.install", d);
+    tf_write_file(mr, "installed 0000000000000000000000000000000000000000000000000000000000000000\n", 75);
+    snprintf(mc, sizeof mc, "%s/models/current.json", d);
+    tf_write_file(mc, "{}", 2);
+    uint8_t k1[32], k2[32];
+    memset(k2, 0, sizeof k2);
+    const int key_made = tf__install_key(d, 1, k1) == 0;
+    size_t n1 = 0, n2 = 0;
+    char *s1 = read_text(sp2, &n1);
+    CHECK(key_made && tf__sharing_outbox_pending(c) == 1 && tf__client_sharing_state(c) == 1 && tf_file_exists(mf), "before the refusal: one recording pending, sharing on");
+    tf__client_refuse(c, "key_revoked"); /* what a model request refused with this reason does */
+    char *s2 = read_text(sp2, &n2);
+    CHECK(!tf_file_exists(mf) && !tf_file_exists(mr) && !tf_file_exists(mc), "the refusal left model files: manifest %d, record %d, current.json %d", tf_file_exists(mf),
+          tf_file_exists(mr), tf_file_exists(mc));
+    CHECK(tf__sharing_outbox_pending(c) == 1 && tf__client_sharing_state(c) == 1 && s1 && s2 && n1 == n2 && !memcmp(s1, s2, n1) &&
+              tf__install_key(d, 0, k2) == 0 && !memcmp(k1, k2, 32) && !strcmp(tf__client_gate(c), "key_revoked"),
+          "the refusal touched more than the models: %d recordings pending, sharing %d, the sharing state %s, the device key %s, remembered \"%s\"",
+          tf__sharing_outbox_pending(c), tf__client_sharing_state(c), s1 && s2 && n1 == n2 && !memcmp(s1, s2, n1) ? "unchanged" : "CHANGED",
+          !memcmp(k1, k2, 32) ? "unchanged" : "CHANGED", tf__client_gate(c));
+    free(s1);
+    free(s2);
+    tf__client_close(c);
+    /* the refusal is in the state the Client left (this test's client maker writes a fresh state at every open, so
+     * it is read here; the model tests start a Client on a remembered refusal) */
+    char st2[1300];
+    snprintf(st2, sizeof st2, "%s/client.json", d);
+    s1 = read_text(st2, &n1);
+    CHECK(s1 && strstr(s1, "\"refused\":\"key_revoked\"") && strstr(s1, "\"remove_models\":false"), "the state after the refusal: %s", s1 ? s1 : "(none)");
+    free(s1);
+    c = consent_client(d, NULL);
+    CHECK(tf__sharing_outbox_pending(c) == 1 && tf__client_sharing_state(c) == 1 && !tf_file_exists(mf), "after a restart: %d recordings pending, sharing %d",
+          tf__sharing_outbox_pending(c), tf__client_sharing_state(c));
+    tf__client_sharing_set(c, 0); /* the queue goes, as the other tests leave it */
+    tf__client_close(c);
+    printf("a refusal that stops the model removed the model files and nothing else: the sharing state, one unsent recording, the device key and the "
+           "remembered refusal stayed, also across a restart\n");
+  }
   free(noise);
-  printf("upgrades kept the grant with no ask (2.0.0 and earlier decks): %d/4\n", up_ok);
+  CHECK(up_ok == 5, "%d of 5 stored answers of earlier decks were kept with their version and without an ask", up_ok);
+  printf("upgrades kept the grant with no ask (2.0.0 and earlier decks, the deck of 2026-11-09 among them): %d/5\n", up_ok);
 
   /* 4. three sheets per install, ever. "Not now" three times: asks at sessions 1, 8 and 15 (7 apart), then none in
    * 40 sessions and none after a restart; the settings switch still turns sharing on. */
@@ -808,7 +872,7 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
   for (int i = 0; i < 30; ++i) feedback_session(c);
   CHECK(rec.calls == 3 && tf__client_sharing_state(c) == 0, "a fourth sheet after a restart: %d calls", rec.calls);
   tf__client_sharing_set(c, 1);
-  CHECK(tf__client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-09\""), "the settings switch after three Not now");
+  CHECK(tf__client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-12\""), "the settings switch after three Not now");
   tf__client_close(c);
 
   /* sheets left unanswered (no callback, the pending ask never answered) count too: three, 7 sessions apart */
@@ -890,21 +954,59 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
   CHECK(rec.calls == 0 && tf__client_sharing_state(c) == 0, "2.0.0's five unanswered asks: %d more", rec.calls);
   tf__client_close(c);
   free(rec.copy);
-  /* 5. the decks: eight languages, version 2026-11-09.1, consent share-2026-11-09, the new keys, no {days} */
+  /* 5. the decks: eight languages, version 2026-11-12.1, consent share-2026-11-12, the new keys, no {days} */
   static const char *const langs[] = {"ar", "bn", "en", "fr", "id", "ms", "tr", "ur"};
-  int decks = 0;
+  int decks = 0, shown_ok = 0;
   for (int i = 0; i < 8; ++i) {
     const char *t = tf__sharing_deck_json(langs[i]);
     TfJson *j = t ? tf_json_parse(t, strlen(t), NULL) : NULL;
     const TfJson *s = tf_json_get(j, "strings");
-    const int good = j && !strcmp(tf_json_str(tf_json_get(j, "lang")), langs[i]) && !strcmp(tf_json_str(tf_json_get(j, "version")), "2026-11-09.1") &&
-                     !strcmp(tf_json_str(tf_json_get(j, "consent_version")), "share-2026-11-09") && tf_json_get(s, "recovery.keep") &&
+    const int good = j && !strcmp(tf_json_str(tf_json_get(j, "lang")), langs[i]) && !strcmp(tf_json_str(tf_json_get(j, "version")), "2026-11-12.1") &&
+                     !strcmp(tf_json_str(tf_json_get(j, "consent_version")), "share-2026-11-12") && tf_json_get(s, "recovery.keep") &&
                      tf_json_get(s, "delete.failed.network") && tf_json_get(s, "delete.retry") && !strstr(t, "{days}");
     CHECK(good, "deck %s", langs[i]);
+    /* the bundled deck is the contract's file, byte for byte (sharing_copy/READY has these hashes) */
+    static const char *const kDeckSha[] = {
+      "b8a3402a262ac0f295af5e485ae99804fcbab0dde44f403dc9f38e1bc18be5f0",
+      "56225ba6ebe642793b288d13b82874f9ada8184df8e83ea679aac3ca28a01acb",
+      "1600ab0625db9dab1483d1a2bfd0f0ec9e0e636880909a2d47df2eb7fefd52c0",
+      "aba381efd20462db4864e8328b9a2f231597ffbffac7f42096b89e59e0950be2",
+      "8d32f968b66b6b9176a3e2c152c69903a96fa20601d53f47d23cf3d20edba4f5",
+      "78bd9055b9c3f1ffa05efee1a15778897ee27f7d15aa1887142682d80f21848c",
+      "258a04a68c4e4d44739ca73da170a052cdb2a2f41914e5067314982190e0b9d9",
+      "6d50705ea642f30711207b7093337a15cb7afba5d12b5c4d80bf0fe7e192c1d1"};
+    uint8_t dh[32];
+    char dhex[65];
+    tf_sha256(t ? t : "", t ? strlen(t) : 0, dh);
+    tf_hex_encode(dh, 32, dhex);
+    CHECK(!strcmp(dhex, kDeckSha[i]), "deck %s is not the contract's file: sha256 %s", langs[i], dhex);
+    /* SPEC 11.8: what the app is handed to show (the request's copy_json for a client of this language) holds
+     * the deck's sheet.who and what.detail whole, word for word */
+    {
+      char dd[1200];
+      snprintf(dd, sizeof dd, "%s/who_%s", dir, langs[i]);
+      AskRec wr;
+      memset(&wr, 0, sizeof wr);
+      TfClient *wc = consent_client_lang(dd, &wr, langs[i]);
+      feedback_session(wc);
+      TfJson *shown = wr.copy ? tf_json_parse(wr.copy, strlen(wr.copy), NULL) : NULL;
+      const TfJson *ss2 = tf_json_get(shown, "strings");
+      const char *who = tf_json_str(tf_json_get(s, "sheet.who")), *detail = tf_json_str(tf_json_get(s, "what.detail"));
+      const char *who2 = tf_json_str(tf_json_get(ss2, "sheet.who")), *detail2 = tf_json_str(tf_json_get(ss2, "what.detail"));
+      const int same = wr.calls == 1 && who && who2 && !strcmp(who, who2) && detail && detail2 && !strcmp(detail, detail2) && strlen(who) > 40 &&
+                       !strcmp(wr.version, "share-2026-11-12");
+      CHECK(same, "the sheet's lines for %s: %d asks, version %s, sheet.who %s", langs[i], wr.calls, wr.version, who2 ? "differs from the deck's" : "is missing");
+      shown_ok += same;
+      tf_json_free(shown);
+      tf__client_close(wc);
+      free(wr.copy);
+    }
     decks += good;
     tf_json_free(j);
   }
-  printf("copy decks: %d/8 at 2026-11-09.1 (share-2026-11-09), recovery and delete.failed keys, no {days}\n", decks);
+  CHECK(shown_ok == 8, "%d of 8 languages are handed the deck's sheet.who and what.detail whole", shown_ok);
+  printf("copy decks: %d/8 at 2026-11-12.1 (share-2026-11-12), the contract's bytes, recovery and delete.failed keys, no {days}; the sheet's "
+         "sheet.who and what.detail handed over whole: %d/8\n", decks, shown_ok);
   printf("consent (own text, a yes kept across decks, wording and upgrades, three sheets at most, session JSON, no capture before a grant, withdrawal, deletion): %s\n", fails ? "FAIL" : "ok");
   return fails ? 1 : 0;
 }
@@ -1256,7 +1358,7 @@ static int sdk_latest_tests(const char *configs, const char *dir) {
   if (!g_sl.fx) return 2;
   tf_mkdirs(dir);
   tf_http_set_transport(sl_stub, NULL);
-  static const char want[] = "Quran Lab SDK 3.0.2 is available (recommended), you have " TF_SDK_VERSION ": https://github.com/Quran-Lab/tajweedformer-c/releases";
+  static const char want[] = "Quran Lab SDK 3.1.1 is available (recommended), you have " TF_SDK_VERSION ": https://github.com/Quran-Lab/tajweedformer-c/releases";
   char d[1100];
   /* newer: one line at launch; a second newer config (a refresh) adds none */
   snprintf(d, sizeof d, "%s/newer", dir);

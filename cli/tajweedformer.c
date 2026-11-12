@@ -1,21 +1,24 @@
 /* tajweedformer: the command-line tool and server tier of the TajweedFormer SDK (Windows, Linux).
  *
- *   tajweedformer info     <folder>                             the model's info JSON
- *   tajweedformer decode   <folder> <audio> [--context C] [--heads all|name,name] [--top-k K] [--frames] [--values]
- *                          [--end-on-silence MS] [--threads N] [--pin | --no-pin]
- *   tajweedformer serve    <folder> [options as decode]         JSON lines in: {"audio": "<path>"}; one result line each
- *   tajweedformer bench    <folder> <list.txt> [--workers N] [--threads N] [--pin | --no-pin]   N worker processes
- *   tajweedformer download --key KEY --app-id ID --storage DIR [--version X.Y.Z]   the model for this app, verified
- *   tajweedformer diagnose --key KEY --app-id ID --storage DIR                     the client's report as JSON
- *   (every command that opens a folder: --trusted-key HEX for a folder signed with a test key)
+ * Every command works through a Client, as an app does: --key KEY --app-id ID --storage DIR. The model comes from
+ * Quran Lab's server (downloaded on first use into DIR, verified, then used from there); since 3.1.0 no command
+ * opens a model folder.
+ *
+ *   tajweedformer info                                          the model's info JSON
+ *   tajweedformer decode   <audio> [--context C] [--heads all|name,name] [--top-k K] [--frames] [--values]
+ *                          [--end-on-silence MS] [--threads N] [--pin | --no-pin] [--version X.Y.Z]
+ *   tajweedformer serve    [options as decode]                  JSON lines in: {"audio": "<path>"}; one result line each
+ *   tajweedformer download [--version X.Y.Z]                    the model for this app, verified
+ *   tajweedformer diagnose                                      the client's report as JSON
+ *
+ * A server runs one process per take, each with its own storage folder (a Client's storage is for one process).
  *
  * A decode line: {"audio","audio_s","compute_s","chunks","heads":[{"name","kind","frame_ms","frames","classes",
  * "values"?}],"greedy":{"<ctc head>":[ids]},"decoded":{...}}. --values adds each head's numbers; --frames the
  * decoded layer's per-frame top-1 and runner-up (and the top K with --top-k).
  *
  * Audio: WAV (PCM 16-bit or float 32-bit, the first channel, any rate 8 to 48 kHz) or raw float32 16 kHz
- * (.pcm/.f32/.raw). One take at a time per process (the engine's rule): the server tier scales with worker
- * processes. */
+ * (.pcm/.f32/.raw). One take at a time per process (the engine's rule): the server tier scales with processes. */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -49,8 +52,8 @@ static double now_s(void) {
 }
 
 typedef struct {
-  const char *folder, *key, *context, *heads;
-  int frames, values, top_k, threads, workers, end_ms;
+  const char *version, *context, *heads;
+  int frames, values, top_k, threads, end_ms;
   int pin; /* 0: the engine's default; 1: --pin; -1: --no-pin */
 } Opts;
 
@@ -67,14 +70,13 @@ static int flag(int argc, char **argv, const char *name) {
 static int num(int argc, char **argv, const char *name, int dflt) { return arg(argc, argv, name) ? atoi(arg(argc, argv, name)) : dflt; }
 static void parse(Opts *o, int argc, char **argv) {
   memset(o, 0, sizeof *o);
-  o->key = arg(argc, argv, "--trusted-key");
+  o->version = arg(argc, argv, "--version");
   o->context = arg(argc, argv, "--context");
   o->heads = arg(argc, argv, "--heads");
   o->frames = flag(argc, argv, "--frames");
   o->values = flag(argc, argv, "--values");
   o->top_k = num(argc, argv, "--top-k", 0);
   o->threads = num(argc, argv, "--threads", 0);
-  o->workers = num(argc, argv, "--workers", 1);
   o->end_ms = num(argc, argv, "--end-on-silence", 0);
   o->pin = flag(argc, argv, "--pin") ? 1 : flag(argc, argv, "--no-pin") ? -1 : 0;
 }
@@ -85,14 +87,23 @@ static int fail(const char *what) {
   return 1;
 }
 
-static TfModel *open_model(const Opts *o) {
+static TfClient *client(int argc, char **argv);
+static TfClient *g_client;
+/* the Model of this app, through a Client: downloaded on first use, verified, opened */
+static TfModel *open_model(int argc, char **argv, const Opts *o) {
+  g_client = client(argc, argv);
   TfModelOptions mo = {0};
-  mo.trusted_key_hex = o->key;
+  mo.version = o->version;
   mo.threads = o->threads;
   mo.pin = o->pin;
-  TfModel *m = tf_model_open(o->folder, &mo);
-  if (!m) exit(fail(o->folder));
+  TfModel *m = tf_client_model(g_client, &mo);
+  if (!m) exit(fail("model"));
   return m;
+}
+static void close_model(TfModel *m) {
+  tf_model_close(m);
+  tf_client_destroy(g_client);
+  g_client = NULL;
 }
 
 /* ------------------------------------------------------------------ audio */
@@ -229,16 +240,16 @@ static int run_take(TfModel *m, const Opts *o, const char *audio, FILE *out, dou
 }
 
 static int cmd_decode(int argc, char **argv, const Opts *o) {
-  if (argc < 4) return 2;
-  TfModel *m = open_model(o);
-  const int rc = run_take(m, o, argv[3], stdout, NULL, NULL);
-  tf_model_close(m);
+  if (argc < 3 || !strncmp(argv[2], "--", 2)) return 2;
+  TfModel *m = open_model(argc, argv, o);
+  const int rc = run_take(m, o, argv[2], stdout, NULL, NULL);
+  close_model(m);
   return rc;
 }
 
 /* JSON lines on stdin: {"audio": "<path>"}; one result line each */
-static int cmd_serve(const Opts *o) {
-  TfModel *m = open_model(o);
+static int cmd_serve(int argc, char **argv, const Opts *o) {
+  TfModel *m = open_model(argc, argv, o);
   char line[8192];
   while (fgets(line, sizeof line, stdin)) {
     char audio[4096] = "";
@@ -251,101 +262,7 @@ static int cmd_serve(const Opts *o) {
     }
     run_take(m, o, audio, stdout, NULL, NULL);
   }
-  tf_model_close(m);
-  return 0;
-}
-
-/* worker: decode every line of a list (one per line), print a summary line */
-static int cmd_worker(const Opts *o, const char *list, int shard, int shards) {
-  TfModel *m = open_model(o);
-  FILE *f = fopen(list, "r");
-  if (!f) return 1;
-  char line[4096];
-  int k = 0, done = 0;
-  double audio = 0, wall = 0;
-  FILE *sink = fopen(
-#ifdef _WIN32
-      "NUL",
-#else
-      "/dev/null",
-#endif
-      "w");
-  while (sink && fgets(line, sizeof line, f)) {
-    size_t len = strlen(line);
-    while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
-    if (!len || (k++ % shards) != shard) continue;
-    run_take(m, o, line, sink, &audio, &wall);
-    done++;
-  }
-  fclose(f);
-  if (sink) fclose(sink);
-  printf("{\"worker\":%d,\"clips\":%d,\"audio_s\":%.3f,\"compute_s\":%.3f}\n", shard, done, audio, wall);
-  tf_model_close(m);
-  return 0;
-}
-
-static int cmd_bench(int argc, char **argv, const Opts *o) {
-  if (argc < 4) return 2;
-  const int w = o->workers > 0 ? o->workers : 1;
-  char self[4096];
-#ifdef _WIN32
-  GetModuleFileNameA(NULL, self, sizeof self);
-#else
-  snprintf(self, sizeof self, "%s", argv[0]);
-#endif
-  const double t0 = now_s();
-  char sh[16], shs[16], th[16];
-  snprintf(shs, sizeof shs, "%d", w);
-  snprintf(th, sizeof th, "%d", o->threads ? o->threads : 1);
-#ifdef _WIN32
-  intptr_t pids[64];
-#else
-  pid_t pids[64];
-#endif
-  for (int i = 0; i < w && i < 64; ++i) {
-    snprintf(sh, sizeof sh, "%d", i);
-    const char *av[16];
-    int k = 0;
-    av[k++] = self;
-    av[k++] = "worker";
-    av[k++] = argv[2];
-    av[k++] = argv[3];
-    av[k++] = sh;
-    av[k++] = shs;
-    av[k++] = "--threads";
-    av[k++] = th;
-    if (o->pin > 0) av[k++] = "--pin";
-    if (o->pin < 0) av[k++] = "--no-pin";
-    if (o->key) {
-      av[k++] = "--trusted-key";
-      av[k++] = o->key;
-    }
-    if (o->context) {
-      av[k++] = "--context";
-      av[k++] = o->context;
-    }
-    av[k] = NULL;
-#ifdef _WIN32
-    pids[i] = _spawnv(_P_NOWAIT, self, av);
-#else
-    pids[i] = fork();
-    if (pids[i] == 0) {
-      execv(self, (char *const *)av);
-      _exit(127);
-    }
-#endif
-  }
-  for (int i = 0; i < w && i < 64; ++i) {
-#ifdef _WIN32
-    int st;
-    _cwait(&st, pids[i], 0);
-#else
-    int st;
-    waitpid(pids[i], &st, 0);
-#endif
-  }
-  fprintf(stderr, "bench: %d worker processes, %d threads each, wall %.2f s (each worker prints its own audio and compute)\n", w,
-          o->threads ? o->threads : 1, now_s() - t0);
+  close_model(m);
   return 0;
 }
 
@@ -361,7 +278,6 @@ static TfClient *client(int argc, char **argv) {
   co.app_id = arg(argc, argv, "--app-id");
   co.storage = arg(argc, argv, "--storage");
   co.app_version = "cli";
-  co.trusted_key_hex = arg(argc, argv, "--trusted-key");
   TfClient *c = tf_client_create(&co);
   if (!c) exit(fail("client"));
   return c;
@@ -369,7 +285,7 @@ static TfClient *client(int argc, char **argv) {
 
 int main(int argc, char **argv) {
   if (argc < 2 || flag(argc, argv, "--help")) {
-    fprintf(stderr, "tajweedformer %s: info | decode | serve | bench | download | diagnose (see the comment at the top of cli/tajweedformer.c)\n",
+    fprintf(stderr, "tajweedformer %s: info | decode | serve | download | diagnose, each with --key KEY --app-id ID --storage DIR (see the comment at the top of cli/tajweedformer.c)\n",
             tf_version());
     return argc < 2 ? 2 : 0;
   }
@@ -394,18 +310,14 @@ int main(int argc, char **argv) {
     tf_client_destroy(cl);
     return report ? 0 : 1;
   }
-  if (argc < 3) return 2;
-  o.folder = argv[2];
   if (!strcmp(c, "info")) {
-    TfModel *m = open_model(&o);
+    TfModel *m = open_model(argc, argv, &o);
     printf("%s\n", tf_model_info_json(m));
-    tf_model_close(m);
+    close_model(m);
     return 0;
   }
   if (!strcmp(c, "decode")) return cmd_decode(argc, argv, &o);
-  if (!strcmp(c, "serve")) return cmd_serve(&o);
-  if (!strcmp(c, "bench")) return cmd_bench(argc, argv, &o);
-  if (!strcmp(c, "worker") && argc >= 6) return cmd_worker(&o, argv[3], atoi(argv[4]), atoi(argv[5]));
+  if (!strcmp(c, "serve")) return cmd_serve(argc, argv, &o);
   fprintf(stderr, "unknown command %s\n", c);
   return 2;
 }

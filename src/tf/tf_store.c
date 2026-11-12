@@ -108,6 +108,85 @@ static void write_current(TfClient *c, const Pick *p) {
   tf_buf_free(&b);
 }
 
+/* ------------------------------------------------------------------ the install record (SPEC 15.2)
+ * models/<build>.install: "<state> <mac>\n", state `downloading` or `installed`, mac = HMAC-SHA256(device key,
+ * "quranlab-model-install 1\n" + build + "\n" + state + "\n") in hex. Written before the first byte of a build
+ * is asked for and again when every file is verified. A build folder without a valid record is not this
+ * Client's: it is never opened, nothing of it is reused, it is deleted and the build is downloaded. */
+static void hmac_sha256(const uint8_t key[32], const void *msg, size_t n, uint8_t out[32]) {
+  uint8_t pad[64], inner[32];
+  TfSha256 s;
+  for (int i = 0; i < 64; ++i) pad[i] = (uint8_t)((i < 32 ? key[i] : 0) ^ 0x36);
+  tf_sha256_init(&s);
+  tf_sha256_update(&s, pad, 64);
+  tf_sha256_update(&s, msg, n);
+  tf_sha256_final(&s, inner);
+  for (int i = 0; i < 64; ++i) pad[i] = (uint8_t)((i < 32 ? key[i] : 0) ^ 0x5c);
+  tf_sha256_init(&s);
+  tf_sha256_update(&s, pad, 64);
+  tf_sha256_update(&s, inner, 32);
+  tf_sha256_final(&s, out);
+}
+static char *rec_path(TfClient *c, const char *build) {
+  char name[64], *dir = models_dir(c);
+  snprintf(name, sizeof name, "%s.install", build);
+  char *p = dir ? tf_path_join(dir, name) : NULL;
+  free(dir);
+  return p;
+}
+/* the record's mac for this build and state: 0 with hex; 1 no device key (and create is 0); -1 the key store failed */
+static int rec_mac(TfClient *c, int create, const char *build, const char *state, char hex[65]) {
+  uint8_t key[32], mac[32];
+  const int rc = tf__install_key(tf__client_dir(c), create, key);
+  if (rc) return rc;
+  char msg[160];
+  const int n = snprintf(msg, sizeof msg, "quranlab-model-install 1\n%s\n%s\n", build, state);
+  hmac_sha256(key, msg, (size_t)n, mac);
+  memset(key, 0, sizeof key);
+  tf_hex_encode(mac, 32, hex);
+  return 0;
+}
+enum { REC_NONE = 0, REC_DOWNLOADING = 1, REC_INSTALLED = 2 };
+/* REC_INSTALLED, REC_DOWNLOADING, REC_NONE (no record, or not a valid one), or -1 when the key store failed */
+static int rec_state(TfClient *c, const char *build) {
+  char *p = rec_path(c, build), *text = NULL;
+  size_t n = 0;
+  const int have = p && tf_file_exists(p) && !tf_read_file(p, &text, &n);
+  free(p);
+  if (!have) return REC_NONE;
+  char state[16] = "", mac[80] = "", want[65];
+  int st = REC_NONE;
+  if (n < 120 && sscanf(text, "%15s %79s", state, mac) == 2 && (!strcmp(state, "installed") || !strcmp(state, "downloading"))) {
+    const int rc = rec_mac(c, 0, build, state, want);
+    if (rc < 0) st = -1;
+    else if (rc == 0 && !strcmp(mac, want)) st = !strcmp(state, "installed") ? REC_INSTALLED : REC_DOWNLOADING;
+  }
+  free(text);
+  return st;
+}
+static int rec_write(TfClient *c, const char *build, const char *state) {
+  char hex[65], line[120];
+  if (rec_mac(c, 1, build, state, hex)) return -1;
+  const int n = snprintf(line, sizeof line, "%s %s\n", state, hex);
+  char *dir = models_dir(c), *p = rec_path(c, build);
+  int rc = dir && p && !tf_mkdirs(dir) ? tf_write_file(p, line, (size_t)n) : -1;
+  free(p);
+  free(dir);
+  return rc;
+}
+/* a build folder that is not this Client's download: the folder and whatever record it has go */
+static void rec_discard(TfClient *c, const char *build) {
+  char *dir = models_dir(c), *bd = dir ? tf_path_join(dir, build) : NULL, *p = rec_path(c, build);
+  if (bd) tf__remove_tree(bd);
+  if (p) remove(p);
+  free(p);
+  free(bd);
+  free(dir);
+}
+static int rec_failed(void) {
+  return tf__fail(TF_ERR_STORAGE_FAILED, "the device key of the model's install record cannot be read; nothing was opened, deleted or downloaded");
+}
+
 /* why the server would not talk to this app, as a catalogue error (0 when it did not refuse) */
 static int stop_error(TfClient *c) {
   const char *code = tf__client_stop_code(c);
@@ -148,9 +227,29 @@ int tf__store_fetch(TfClient *c, const TfFetch *f, char *out_dir, size_t n, TfMo
   tf__client_set_pin(c, f->version);
   const int net = tf__client_refresh_config(c);
   const int offline = net == TF__ERR_NETWORK;
+  /* SPEC 15.3: the server has refused the key or the app (now, or in an earlier launch with no accepting answer
+   * since): no model runs, also not one a real download left on this device */
+  if (net == 0) tf__client_gate_retry(c);
+  /* a refusal removes the models: here for a refusal an earlier launch remembered, and for a
+   * removal that is still owed after the key was accepted again (a Model was open, or the removal failed) */
+  tf__client_purge_models(c);
+  if (*tf__client_gate(c)) return tf__fail_gate(c);
   Pick p, disk;
   const int have_cfg = pick_from_config(c, &p) == 0;
-  const int have_disk = pick_from_disk(c, &disk) == 0;
+  int have_disk = pick_from_disk(c, &disk) == 0;
+  /* SPEC 15.2: the build current.json names counts only with this Client's own record that it was installed */
+  if (have_disk) {
+    const int st = rec_state(c, disk.build);
+    if (st < 0) return rec_failed();
+    if (st == REC_NONE) {
+      rec_discard(c, disk.build);
+      char *md = models_dir(c), *cur = md ? tf_path_join(md, "current.json") : NULL;
+      if (cur) remove(cur);
+      free(cur);
+      free(md);
+    }
+    if (st != REC_INSTALLED) have_disk = 0;
+  }
   if (!have_cfg) {
     /* no config in force (no network, or the server refused): what is on disk still runs */
     const int refused = stop_error(c);
@@ -168,6 +267,11 @@ int tf__store_fetch(TfClient *c, const TfFetch *f, char *out_dir, size_t n, TfMo
   }
   tf__clear_error();
   fill_open(c, &p, out_dir, n, open, g_keep);
+  /* the build the config names: a folder of it without a record of this Client is deleted before anything is
+   * asked of the server, so no file of it is reused or resumed */
+  const int pst = rec_state(c, p.build);
+  if (pst < 0) return rec_failed();
+  if (pst == REC_NONE) rec_discard(c, p.build);
   char *mf = tf_path_join(out_dir, "manifest.json");
   const int on_disk = mf && tf_file_exists(mf);
   free(mf);
@@ -218,9 +322,18 @@ int tf__store_fetch(TfClient *c, const TfFetch *f, char *out_dir, size_t n, TfMo
   int resumed = 0;
   d.fetched = &fetched;
   d.resumed = &resumed;
+  d.client = c;
+  /* the record is written before the first byte of the build is asked for */
+  if (pst == REC_NONE && rec_write(c, p.build, "downloading")) return rec_failed();
   const int rc = tf__download_model(&d);
   /* the day's telemetry: one attempt for this build (none when nothing was fetched and nothing failed) */
   if (rc || fetched > 0) tf__client_count_download(c, p.version, p.build, fetched, rc == 0, resumed);
+  /* refused while this download ran (by the model host, or by the API on another thread): nothing of it stays,
+   * and the refusal is the error */
+  if (*tf__client_gate(c)) {
+    tf__client_purge_models(c);
+    return tf__fail_gate(c);
+  }
   if (!rc && open) open->skip_file_checks = 1; /* every engine file of the context was hashed just now */
   if (rc == TF_ERR_DOWNLOAD_FAILED && open && (complete || have_disk)) {
     /* the CDN did not answer and a model is here: it runs (the folder is verified again at open); a prefetch
@@ -230,6 +343,7 @@ int tf__store_fetch(TfClient *c, const TfFetch *f, char *out_dir, size_t n, TfMo
     return 0;
   }
   if (rc) return rc;
+  if (pst != REC_INSTALLED && rec_write(c, p.build, "installed")) return rec_failed();
   write_current(c, &p);
   return 0;
 }
@@ -240,6 +354,14 @@ void tf__store_prune(TfClient *c, const char *keep) {
   char (*names)[256] = (char (*)[256])malloc(64 * 256);
   const int n = dir && names ? tf__list_dir(dir, names, 64) : 0;
   for (int i = 0; i < n; ++i) {
+    /* a record whose build is not kept goes with it (<build>.install) */
+    const size_t ln = strlen(names[i]);
+    if (ln == 48 && !strcmp(names[i] + 40, ".install") && !(keep && !strncmp(names[i], keep, 40))) {
+      char *rp = tf_path_join(dir, names[i]);
+      if (rp) remove(rp);
+      free(rp);
+      continue;
+    }
     if (!is_build(names[i]) || (keep && !strcmp(names[i], keep))) continue;
     char *bd = tf_path_join(dir, names[i]);
     if (bd) tf__remove_tree(bd);
@@ -268,6 +390,7 @@ int tf__store_fetch_role(TfClient *c, const TfModel *m, const char *context, con
   d.contexts = context;
   d.only_role = role;
   d.trusted_key_hex = tf__client_model_key(c);
+  d.client = c;
   d.want_version = p.version;
   d.check_build = 1;
   return tf__download_model(&d);
@@ -331,6 +454,19 @@ char *tf__store_json(TfClient *c, long long *models_out, long long *sharing_out)
   return tf_buf_take(&b);
 }
 
+/* SPEC 15.3: the removal a refusal brings. Everything under models/: the build folders with
+ * their partial downloads, the install records, current.json. Nothing else of the storage folder. Called with
+ * no Model open (tf__client_purge_models sees to that); when the folder is gone nothing is owed any more, and a
+ * removal that fails stays owed: it is tried again at the next start and the next refusal. Sets no error. */
+int tf__store_purge_fail_test;
+void tf__store_purge(TfClient *c) {
+  if (!*tf__client_gate(c) && !tf__client_purge_owed(c)) return;
+  char *dir = models_dir(c);
+  const int gone = dir && !tf__store_purge_fail_test && tf__remove_tree(dir) == 0;
+  free(dir);
+  tf__client_purge_set(c, !gone);
+}
+
 /* removes the model files: every build folder and current.json. Never the consent state or the sharing queue. */
 int tf__store_remove(TfClient *c) {
   char *dir = models_dir(c);
@@ -343,7 +479,7 @@ int tf__store_remove(TfClient *c) {
 /* the build on disk, for the diagnosis: version and build copied out, 1 when there is one */
 int tf__store_current(TfClient *c, char version[24], char build[41]) {
   Pick p;
-  if (pick_from_disk(c, &p)) return 0;
+  if (pick_from_disk(c, &p) || rec_state(c, p.build) != REC_INSTALLED) return 0;
   snprintf(version, 24, "%s", p.version);
   snprintf(build, 41, "%s", p.build);
   return 1;

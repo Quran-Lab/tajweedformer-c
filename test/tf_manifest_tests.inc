@@ -6,7 +6,7 @@
  * 519235d0 (min SDK 2.0.1, with golden_tolerance) and build d4644956 (min SDK 2.0.0, without it), both signed with
  * Quran Lab's pinned key (key id 660a07197c4808da). Data-free: no model files, no network.
  *
- * Each must verify with the pinned key, through the verifier, tf_model_open and tf__download_model (a stubbed
+ * Each must verify with the pinned key, through the verifier, the open from disk and tf__download_model (a stubbed
  * transport), and be refused with one byte changed in a header value, in a tolerance value (519235d0) and in a
  * file line. The 519235d0 signed text must carry the golden_tolerance lines in make_manifest3.py signed_text()'s
  * order: after the header lines, before the first file line, sorted by the build key's UTF-8 bytes. A tolerance
@@ -54,7 +54,7 @@ static int mf_verify(const char *text, int *tolerance_signed) {
   return ok;
 }
 
-/* tf_model_open on a folder holding only this manifest.json: the error code (the signature is checked before any
+/* the open from disk on a folder holding only this manifest.json: the error code (the signature is checked before any
  * listed file; a 2.x manifest that verifies is then refused for having no model version) */
 static int mf_open(const char *work, const char *name, const char *text) {
   char *dir = tf_path_join(work, name), *mp = dir ? tf_path_join(dir, "manifest.json") : NULL;
@@ -123,7 +123,7 @@ static int manifest_tests(const char *data, const char *work) {
     tf_hex_encode(h, 8, id);
     CHECK(!strcmp(id, "660a07197c4808da"), "pinned key id %s, want 660a07197c4808da", id);
   }
-  CHECK(!strcmp(tf_version(), "3.0.1") && !strcmp(TF_SDK_VERSION, "3.0.1"), "version %s", tf_version());
+  CHECK(!strcmp(tf_version(), "3.1.0") && !strcmp(TF_SDK_VERSION, "3.1.0"), "version %s", tf_version());
   for (int b = 0; b < 2; ++b) {
     const int has_tol = b == 0;
     char *path = tf_path_join(data, kMfBuilds[b]);
@@ -142,7 +142,7 @@ static int manifest_tests(const char *data, const char *work) {
     }
     CHECK(tf_manifest_has_tolerance(m) == has_tol, "%s: golden_tolerance %s", kMfBuilds[b], has_tol ? "missing" : "present");
 
-    /* 1. it verifies with the pinned key: through the verifier, tf_model_open and the downloader */
+    /* 1. it verifies with the pinned key: through the verifier, the open from disk and the downloader */
     int tsigned = -1;
     CHECK(tf_manifest_verify_signature_ex(m, TF_QURANLAB_KEY_HEX, &tsigned) == 1, "%s does not verify with the pinned key",
           kMfBuilds[b]);
@@ -154,7 +154,7 @@ static int manifest_tests(const char *data, const char *work) {
     int rc = mf_open(work, name, text);
     /* 3.0: a manifest that verifies and names no model version is a build for SDK 2: refused as incompatible
      * (past the signature: a changed byte below is signature_invalid) */
-    CHECK(rc == TF_ERR_MODEL_INCOMPATIBLE, "%s: tf_model_open %s (%s), want model_incompatible past the signature", kMfBuilds[b], tf_error_name(rc),
+    CHECK(rc == TF_ERR_MODEL_INCOMPATIBLE, "%s: the open from disk %s (%s), want model_incompatible past the signature", kMfBuilds[b], tf_error_name(rc),
           tf_last_error() ? tf_last_error() : "");
     snprintf(name, sizeof name, "download-%d", b);
     rc = mf_download(work, name, text);
@@ -215,7 +215,7 @@ static int manifest_tests(const char *data, const char *work) {
       CHECK(mf_verify(t, NULL) == 0, "%s: verifies with one byte changed in %s", kMfBuilds[b], kMut[k].what);
       snprintf(name, sizeof name, "open-%d-mut-%d", b, (int)k);
       rc = mf_open(work, name, t);
-      CHECK(rc == TF_ERR_SIGNATURE_INVALID, "%s, one byte changed in %s: tf_model_open %s", kMfBuilds[b], kMut[k].what, tf_error_name(rc));
+      CHECK(rc == TF_ERR_SIGNATURE_INVALID, "%s, one byte changed in %s: the open from disk %s", kMfBuilds[b], kMut[k].what, tf_error_name(rc));
       snprintf(name, sizeof name, "download-%d-mut-%d", b, (int)k);
       rc = mf_download(work, name, t);
       CHECK(rc == TF_ERR_SIGNATURE_INVALID && g_mf.file_calls == 0, "%s, one byte changed in %s: tf__download_model %s, %d file requests",
@@ -241,11 +241,11 @@ static int manifest_tests(const char *data, const char *work) {
       CHECK(mf_verify(t, &ts) == 1 && ts == 0, "%s with an unsigned golden_tolerance: verify %d, tolerance_signed %d", kMfBuilds[b],
             mf_verify(t, NULL), ts);
       rc = mf_open(work, "open-unsigned-tolerance", t);
-      CHECK(rc == TF_ERR_MODEL_INCOMPATIBLE, "%s with an unsigned golden_tolerance: tf_model_open %s", kMfBuilds[b], tf_error_name(rc));
+      CHECK(rc == TF_ERR_MODEL_INCOMPATIBLE, "%s with an unsigned golden_tolerance: the open from disk %s", kMfBuilds[b], tf_error_name(rc));
       printf("%s: an unsigned golden_tolerance verifies through the fallback and is ignored\n", kMfBuilds[b]);
       free(t);
     }
-    printf("%s: verifies with the pinned key (tolerance %s); tf_model_open and tf__download_model refuse it as a build for SDK 2\n",
+    printf("%s: verifies with the pinned key (tolerance %s); the open from disk and tf__download_model refuse it as a build for SDK 2\n",
            kMfBuilds[b], has_tol ? "signed" : "absent");
     tf_json_free(m);
     free(text);
