@@ -11,8 +11,8 @@
  *   model30 <local30 dir> <key> <work dir>   the local 3.0 model folders (not in the repository) */
 
 /* the SHA-256 of sdk_3.0.0/errors.json as recorded when the catalogue was embedded (the contract's file at
- * version 1.3.9: 26 codes, and the eight entries under server_rejected's reasons). A changed catalogue changes this line, the generated header and test/data together. */
-#define TF_TEST_ERRORS_SHA256 "9d692efed682a65f5b1d2fb0afbe0df37aad790884a0cb9cf5479ca77889e631"
+ * version 1.8.0, SDK 3.1.0: 26 codes, and the ten entries under server_rejected's reasons). A changed catalogue changes this line, the generated header and test/data together. */
+#define TF_TEST_ERRORS_SHA256 "04b264b9d820f865a0bfd4d695e17a07b2ae6b1be318324c91f3177d322cd510"
 #define TF_TEST_CONTRACT_ERRORS ""
 
 static int t30_down(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
@@ -187,8 +187,9 @@ static void t30_manifest(const char *data) {
   {
     const char *built = tf_json_str(tf_json_get(v, "sdk_version"));
     const int cmp = built ? tf__version_cmp(built, TF_SDK_VERSION) : -2;
-    CHECK(built && (cmp == 0 || cmp == -1) && !strncmp(built, TF_SDK_VERSION, 4), "the vector was built with SDK %s, this is %s", built ? built : "(none)",
-          TF_SDK_VERSION);
+    /* since contract 1.7.1 the file holds for 3.0.0 to 3.1.99 */
+    CHECK(built && (cmp == 0 || cmp == -1) && (!strncmp(TF_SDK_VERSION, "3.0.", 4) || !strncmp(TF_SDK_VERSION, "3.1.", 4)),
+          "the vector was built with SDK %s, this is %s", built ? built : "(none)", TF_SDK_VERSION);
   }
   int ok = 0, accepted = 0;
   for (int i = 0; cases && i < cases->n; ++i) {

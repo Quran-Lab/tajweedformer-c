@@ -13,8 +13,6 @@
  *
  *   quickstart KEY                 the example: a to e
  *   quickstart KEY --quick         only the README's quick start (the marked region below)
- *   quickstart --folder DIR [HEX]  b to d on a model folder already on disk, without a key or a network
- *                                  (HEX: the public key of a folder signed with a test key)
  *
  * test/quickstart_check.py keeps the README's code equal to the marked region of this file. */
 #include <stdio.h>
@@ -65,19 +63,16 @@ static int failed(const char *what) {
 }
 
 int main(int argc, char **argv) {
-  if (argc < 2 || (!strcmp(argv[1], "--folder") && argc < 3))
-    return fprintf(stderr, "usage: quickstart qlk_v1_... [--quick] < mono float samples at 16 kHz\n"
-                           "       quickstart --folder DIR [PUBLIC_KEY_HEX] < mono float samples at 16 kHz\n"), 2;
+  if (argc < 2) return fprintf(stderr, "usage: quickstart qlk_v1_... [--quick] < mono float samples at 16 kHz\n"), 2;
 #ifdef _WIN32
   _setmode(_fileno(stdin), _O_BINARY);
 #endif
   if (argc > 2 && !strcmp(argv[2], "--quick")) return recite(argv[1]) < 0 ? failed("quick start") : 0;
-  const char *folder = strcmp(argv[1], "--folder") ? NULL : argv[2];
 
   /* a. the model: downloaded once (resumed when interrupted), verified, opened and warm */
-  TfClient *client = folder ? NULL : tf_client_create(&(TfClientOptions){.key = argv[1], .app_id = "com.example.quickstart", .app_version = "1.0"});
-  if (!folder && tf_client_prefetch(client, &(TfPrefetchOptions){.on_progress = on_progress}) < 0) return failed("model download");
-  TfModel *model = folder ? tf_model_open(folder, &(TfModelOptions){.trusted_key_hex = argc > 3 ? argv[3] : NULL}) : tf_client_model(client, NULL);
+  TfClient *client = tf_client_create(&(TfClientOptions){.key = argv[1], .app_id = "com.example.quickstart", .app_version = "1.0"});
+  if (tf_client_prefetch(client, &(TfPrefetchOptions){.on_progress = on_progress}) < 0) return failed("model download");
+  TfModel *model = tf_client_model(client, NULL);
   if (!model) return failed("model");
   fprintf(stderr, "model %s, version %s\n", tf_model_id(model), tf_model_version(model));
   const TfSessionOptions options = {.on_chunk = show, .on_event = on_event, .end_on_silence_ms = 1500};
@@ -107,7 +102,7 @@ int main(int argc, char **argv) {
   tf_session_destroy(session);
 
   /* e. diagnose: one report, safe to paste into an issue */
-  if (client) puts(tf_client_diagnose_json(client));
+  puts(tf_client_diagnose_json(client));
   tf_model_close(model);
   tf_client_destroy(client);
   return 0;

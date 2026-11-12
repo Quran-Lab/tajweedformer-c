@@ -1,5 +1,64 @@
 # Changelog
 
+## 3.1.0
+
+A model comes from Quran Lab's server, through the Client, and from nowhere else. The same change in the Android,
+Apple, web and C SDKs, and one sentence more on the sharing sheet.
+
+- **Removed: opening a model folder the app supplies.** `tf_model_open` is gone, and the header has 66 functions.
+  A Model comes from `tf_client_model` (and `tf_client_prefetch` to download ahead): the key, the signed config,
+  the SDK's own download and its verification. Why: the model is Quran Lab's to deliver, verify, update and
+  withdraw, and an app that carries its own copy can be told of none of that. An app that called
+  `tf_model_open` does not compile; it creates a Client and calls `tf_client_model(client, NULL)`.
+- **Removed: `trusted_key_hex`** in `TfClientOptions` and `TfModelOptions` (it was for tests). Remove the field
+  from a designated initializer that names it.
+- **The Client opens only a build it downloaded itself.** It keeps a record of each download, bound to this
+  machine and user (Windows: a key protected with DPAPI; Linux: a key derived from the machine id and the user
+  id, or a key file in the storage folder where the machine has no id). A model folder in the Client's storage
+  without that record, put there by an installer or copied from another machine, is deleted and the model is
+  downloaded. **An installation that updates from an earlier SDK downloads the model once more**; without a
+  connection at that first start `tf_client_model` fails with `needs_connection`. After that a model runs
+  without a network, as before.
+- **Changed: a Client that Quran Lab has refused does not run the model, and removes it.** When Quran Lab
+  refuses the key or the app (a revoked key, a paused or blocked app), the SDK stops running the model and
+  removes the downloaded model from the device. Once the key is accepted again the model is downloaded again.
+  The refusals that do this: a key that was revoked or that Quran Lab never issued; `app_not_allowed`,
+  `origin_not_allowed`, `key_type_mismatch`; `app_blocked`, which is an app blocked by Quran Lab or paused by
+  its developer; `developer_not_approved`. `tf_client_model` and `tf_client_prefetch` fail with that refusal
+  (`invalid_key`, or `server_rejected` with the refusal's message and fix), at the next start without a network
+  too, until a later answer accepts the key. What is removed: every model build in the Client's storage folder,
+  with the record of its download and any partial download; nothing else in that folder (not the sharing state,
+  not a recording that is not sent yet). A Model that is already open keeps running until it is closed, and
+  its files are removed when it is closed, or at the next start. A removal that cannot be done is tried again
+  at the next start and is never an error of its own. Before, a model on disk kept running. A missing
+  connection, a timeout, a server error, a network Quran Lab does not serve and any answer that names no such
+  reason never stop a model and remove nothing. `sdk_too_old` does what it did.
+- **Changed: model files are requested with the installation's token.** Every request for the model (its
+  manifest, each file, each resumed range) carries the app token the SDK already uses for its other calls, next
+  to the key. Two refusals of such a request have their own message and fix under `server_rejected`:
+  `model_attestation_required` and `model_not_allowed`; a daily limit is `download_failed` and is not retried in
+  a loop.
+- **Changed: the command-line tool gets its model through a Client**, as an app does: every command takes
+  `--key`, `--app-id` and `--storage`, and none takes a folder. `bench` is gone (it ran several processes on one
+  model folder; a server runs one process per take, each with its own storage folder). The example program's
+  `--folder` mode is gone.
+- **Changed: the sharing sheet and "What is shared" now say that no human ever listens to your recordings: only
+  software learns from them.** Copy deck `2026-11-12.1` (consent `share-2026-11-12`) in eight languages; the
+  sentence is in `sheet.who` and `what.detail`, and an app that draws its own sheet from the deck shows it with
+  no change. A learner who already agreed is not asked again, and their recordings keep the version they agreed
+  to.
+- **Changed: the error catalogue** (the shared `errors.json`): the fix sentence of `model_missing`, the two
+  reasons above, and the words of `app_blocked`.
+- Tests: the shared vector `model_gate.json` (32 answers of the API and of the model host: which stop a model
+  and remove it, remembered across a start and cleared by an accepting answer, and the error the app gets); a
+  refusal with a real download on the device leaves no model file and no record, and the sharing state, an
+  unsent recording, the device key and the remembered refusal stay; a model put back by hand is removed at the
+  next start without a network; after the key is accepted again every file is downloaded again; a Model open at
+  the refusal runs a take and its files go when it is closed; a removal that fails stays owed; a storage folder
+  filled in advance is not opened and is replaced by a download; a record made with another key and a record of
+  another build are not valid; a download, then a start with no request for a file; the two ways the key store
+  can fail.
+
 ## 3.0.1
 
 One subject, the same in the Android, Apple, web and C SDKs: what "sharing off" and "delete what I shared" must

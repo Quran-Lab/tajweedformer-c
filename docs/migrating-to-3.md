@@ -13,7 +13,7 @@ has two choices: build its own judge (the second half of this page), or stay on 
 | 2.x | 3.0.0 |
 | - | - |
 | `tf_client_default_options()`, `tf_model_default_options()`, `tf_stream_default_options()` | gone: a NULL or zeroed options struct is the default |
-| `tf_client_create`, then `tf_client_launch`, reading the config for the revision, `tf_download_model`, `tf_model_open` | `tf_client_create`, then `tf_client_model(client, NULL)`: downloads, verifies, opens and warms. `tf_client_prefetch` to download ahead |
+| `tf_client_create`, then `tf_client_launch`, reading the config for the revision, `tf_download_model`, `tf_model_open` | `tf_client_create`, then `tf_client_model(client, NULL)`: downloads, verifies, opens and warms. `tf_client_prefetch` to download ahead. Since 3.1.0 this is the only way to a Model: `tf_model_open` is gone |
 | `TfClientOptions.storage_dir`, `.telemetry`, `.debug_build` | `.storage`, `.analytics` (`TF_ANALYTICS_ON`, `TF_ANALYTICS_OFF`), `.debug` |
 | `TfModelOptions.context`, `.sample_rate` | on the Session: `TfSessionOptions.context`, `.sample_rate` |
 | `TfStream`, `tf_stream_create`, `tf_stream_push_audio`, `tf_stream_finish`, `tf_stream_destroy` | `TfSession`, `tf_session_create`, `tf_session_push`, `tf_session_finish`, `tf_session_destroy` |

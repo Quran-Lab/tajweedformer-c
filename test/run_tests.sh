@@ -134,7 +134,7 @@ run "shared-session upload (batches, 403, crash recovery, sharing off, key misma
 run "the Session's hook: a take shared through a Session (16 kHz, resampled), heads unchanged" tt session_share "$W/v4" "$KEY" "$W/clips.txt" "$W/session_share"
 run "platform client (replayed) and sharing state machine" tt client "$HERE/data/client-fixtures.json" "$W/client"
 run "bitrate ladder vector, a 150 s stream at 192/96/32/64/192 kbit/s (pages, decode, ffmpeg when present), outbox wiring" tt bitrate "$HERE/data/sharing_vectors" "$W/bitrate"
-run "consent wording vector, pause and update ask, session JSON, withdrawal, deletion; copy decks 2026-11-09.1" tt consent "$HERE/data/sharing_vectors" "$HERE/data/client-fixtures.json" "$W/consent"
+run "consent wording vector, pause and update ask, session JSON, withdrawal, deletion; copy decks 2026-11-12.1" tt consent "$HERE/data/sharing_vectors" "$HERE/data/client-fixtures.json" "$W/consent"
 run "sdk_latest in the signed config: one debug warning per client when newer, silent otherwise and in release builds" tt sdk_latest "$HERE/data/sdk_latest_configs.json" "$W/sdk_latest"
 run "telemetry deltas (report_id, retries, midnight, send points, timer, share counters, daily register)" tt telemetry "$W/telemetry"
 run "takes in a row: one recording, the take list call, recovery, withdrawal, background, the 20-minute cap" tt takes "$HERE/data/sharing_vectors" "$W/takes"

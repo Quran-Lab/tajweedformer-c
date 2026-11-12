@@ -97,6 +97,11 @@ static struct {
   const char *raw_body;
   int config_calls, requests;
   char config_path[256];
+  /* SDK 3.1.0, the CDN: a model request gets this status and body (0: no CDN in this stub), and the stub keeps
+   * the headers of the last one */
+  int cdn_status, cdn_requests, attest_calls;
+  const char *cdn_body;
+  char cdn_headers[2048];
 } g_ap;
 static void ap_reply(TfHttpResponse *r, int status, const char *body) {
   r->status = status;
@@ -125,7 +130,9 @@ static int ap_api(const TfHttpRequest *q, TfHttpResponse *r, int *rc) {
     return 1;
   }
   if (!strncmp(path, "/v1/attest", 10)) {
-    ap_reply(r, 200, "{\"token\":\"qlt_v1.test.sig\",\"expires_in\":86400,\"attested\":false}");
+    char tok[120];
+    snprintf(tok, sizeof tok, "{\"token\":\"qlt_v1.test%d.sig\",\"expires_in\":86400,\"attested\":false}", ++g_ap.attest_calls);
+    ap_reply(r, 200, tok);
   } else if (!strncmp(path, "/v1/config", 10)) {
     g_ap.config_calls++;
     snprintf(g_ap.config_path, sizeof g_ap.config_path, "%s", path);
@@ -157,13 +164,23 @@ static int ap_stub(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
   (void)u;
   g_ap.requests++;
   int rc = 0;
-  if (g_ap.mode == 0 || !ap_api(q, r, &rc)) return tf__fail(TF__ERR_NETWORK, "no network (test)");
-  return rc;
+  if (g_ap.mode == 0) return tf__fail(TF__ERR_NETWORK, "no network (test)");
+  if (ap_api(q, r, &rc)) return rc;
+  if (g_ap.cdn_status && strstr(q->url, "cdn.quranlab.ai/models/")) {
+    g_ap.cdn_requests++;
+    g_ap.cdn_headers[0] = 0;
+    for (const char *const *h = q->headers; h && *h; ++h) {
+      const size_t at = strlen(g_ap.cdn_headers);
+      snprintf(g_ap.cdn_headers + at, sizeof g_ap.cdn_headers - at, "%s\n", *h);
+    }
+    ap_reply(r, g_ap.cdn_status, g_ap.cdn_body ? g_ap.cdn_body : "");
+    return 0;
+  }
+  return tf__fail(TF__ERR_NETWORK, "no network (test)");
 }
 static TfClient *ap_client(const char *dir) {
   tf_mkdirs(dir);
-  TfClient *c = tf_client_create(&(TfClientOptions){.key = "qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa", .app_id = "org.example.Api", .app_version = "1.0", .storage = dir,
-                                                    .trusted_key_hex = tf_json_str(tf_json_get(g_ap.fx, "public_key_hex"))});
+  TfClient *c = tf__client_create_with_key(&(TfClientOptions){.key = "qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa", .app_id = "org.example.Api", .app_version = "1.0", .storage = dir}, tf_json_str(tf_json_get(g_ap.fx, "public_key_hex")));
   if (!c) fprintf(stderr, "client: %s\n", tf_last_error());
   return c;
 }
@@ -192,6 +209,27 @@ static int ap_true(const TfJson *j, const char *a, const char *b) {
 static int ap_false(const TfJson *j, const char *a, const char *b) {
   const TfJson *v = b ? tf_json_get(tf_json_get(j, a), b) : tf_json_get(j, a);
   return v && v->type == TJ_BOOL && !v->boolean;
+}
+
+/* SDK 3.1.0, contract 1.10.0: stand-in model files in a Client's storage (a build folder with a manifest and a
+ * partial download, and the build's install record), as the removal after a refusal finds them */
+static void gate_stand_in(const char *storage, const char *build) {
+  char p[1500];
+  snprintf(p, sizeof p, "%s/models/%s", storage, build);
+  tf_mkdirs(p);
+  snprintf(p, sizeof p, "%s/models/%s/manifest.json", storage, build);
+  tf_write_file(p, "{}", 2);
+  snprintf(p, sizeof p, "%s/models/%s/weights.bin.part", storage, build);
+  tf_write_file(p, "0123456789", 10);
+  snprintf(p, sizeof p, "%s/models/%s.install", storage, build);
+  tf_write_file(p, "installed 0000000000000000000000000000000000000000000000000000000000000000\n", 75);
+}
+static int gate_state_has(const char *path, const char *what) {
+  char *t = NULL;
+  size_t n = 0;
+  const int has = !tf_read_file(path, &t, &n) && t && strstr(t, what) != NULL;
+  free(t);
+  return has;
 }
 
 static int api_tests(const char *work, const char *data) {
@@ -226,7 +264,7 @@ static int api_tests(const char *work, const char *data) {
   CHECK(tf_client_create(&(TfClientOptions){.key = "qlk_v1_x", .app_id = "a", .storage = d, .audience = "kids"}) == NULL &&
             tf_last_error_code() == TF_ERR_INVALID_ARGUMENT,
         "an audience that is not general or children");
-  CHECK(tf_client_create(&(TfClientOptions){.key = "qlk_v1_x", .app_id = "a", .storage = d, .trusted_key_hex = "zz"}) == NULL, "a trusted key that is not hex");
+  CHECK(tf__client_create_with_key(&(TfClientOptions){.key = "qlk_v1_x", .app_id = "a", .storage = d}, "zz") == NULL, "a trusted key that is not hex");
   TfClient *c = ap_client(d);
   CHECK(c != NULL, "the first client: %s", tf_last_error() ? tf_last_error() : "");
   TfClient *second = tf_client_create(&(TfClientOptions){.key = "qlk_v1_other", .app_id = "b", .storage = d});
@@ -339,11 +377,14 @@ static int api_tests(const char *work, const char *data) {
     for (int i = 0; errs && i < errs->n; ++i)
       if (!strcmp(tf_json_str(tf_json_get(&errs->kids[i], "code")), "server_rejected")) reasons = tf_json_get(&errs->kids[i], "reasons");
     /* seven are the server's 403 codes; the eighth (local_needs_development_key) is the web origin check's and is
-     * looked up the same way */
-    CHECK(reasons && reasons->n == 8, "the catalogue has %d entries under server_rejected's reasons, want 8", reasons ? reasons->n : 0);
-    int told = 0;
+     * looked up the same way; the last two (SDK 3.1.0) are refusals of a model request, which the CDN gives and
+     * the API does not: model_gate.json runs them */
+    CHECK(reasons && reasons->n == 10, "the catalogue has %d entries under server_rejected's reasons, want 10", reasons ? reasons->n : 0);
+    int told = 0, of_the_api = 0;
     for (int i = 0; reasons && i < reasons->n; ++i) {
       const TfJson *rs = &reasons->kids[i];
+      if (!strcmp(rs->key, "model_attestation_required") || !strcmp(rs->key, "model_not_allowed")) continue;
+      of_the_api++;
       const char *msg = tf_json_str(tf_json_get(rs, "message")), *fix = tf_json_str(tf_json_get(rs, "fix"));
       g_ap.mode = 3;
       g_ap.refusal = rs->key;
@@ -375,7 +416,8 @@ static int api_tests(const char *work, const char *data) {
           "a refusal the catalogue does not know: %s", tf_last_error());
     tf_client_destroy(c);
     g_ap.refusal = NULL;
-    printf("api: a refusal says what to do: %d of %d refusals of the catalogue, app_not_allowed word for word, an unknown code\n", told, reasons ? reasons->n : 0);
+    CHECK(told == of_the_api && of_the_api == 8, "%d of the %d refusals the API gives say what to do", told, of_the_api);
+    printf("api: a refusal says what to do: %d of the %d refusals of the catalogue that the API gives, app_not_allowed word for word, an unknown code\n", told, of_the_api);
     tf_json_free(cat);
   }
 
@@ -398,8 +440,7 @@ static int api_tests(const char *work, const char *data) {
       g_ap.raw_body = text;
       snprintf(d, sizeof d, "%s/vec_refusal_%d", work, i);
       tf_mkdirs(d);
-      c = tf_client_create(&(TfClientOptions){.key = "qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa", .app_id = app, .app_version = "1.0", .storage = d,
-                                              .trusted_key_hex = tf_json_str(tf_json_get(g_ap.fx, "public_key_hex"))});
+      c = tf__client_create_with_key(&(TfClientOptions){.key = "qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa", .app_id = app, .app_version = "1.0", .storage = d}, tf_json_str(tf_json_get(g_ap.fx, "public_key_hex")));
       const char *code = tf_json_str(tf_json_get(e, "code")), *fix = tf_json_str(tf_json_get(e, "fix"));
       /* a message that carries the SDK's version has the version the file was built with (`sdk`): this SDK's own
        * goes in its place (the shared README 4.5) */
@@ -425,6 +466,196 @@ static int api_tests(const char *work, const char *data) {
     g_ap.raw_body = NULL;
     CHECK(cases && cases->n == 11 && ok == cases->n, "refusals.json: %d of %d cases", ok, cases ? cases->n : 0);
     printf("api: refusals.json: %d of %d answers give the catalogue's code, message and fix (the reason is read first)\n", ok, cases ? cases->n : 0);
+    tf_json_free(v);
+  }
+
+  /* 3c. SDK 3.1.0, the model gate (SPEC 15.3 and 15.4, vectors/model_gate.json): which answers of the server
+   * stop a model on the device (exactly those whose body carries a reason of the list), and the error the app
+   * gets. Each case is one answer of the API (every API route
+   * answers it) or of the CDN on a model request (the API accepts the key and names a build). A stop is
+   * remembered: a new Client on the same storage without a network gives the same refusal, not needs_connection,
+   * and an answer that accepts the key clears it. Contract 1.10.0 (format 3, expect.removes_models): a stop also
+   * removes the models from the device, and no other answer removes anything. The models here are stand-ins (a
+   * build folder with a manifest and a partial download, and its install record); the test with a real download
+   * is in the model tests. */
+  {
+    TfJson *v = t30_json(data, "model_gate.json");
+    static const char kStandIn[] = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    int n_removed = 0, n_kept = 0;
+    const TfJson *cases = tf_json_get(v, "cases"), *sr = tf_json_get(v, "stop_reasons");
+    const char *app = tf_json_str(tf_json_get(v, "app")), *built = tf_json_str(tf_json_get(v, "sdk"));
+    const char *pk = tf_json_str(tf_json_get(g_ap.fx, "public_key_hex"));
+    int ok = 0, n_stop = 0, list_ok = sr && sr->type == TJ_ARR && sr->n > 0;
+    for (int i = 0; list_ok && i < sr->n; ++i) list_ok = tf__stop_reason(tf_json_str(&sr->kids[i]));
+    CHECK(list_ok && sr->n == 7 && !tf__stop_reason("invalid_key") && !tf__stop_reason("sdk_too_old") && !tf__stop_reason("model_attestation_required") &&
+              !tf__stop_reason("model_not_allowed") && !tf__stop_reason("environment_mismatch") && tf__key_reason("key_revoked") &&
+              tf__key_reason("key_unknown") && !tf__key_reason("app_blocked"),
+          "the SDK's list of refusals that stop a model is not model_gate.json's stop_reasons");
+    for (int i = 0; cases && i < cases->n; ++i) {
+      const TfJson *cs = &cases->kids[i], *ex = tf_json_get(cs, "expect"), *e = tf_json_get(ex, "error");
+      const TfJson *st = tf_json_get(cs, "status");
+      const char *from = tf_json_str(tf_json_get(cs, "from")), *name = tf_json_str(tf_json_get(cs, "name"));
+      const int stop = t30_bool(ex, "stops_model"), has_error = e && e->type == TJ_OBJ, cdn = from && !strcmp(from, "cdn");
+      const int answered = st && st->type == TJ_NUM;
+      TfBuf body;
+      tf_buf_init(&body);
+      tf_json_write(&body, tf_json_get(cs, "body"));
+      char *text = tf_buf_take(&body);
+      g_ap.cdn_status = g_ap.cdn_requests = g_ap.attest_calls = 0;
+      g_ap.cdn_body = NULL;
+      if (!answered) g_ap.mode = 0;
+      else if (cdn) {
+        g_ap.mode = 4;
+        g_ap.serve = "model";
+        g_ap.cdn_status = (int)st->num;
+        g_ap.cdn_body = text;
+      } else {
+        g_ap.mode = 5;
+        g_ap.raw_status = (int)st->num;
+        g_ap.raw_body = text;
+      }
+      snprintf(d, sizeof d, "%s/gate_%d", work, i);
+      tf_mkdirs(d);
+      const TfJson *rmv = tf_json_get(ex, "removes_models");
+      const int removes = t30_bool(ex, "removes_models");
+      CHECK(rmv && rmv->type == TJ_BOOL && removes == stop, "model_gate.json %s: removes_models is not a boolean equal to stops_model", name);
+      char gm[1500], gp[1500], gr[1500];
+      snprintf(gm, sizeof gm, "%s/models/%s/manifest.json", d, kStandIn);
+      snprintf(gp, sizeof gp, "%s/models/%s/weights.bin.part", d, kStandIn);
+      snprintf(gr, sizeof gr, "%s/models/%s.install", d, kStandIn);
+      gate_stand_in(d, kStandIn);
+      const TfClientOptions co = {.key = "qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa", .app_id = app, .app_version = "1.0", .storage = d};
+      c = tf__client_create_with_key(&co, pk);
+      int good = c && text && tf_client_model(c, NULL) == NULL && tf_last_error_code() != 0;
+      /* when the call has returned: a stop left no model file and no install record; any other answer left all */
+      const int left = tf_file_exists(gm) + tf_file_exists(gp) + tf_file_exists(gr);
+      const int removed_ok = removes ? left == 0 : left == 3;
+      CHECK(removed_ok, "model_gate.json %s: removes_models %d, and %d of the 3 stand-in model files are still there", name, removes, left);
+      n_removed += removes && left == 0;
+      n_kept += !removes && left == 3;
+      char msg[512] = "";
+      if (good && has_error) {
+        const char *m = tf_json_str(tf_json_get(e, "message")), *fix = tf_json_str(tf_json_get(e, "fix"));
+        const char *at = m && built && *built ? strstr(m, built) : NULL;
+        if (at) snprintf(msg, sizeof msg, "%.*s%s%s", (int)(at - m), m, TF_SDK_VERSION, at + strlen(built));
+        else snprintf(msg, sizeof msg, "%s", m ? m : "");
+        good = !strcmp(tf_error_name(tf_last_error_code()), tf_json_str(tf_json_get(e, "code"))) && !strcmp(tf_last_error(), msg) &&
+               tf_last_error_fix() && !strcmp(tf_last_error_fix(), fix);
+      }
+      CHECK(good, "model_gate.json %s: %s / %s / %s", name, tf_error_name(tf_last_error_code()), tf_last_error() ? tf_last_error() : "",
+            tf_last_error_fix() ? tf_last_error_fix() : "(no fix)");
+      /* the refusal is remembered exactly when the case says it stops a model */
+      const char *gate = c ? tf__client_gate(c) : "";
+      const char *want_gate = tf_json_str(tf_json_get(tf_json_get(cs, "body"), "reason"));
+      const int gate_ok = stop ? has_error && want_gate && !strcmp(gate, want_gate) : !*gate;
+      CHECK(gate_ok, "model_gate.json %s: stops_model %d and the Client remembers \"%s\"", name, stop, gate);
+      /* a model request carries the key and the install's token, on the request that was refused too */
+      int hdr_ok = 1;
+      if (cdn && answered) {
+        hdr_ok = g_ap.cdn_requests >= 1 && strstr(g_ap.cdn_headers, "x-qlab-key: qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa\n") &&
+                 strstr(g_ap.cdn_headers, "authorization: Bearer qlt_v1.test");
+        /* 401 invalid_token: the token is renewed once and the request repeated once, with the new token */
+        if (strstr(text, "invalid_token") && !stop)
+          hdr_ok = hdr_ok && g_ap.cdn_requests == 2 && g_ap.attest_calls == 2 && strstr(g_ap.cdn_headers, "authorization: Bearer qlt_v1.test2.sig\n");
+        else hdr_ok = hdr_ok && g_ap.cdn_requests == 1 && g_ap.attest_calls == 1;
+        CHECK(hdr_ok, "model_gate.json %s: %d model requests, %d token requests, headers of the last: %s", name, g_ap.cdn_requests, g_ap.attest_calls,
+              g_ap.cdn_headers);
+      }
+      tf_client_destroy(c);
+      /* the next launch, without a network. After a stop the model files are put back by hand first: the start
+       * removes them before the Client does anything else, and the call fails with the refusal's error */
+      g_ap.mode = 0;
+      g_ap.cdn_status = 0;
+      if (stop) gate_stand_in(d, kStandIn);
+      c = tf__client_create_with_key(&co, pk);
+      const int left2 = tf_file_exists(gm) + tf_file_exists(gp) + tf_file_exists(gr);
+      CHECK(stop ? left2 == 0 : left2 == 3, "model_gate.json %s, the next start without a network: %d of the 3 stand-in model files are there", name, left2);
+      int again;
+      if (stop)
+        again = left2 == 0 && c && tf_client_model(c, NULL) == NULL && !strcmp(tf_error_name(tf_last_error_code()), tf_json_str(tf_json_get(e, "code"))) &&
+                !strcmp(tf_last_error(), msg);
+      else again = left2 == 3 && c && tf_client_model(c, NULL) == NULL && tf_last_error_code() == TF_ERR_NEEDS_CONNECTION;
+      CHECK(again, "model_gate.json %s, the next launch without a network: %s (%s)", name, tf_error_name(tf_last_error_code()),
+            tf_last_error() ? tf_last_error() : "");
+      tf_client_destroy(c);
+      int cleared = 1;
+      if (stop) {
+        /* an answer that accepts the key clears it: here a signed config that names no model */
+        g_ap.mode = 4;
+        g_ap.serve = "no model";
+        c = tf__client_create_with_key(&co, pk);
+        cleared = c && tf_client_model(c, NULL) == NULL && tf_last_error_code() == TF_ERR_MODEL_UNAVAILABLE && !*tf__client_gate(c);
+        CHECK(cleared, "model_gate.json %s, after an answer that accepts the key: %s, remembered \"%s\"", name, tf_error_name(tf_last_error_code()),
+              c ? tf__client_gate(c) : "");
+        tf_client_destroy(c);
+        n_stop++;
+      }
+      ok += good && gate_ok && hdr_ok && again && cleared && removed_ok;
+      free(text);
+    }
+    g_ap.raw_body = g_ap.cdn_body = NULL;
+    g_ap.cdn_status = 0;
+    CHECK(n_removed == 13 && n_kept == 19, "model_gate.json: %d stops removed the models (13), %d other answers removed nothing (19)", n_removed, n_kept);
+    /* a removal that fails (a storage error; here the test's switch) is no error of its own and stays owed: the
+     * app gets the refusal's error, the next start tries again, and the first start that can remove them does */
+    {
+      char gm[1500], gr[1500], st[1500];
+      snprintf(d, sizeof d, "%s/gate_owed", work);
+      tf_mkdirs(d);
+      snprintf(gm, sizeof gm, "%s/models/%s/manifest.json", d, kStandIn);
+      snprintf(gr, sizeof gr, "%s/models/%s.install", d, kStandIn);
+      snprintf(st, sizeof st, "%s/client.json", d);
+      gate_stand_in(d, kStandIn);
+      const TfClientOptions co = {.key = "qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa", .app_id = app, .app_version = "1.0", .storage = d};
+      g_ap.mode = 5;
+      g_ap.raw_status = 403;
+      g_ap.raw_body = "{\"error\":\"app_blocked\",\"message\":\"This app is not served.\",\"reason\":\"app_blocked\"}";
+      tf__store_purge_fail_test = 1;
+      c = tf__client_create_with_key(&co, pk);
+      int owed = c && tf_client_model(c, NULL) == NULL && tf_last_error_code() == TF_ERR_SERVER_REJECTED && strstr(tf_last_error(), "(app_blocked)") &&
+                 tf_file_exists(gm) && tf_file_exists(gr) && gate_state_has(st, "\"remove_models\":true") && gate_state_has(st, "\"refused\":\"app_blocked\"");
+      CHECK(owed, "a removal that fails: %s (%s), the files %s", tf_error_name(tf_last_error_code()), tf_last_error() ? tf_last_error() : "",
+            tf_file_exists(gm) ? "are still there" : "are gone");
+      tf_client_destroy(c);
+      g_ap.mode = 0;
+      c = tf__client_create_with_key(&co, pk);
+      const int owed2 = c && tf_file_exists(gm) && tf_client_model(c, NULL) == NULL && tf_last_error_code() == TF_ERR_SERVER_REJECTED &&
+                        strstr(tf_last_error(), "(app_blocked)") && gate_state_has(st, "\"remove_models\":true");
+      CHECK(owed2, "a start that cannot remove them either: %s, the files %s", tf_error_name(tf_last_error_code()), tf_file_exists(gm) ? "are still there" : "are gone");
+      tf_client_destroy(c);
+      tf__store_purge_fail_test = 0;
+      c = tf__client_create_with_key(&co, pk);
+      const int paid = c && !tf_file_exists(gm) && !tf_file_exists(gr) && gate_state_has(st, "\"remove_models\":false") &&
+                       gate_state_has(st, "\"refused\":\"app_blocked\"") && tf_client_model(c, NULL) == NULL && tf_last_error_code() == TF_ERR_SERVER_REJECTED;
+      CHECK(paid, "the next start, without a network, removes what was owed: the files %s, %s", tf_file_exists(gm) ? "ARE STILL THERE" : "are gone",
+            tf_error_name(tf_last_error_code()));
+      tf_client_destroy(c);
+      /* owed and the key accepted again before any removal worked: the models still go before a model call uses them */
+      gate_stand_in(d, kStandIn);
+      g_ap.mode = 5;
+      tf__store_purge_fail_test = 1;
+      c = tf__client_create_with_key(&co, pk);
+      CHECK(c && tf_client_model(c, NULL) == NULL && tf_file_exists(gm), "the second refusal with a removal that fails");
+      tf_client_destroy(c);
+      g_ap.mode = 4;
+      g_ap.serve = "no model";
+      c = tf__client_create_with_key(&co, pk);
+      CHECK(c && tf_file_exists(gm), "a start that cannot remove the models");
+      tf__store_purge_fail_test = 0;
+      const int late = c && tf_client_model(c, NULL) == NULL && tf_last_error_code() == TF_ERR_MODEL_UNAVAILABLE && !*tf__client_gate(c) && !tf_file_exists(gm) &&
+                       !tf_file_exists(gr) && gate_state_has(st, "\"remove_models\":false");
+      CHECK(late, "a removal still owed when the key is accepted again: %s, the files %s", tf_error_name(tf_last_error_code()),
+            tf_file_exists(gm) ? "ARE STILL THERE" : "are gone");
+      tf_client_destroy(c);
+      g_ap.raw_body = NULL;
+      printf("model gate, removal: 13 stops left no stand-in model file and no install record, 19 other answers removed nothing; files put back by hand "
+             "are removed at the next start without a network; a removal that fails is no error, stays owed across starts and is done by the first "
+             "start or model call that can: %s\n", owed && owed2 && paid && late ? "ok" : "FAIL");
+    }
+    CHECK(cases && cases->n == 32 && ok == cases->n && n_stop == 13, "model_gate.json: %d of %d cases, %d of them stop a model", ok, cases ? cases->n : 0, n_stop);
+    printf("api: model_gate.json: %d of %d answers as the vector says (%d stop a model on the device, remembered across a launch and cleared by an "
+           "accepting answer); a model request carries the key and the token\n",
+           ok, cases ? cases->n : 0, n_stop);
     tf_json_free(v);
   }
 
@@ -464,13 +695,13 @@ static int api_tests(const char *work, const char *data) {
   tf_client_destroy(c);
   tf__now_override = 1794355200 + 9 * 3600;
 
-  /* 5. a folder on disk: what tf_model_open refuses before it reads a model */
-  CHECK(tf_model_open(NULL, NULL) == NULL && tf_last_error_code() == TF_ERR_INVALID_ARGUMENT, "tf_model_open without a folder");
+  /* 5. a folder on disk: what the folder entry of the tests refuses before it reads a model */
+  CHECK(tf__model_open_folder(NULL, NULL, NULL) == NULL && tf_last_error_code() == TF_ERR_INVALID_ARGUMENT, "the folder entry without a folder");
   snprintf(d, sizeof d, "%s/empty", work);
   tf_mkdirs(d);
-  CHECK(tf_model_open(d, NULL) == NULL && tf_last_error_code() == TF_ERR_MODEL_MISSING && strstr(tf_last_error(), "No model here"), "an empty folder: %s",
+  CHECK(tf__model_open_folder(d, NULL, NULL) == NULL && tf_last_error_code() == TF_ERR_MODEL_MISSING && strstr(tf_last_error(), "No model here"), "an empty folder: %s",
         tf_error_name(tf_last_error_code()));
-  CHECK(tf_model_open(d, &(TfModelOptions){.version = "4.0.0"}) == NULL && tf_last_error_code() == TF_ERR_INVALID_ARGUMENT, "a version pin on a folder");
+  CHECK(tf__model_open_folder(d, &(TfModelOptions){.version = "4.0.0"}, NULL) == NULL && tf_last_error_code() == TF_ERR_INVALID_ARGUMENT, "a version pin on a folder");
   tf_http_set_transport(NULL, NULL);
   tf__now_override = 0;
   tf_json_free(g_ap.fx);

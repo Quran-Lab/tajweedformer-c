@@ -29,7 +29,7 @@ FUNCTIONS = """tf_version tf_last_error_code tf_last_error tf_last_error_fix tf_
 tf_decoded_json tf_heads_count tf_heads_name tf_heads_get tf_heads_greedy tf_heads_decoded
 tf_client_create tf_client_destroy tf_client_model tf_client_prefetch tf_client_storage_json tf_client_remove_models
 tf_client_diagnose tf_client_diagnose_json tf_client_report_checks tf_client_background tf_client_foreground
-tf_model_open tf_model_close tf_model_id tf_model_version tf_model_build tf_model_info_json tf_model_chunk_ms
+tf_model_close tf_model_id tf_model_version tf_model_build tf_model_info_json tf_model_chunk_ms
 tf_model_tokens tf_model_token_count tf_model_token_name tf_model_token_id
 tf_model_calibration_json tf_model_calibration tf_model_calibration_number
 tf_model_reference tf_reference_is_downloaded tf_reference_fetch tf_reference_units
@@ -79,6 +79,13 @@ exported = re.findall(r"^\s+(\w+);", mapf.split("local:", 1)[0], re.M)
 if sorted(exported) != sorted(functions) or "*" in mapf.split("local:", 1)[0]:
     bad.append(f"tajweedformer.map differs from the header: extra {sorted(set(exported) - set(functions))}, missing {sorted(set(functions) - set(exported))}")
 
+# SDK 3.1.0 (SPEC section 15): no public way to hand the SDK a model. The call that opened a folder and the
+# option that named another signing key are gone from the header and from the exports, and stay gone.
+for gone in ("tf_model_open", "trusted_key_hex"):
+    if re.search(r"\b" + gone + r"\b", header):
+        bad.append(f"include/tajweedformer.h names {gone}: an app must not be able to open a model it supplies")
+if "tf_model_open" in deff or "tf_model_open" in exported or any(n.startswith("tf__") for n in deff + exported):
+    bad.append("the shared library exports a way to open a model folder")
 for rel in ("cli/tajweedformer.c", "examples/quickstart.c"):
     text = (root / rel).read_text(encoding="utf-8")
     for inc in re.findall(r'^\s*#\s*include\s+"([^"]+)"', text, re.M):

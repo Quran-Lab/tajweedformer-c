@@ -266,6 +266,12 @@ typedef struct {
   const char *folder_path;     /* "sdk/v4.0" */
 } TfModelOpen;
 TfModel *tf__model_open(const char *folder, const TfModelOpen *o);
+/* Tests, the local proof and the conformance tools only (SPEC 15.1): a model folder on disk, verified like a
+ * downloaded one. Not in the public header and not exported from the shared library since 3.1.0 (it was
+ * tf_model_open). trusted_key_hex: another manifest key for a folder signed with a test key, or NULL. */
+TfModel *tf__model_open_folder(const char *folder, const TfModelOptions *options, const char *trusted_key_hex);
+/* Tests only: tf_client_create with another Ed25519 key (64 hex) for the signed config and the manifest. */
+TfClient *tf__client_create_with_key(const TfClientOptions *options, const char *trusted_key_hex);
 const char *tf__model_dir(const TfModel *m);
 TfClient *tf__model_client(const TfModel *m);
 const TfJson *tf__model_manifest(const TfModel *m);
@@ -460,6 +466,35 @@ int tf__client_last_error(const TfClient *c);
 const char *tf__client_stop_code(const TfClient *c);   /* the server's code that stopped this launch's calls, or "" */
 const char *tf__client_stop_detail(const TfClient *c); /* sdk_too_old: the version the answer names, or "" */
 int tf__client_stopped(const TfClient *c);
+/* SPEC 15.3: the refusals of the key or the app that stop a model on the device (vectors/model_gate.json,
+ * stop_reasons). 1 when `code` is one of them. */
+int tf__stop_reason(const char *code);
+int tf__key_reason(const char *code);                                /* key_revoked, key_unknown: the error is invalid_key */
+int tf__body_stop_reason(const char *body, size_t n, char out[48]);  /* the stop reason an answer's body carries */
+int tf__fail_gate(const TfClient *c);                                /* the remembered refusal as the app's error */
+/* The refusal that stops the model, remembered on the device until a later answer accepts the key; "" for none. */
+const char *tf__client_gate(const TfClient *c);
+/* The CDN refused a model request with a stop reason: remembered like the API's refusal. */
+void tf__client_refuse(TfClient *c, const char *code);
+/* The API has just accepted the key: a refusal that came from a model request is asked again. */
+void tf__client_gate_retry(TfClient *c);
+/* SPEC 15.3: a refusal that stops a model also removes the models from the device: every
+ * build folder, the install records, partial downloads and current.json; never the remembered refusal, the
+ * device key, the sharing state or the outbox. tf__client_purge_models is the one way in for a running Client:
+ * it removes them now, or leaves the removal owed while a Model is open (done when the Model is closed, and at
+ * the next start). tf__store_purge does the removal; a removal that fails stays owed and is no error. */
+void tf__client_purge_models(TfClient *c);
+void tf__store_purge(TfClient *c);
+int tf__client_purge_owed(const TfClient *c);
+void tf__client_purge_set(TfClient *c, int owed);
+extern int tf__store_purge_fail_test; /* tests: 1 the removal fails as a storage error would, and removes nothing */
+/* SPEC 15.4: the app token for a model request, in out. renew: the CDN did not take the last one (401
+ * invalid_token), so a new one is asked for. 0, or the client's error (no token: the request is not made). */
+int tf__client_model_token(TfClient *c, int renew, char *out, size_t n);
+/* SPEC 15.2: the device key of the install record (tf_devicekey.c). 0 with the key; 1 when there is none (and
+ * create is 0); -1 when the key store failed, which is never treated as "no key". */
+int tf__install_key(const char *dir, int create, uint8_t key[32]);
+extern int tf__install_key_test; /* tests: 0 the real store; 1 "there is no key" for a read; -1 the store fails */
 const char *tf__client_latest(const TfClient *c);      /* a newer SDK release the config names, or NULL */
 void tf__client_set_pin(TfClient *c, const char *version);
 int tf__client_pin_status(TfClient *c, char *out, size_t n);
@@ -481,6 +516,8 @@ extern long long tf__now_override; /* tests: a fixed clock (unix seconds), 0 for
 typedef struct {
   const char *cdn_url;        /* the model base: default https://cdn.quranlab.ai/models ({base}/{repo}/{build}/{folder}/...) */
   const char *key;            /* developer key (qlk_v1_...) */
+  TfClient *client;           /* the Client whose app token every request carries beside the key (SPEC 15.4); NULL
+                                 in the downloader's own tests: the key alone */
   const char *repo;           /* "Quran-Lab/tajweedformer-v4" */
   const char *revision;       /* the build, from the signed config's models entry */
   const char *folder;         /* "sdk/v4.0" */

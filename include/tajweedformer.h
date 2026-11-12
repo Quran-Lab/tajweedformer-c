@@ -1,4 +1,4 @@
-/* tajweedformer.h: the TajweedFormer SDK for Windows and Linux (C API, SDK 3.0.1).
+/* tajweedformer.h: the TajweedFormer SDK for Windows and Linux (C API, SDK 3.1.0).
  *
  * A pure inference engine: audio in, the model's own output out. Five things, with the same names and the same
  * order of calls as the Android, Apple and web SDKs:
@@ -58,9 +58,9 @@ extern "C" {
 #define TF_API
 #endif
 
-#define TF_SDK_VERSION "3.0.1"
+#define TF_SDK_VERSION "3.1.0"
 
-TF_API const char *tf_version(void); /* "3.0.1" */
+TF_API const char *tf_version(void); /* "3.1.0" */
 
 /* ============================================================================ errors */
 
@@ -270,8 +270,6 @@ typedef struct {
   void (*on_log)(void *user, int level, const char *message); /* where that log goes; NULL: stderr. level 0 debug,
                                   1 info, 2 warning, 3 error */
   void *user;                  /* passed to on_consent and on_log */
-  const char *trusted_key_hex; /* tests only: another Ed25519 public key (64 hex) for the signed config and the
-                                  model manifest; NULL: Quran Lab's */
 } TfClientOptions;
 
 /* One Client per process: a second one while the first is not destroyed is TF_ERR_CLIENT_EXISTS. Never waits for
@@ -285,13 +283,14 @@ typedef struct {
   int threads;                 /* engine threads; 0: the fast cores */
   int pin;                     /* 0: the engine's default (desktops and servers: threads not pinned to cores);
                                   1: pinned; -1: not pinned. Timing only, never a bit */
-  const char *trusted_key_hex; /* tests only: another Ed25519 public key (64 hex) for the manifest; NULL: Quran
-                                  Lab's (tf_client_model uses the client's) */
 } TfModelOptions;
 
 /* The Model for this app: downloads on first use (resumable), verifies every file, opens and warms the engine, so
  * call it early. Without a network and without a model on disk: TF_ERR_NEEDS_CONNECTION. While Quran Lab has no
- * build for this SDK version: TF_ERR_MODEL_UNAVAILABLE. */
+ * build for this SDK version: TF_ERR_MODEL_UNAVAILABLE. When Quran Lab refuses the key or the app (a revoked key,
+ * a paused or blocked app): TF_ERR_INVALID_KEY or TF_ERR_SERVER_REJECTED, and the SDK removes the downloaded
+ * model from the device; once the key is accepted again the model is downloaded again. A Model that is open
+ * then keeps running until tf_model_close, which removes its files. */
 TF_API TfModel *tf_client_model(TfClient *c, const TfModelOptions *options);
 
 typedef struct {
@@ -315,7 +314,7 @@ TF_API int tf_client_remove_models(TfClient *c);
 
 /* One structured report, safe to paste into an issue: no audio, text or identifiers. */
 typedef struct {
-  const char *sdk_version;     /* "3.0.1" */
+  const char *sdk_version;     /* "3.1.0" */
   const char *sdk_latest;      /* the SDK release the signed config in force names, or NULL when it names none */
   int key_accepted;            /* 1 accepted, 0 refused, -1 not known yet (no answer from the server) */
   const char *key_reason;      /* why not: the server's code, or NULL */
@@ -349,9 +348,9 @@ TF_API int tf_client_foreground(TfClient *c);
 
 /* ============================================================================ Model */
 
-/* Opens a model folder already on disk, verified the same way: the signed manifest, then every file's size and
- * SHA-256; a file the manifest does not list is never opened. */
-TF_API TfModel *tf_model_open(const char *folder, const TfModelOptions *options);
+/* A Model comes from tf_client_model and from nowhere else: from Quran Lab's server, through the Client. Since
+ * 3.1.0 no call opens a model folder the app supplies (the call that did is gone), and the Client opens only a
+ * build it downloaded itself: a model folder put into its storage by anything else is deleted and downloaded. */
 TF_API void tf_model_close(TfModel *m);
 
 TF_API const char *tf_model_id(const TfModel *m);       /* "v4.0" */

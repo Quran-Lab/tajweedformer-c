@@ -135,35 +135,77 @@ static int get(Run *run, const char *rel, const char *to_file, long long from, T
   char url[4096], key[512];
   if (tf__model_url(url, sizeof url, o->cdn_url ? o->cdn_url : "https://cdn.quranlab.ai/models", o->repo, o->revision, o->folder, rel))
     return tf__fail(TF_ERR_INVALID_ARGUMENT, "the model URL of %s is too long", rel);
+  /* SPEC 15.4: every model request (the manifest, a file, a Range request) carries the install's app token, and
+   * in 3.1.0 the key too. Both headers are made here and nowhere else. */
   snprintf(key, sizeof key, "x-qlab-key: %s", o->key ? o->key : "");
-  const char *hdr[] = {key, NULL};
-  TfHttpRequest q;
-  memset(&q, 0, sizeof q);
-  q.method = "GET";
-  q.url = url;
-  q.headers = hdr;
-  q.download_file = to_file;
-  q.range_from = from;
-  q.timeout_s = 3600;
-  if (to_file) {
-    q.on_bytes = net_bytes;
-    q.bytes_user = run;
-  }
-  if (tf_http(&q, r)) {
-    /* no answer: the .part stays and the next call resumes */
-    if (tf__error_code() == TF__ERR_IO) return tf__error_as(TF_ERR_STORAGE_FAILED);
-    return tf__error_as(TF_ERR_DOWNLOAD_FAILED);
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    char auth[1200] = "", token[1024] = "";
+    if (o->client) {
+      /* no token, no request */
+      if (tf__client_model_token(o->client, attempt > 0, token, sizeof token)) return tf__error_as(TF_ERR_DOWNLOAD_FAILED);
+      snprintf(auth, sizeof auth, "authorization: Bearer %s", token);
+    }
+    const char *hdr[] = {key, auth[0] ? auth : NULL, NULL};
+    TfHttpRequest q;
+    memset(&q, 0, sizeof q);
+    q.method = "GET";
+    q.url = url;
+    q.headers = hdr;
+    q.download_file = to_file;
+    q.range_from = from;
+    q.timeout_s = 3600;
+    if (to_file) {
+      q.on_bytes = net_bytes;
+      q.bytes_user = run;
+    }
+    if (tf_http(&q, r)) {
+      /* no answer: the .part stays and the next call resumes */
+      if (tf__error_code() == TF__ERR_IO) return tf__error_as(TF_ERR_STORAGE_FAILED);
+      return tf__error_as(TF_ERR_DOWNLOAD_FAILED);
+    }
+    /* 401 invalid_token without a reason: the token is renewed once and the request repeated once */
+    char why[48];
+    if (r->status == 401 && o->client && attempt == 0 && r->body && strstr(r->body, "invalid_token") &&
+        !tf__body_stop_reason(r->body, r->body_n, why)) {
+      tf_http_response_free(r);
+      continue;
+    }
+    break;
   }
   return 0;
 }
 
 /* an error status of the CDN as a catalogue error: the key's answers by their code, anything else a stopped
  * download */
-static int http_error(const char *rel, const TfHttpResponse *r) {
+static int http_error(const Run *run, const char *rel, const TfHttpResponse *r) {
   const char *b = r->body ? r->body : "";
-  if (r->status == 401 && strstr(b, "invalid_key")) return tf__fail(TF_ERR_INVALID_KEY, NULL);
+  /* SPEC 15.3: a reason of the list refuses the key or the app, and stops the model on this device */
+  char stop[48];
+  if (tf__body_stop_reason(r->body, r->body_n, stop)) {
+    if (run->o->client) tf__client_refuse(run->o->client, stop);
+    return tf__key_reason(stop) ? tf__fail(TF_ERR_INVALID_KEY, NULL)
+                                : tf__fail_rejected(stop, run->o->client ? tf__client_app(run->o->client) : NULL);
+  }
+  /* else the refusal's code: the body's reason when the catalogue knows it, else its error (NAMING section 7) */
+  char code[64] = "";
+  TfJson *j = r->body ? tf_json_parse(r->body, r->body_n, NULL) : NULL;
+  const char *why = tf_json_str(tf_json_get(j, "reason")), *err = tf_json_str(tf_json_get(j, "error"));
+  if (why && strlen(why) < sizeof code && tf__reason_known(why)) snprintf(code, sizeof code, "%s", why);
+  else if (err && strlen(err) < sizeof code) snprintf(code, sizeof code, "%s", err);
+  tf_json_free(j);
+  /* model_attestation_required and model_not_allowed are refusals of this request only (SPEC 15.4), and so is
+   * any other refusal the catalogue knows that came without a reason: an error with its own words, no stop */
+  if ((r->status == 401 || r->status == 403) && tf__reason_known(code))
+    return tf__fail_rejected(code, run->o->client ? tf__client_app(run->o->client) : NULL);
+  if (r->status == 429 && !strcmp(code, "model_limit"))
+    return tf__fail(TF_ERR_DOWNLOAD_FAILED, "Quran Lab's daily limit for model downloads is reached; try again later");
+  if (r->status == 503 && !strcmp(code, "network_blocked"))
+    return tf__fail(TF_ERR_DOWNLOAD_FAILED, "Quran Lab does not serve this network at the moment; try again later or from another network");
+  if (r->status == 401 && !strcmp(code, "invalid_token")) return tf__fail(TF_ERR_DOWNLOAD_FAILED, "Quran Lab did not take this install's token for %s", rel);
   if (r->status == 403 && strstr(b, "sdk_too_old")) return tf__fail_sdk_too_old(NULL);
-  if (r->status == 401 || r->status == 403) return tf__fail(TF_ERR_SERVER_REJECTED, "HTTP %d for %s", r->status, rel);
+  /* a 401 without a reason: a key the CDN does not know */
+  if (r->status == 401) return tf__fail(TF_ERR_INVALID_KEY, NULL);
+  if (r->status == 403) return tf__fail(TF_ERR_SERVER_REJECTED, "HTTP %d for %s", r->status, rel);
   return tf__fail(TF_ERR_DOWNLOAD_FAILED, "HTTP %d for %s", r->status, rel);
 }
 
@@ -197,8 +239,9 @@ static int fetch_raw(Run *run, const char *rel, long long size, const char *sha,
         continue;
       }
       if (st != 200 && st != 206) {
-        remove(part);
-        rc = http_error(rel, &r);
+        /* a refusal or a limit says nothing about the bytes already here: the .part stays for the next call */
+        if (st != 401 && st != 403 && st != 429) remove(part);
+        rc = http_error(run, rel, &r);
         tf_http_response_free(&r);
         break;
       }
@@ -308,11 +351,11 @@ int tf__download_model(const TfDownload *opt) {
   int rc = get(&run, "manifest.json", NULL, 0, &r);
   if (rc) return rc;
   if (r.status != 200) {
-    rc = http_error("manifest.json", &r);
+    rc = http_error(&run, "manifest.json", &r);
     tf_http_response_free(&r);
     return rc;
   }
-  /* the same acceptance checks, in the same order, as tf_model_open (tf__manifest_accept) */
+  /* the same acceptance checks, in the same order, as an open from disk (tf__manifest_accept) */
   TfJson *m = NULL;
   rc = tf__manifest_accept(r.body, r.body_n, o.check_build ? o.revision : NULL, o.want_version,
                            o.trusted_key_hex ? o.trusted_key_hex : TF_QURANLAB_KEY_HEX, 0, &m, NULL, NULL, NULL);

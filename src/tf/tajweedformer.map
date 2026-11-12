@@ -32,7 +32,6 @@
     tf_model_close;
     tf_model_id;
     tf_model_info_json;
-    tf_model_open;
     tf_model_reference;
     tf_model_sample_clip;
     tf_model_sample_clip_count;

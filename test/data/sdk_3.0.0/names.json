@@ -185,7 +185,7 @@
   "backend_apple": [
    "auto",
    "cpu",
-   "coreml"
+   "coreml-compact"
   ],
   "pace": [
    "realTime",

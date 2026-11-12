@@ -1,4 +1,4 @@
-# The C API: `tajweedformer.h` (SDK 3.0.1)
+# The C API: `tajweedformer.h` (SDK 3.1.0)
 
 One library for Windows and Linux apps and for servers: `tajweedformer.dll` / `libtajweedformer.so` (or the static
 library) and one header, `include/tajweedformer.h`. It includes nothing but `<stddef.h>` and names no engine type.
@@ -18,7 +18,7 @@ Five things, with the same names and the same order of calls as the Android, App
 
 Every options struct (`TfClientOptions`, `TfModelOptions`, `TfPrefetchOptions`, `TfSessionOptions`) may be NULL or
 zeroed: zero is the default of every field. Strings and arrays returned as `const` belong to the object they came
-from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"3.0.1"`.
+from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"3.1.0"`.
 
 ## Errors
 
@@ -106,13 +106,20 @@ by callback, none waits) and `connection` (always `"unknown"` here). No audio, t
 ## Model
 
 ```c
-TfModel *model = tf_client_model(client, NULL);              /* or tf_model_open("models/sdk/v4.0", NULL) */
+TfModel *model = tf_client_model(client, NULL);
 printf("%s %s, %d ms chunks\n", tf_model_id(model), tf_model_version(model), tf_model_chunk_ms(model, NULL));
 ```
 
-`tf_model_open(folder, options)` opens a folder already on disk, verified the same way: the Ed25519 signature of
-the manifest by Quran Lab's key, then the size and SHA-256 of every file it reads; a file the manifest does not
-list is never opened. `tf_model_close` releases it.
+A Model comes from `tf_client_model` and from nowhere else: from Quran Lab's server, through the Client (the
+Ed25519 signature of the manifest by Quran Lab's key, then the size and SHA-256 of every file it reads; a file the
+manifest does not list is never opened). Since 3.1.0 no call opens a model folder the app supplies, and the Client
+opens only a build it downloaded itself: a folder put into its storage by anything else is deleted and
+downloaded. When Quran Lab refuses the key or the app (a revoked key, a paused or blocked app), the SDK stops
+running the model and removes the downloaded model from the device: every build in the Client's storage folder
+with its download record, and nothing else in that folder. `tf_client_model` and `tf_client_prefetch` then fail
+with `invalid_key`, or with `server_rejected` and that refusal's message and fix, until a later answer accepts
+the key; once the key is accepted again the model is downloaded again. A Model that is already open keeps
+running until it is closed, and its files are removed when it is closed, or at the next start. `tf_model_close` releases it.
 
 | Call | Gives |
 | - | - |
@@ -319,18 +326,19 @@ How the SDK talks to Quran Lab, what it sends and when: [platform-client.md](pla
 ## Command line and server tier
 
 ```sh
-tajweedformer info     <folder>
-tajweedformer decode   <folder> clip.wav [--context c24_l72] [--heads all] [--top-k 5] [--frames] [--values] [--end-on-silence 1500]
-tajweedformer serve    <folder>                      # JSON lines in: {"audio": "<path>"}; one result line each
-tajweedformer bench    <folder> list.txt --workers 8  # N worker processes, one take each
-tajweedformer download --key qlk_v1_... --app-id com.example.app --storage DIR [--version 4.0.0]
-tajweedformer diagnose --key qlk_v1_... --app-id com.example.app --storage DIR
+# every command: --key qlk_v1_... --app-id com.example.app --storage DIR   (a Client, as in an app)
+tajweedformer info
+tajweedformer decode   clip.wav [--context c24_l72] [--heads all] [--top-k 5] [--frames] [--values] [--end-on-silence 1500]
+tajweedformer serve                                  # JSON lines in: {"audio": "<path>"}; one result line each
+tajweedformer download [--version 4.0.0]
+tajweedformer diagnose
 ```
 
 A decode line holds the audio's length, the compute time, the chunks, each head (`--values` adds its numbers), the
 greedy tokens of every ctc head and the decoded layer (`--frames` adds the frames). Audio is WAV (PCM 16-bit or
 float 32-bit, the first channel, 8 to 48 kHz) or raw float32 at 16 kHz. `serve` handles one take at a time; a
-server scales with worker processes, as `bench` does. The tool uses only the public header.
+server scales with processes, each with its own storage folder. The tool uses only the public header and gets
+its model through a Client, as an app does (since 3.1.0 it opens no folder, and `bench` is gone with that).
 
 ## Tests
 

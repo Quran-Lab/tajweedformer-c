@@ -672,6 +672,7 @@ void tf_model_close(TfModel *m) {
   if (!m) return;
   /* a Model the Client gave out more than once stays open until its last holder closes it */
   if (m->client && tf__client_model_release(m->client, m)) return;
+  TfClient *const client = m->client;
   engine_close(m);
   tf__reference_release(&m->ref);
   tf_json_free(m->manifest);
@@ -683,6 +684,8 @@ void tf_model_close(TfModel *m) {
   free(m->folder_path);
   free(m->info_json);
   free(m);
+  /* SPEC 15.3: a refusal arrived while this Model was open: its files go now */
+  if (client) tf__client_purge_models(client);
 }
 
 static char *dup_s(const char *s) {
@@ -825,7 +828,7 @@ fail:
   return NULL;
 }
 
-TfModel *tf_model_open(const char *folder, const TfModelOptions *options) {
+TfModel *tf__model_open_folder(const char *folder, const TfModelOptions *options, const char *trusted_key_hex) {
   TfModelOpen o;
   memset(&o, 0, sizeof o);
   if (tf__runtime_check()) {
@@ -839,8 +842,8 @@ TfModel *tf_model_open(const char *folder, const TfModelOptions *options) {
     }
     o.threads = options->threads;
     o.pin = options->pin;
-    o.trusted_key_hex = options->trusted_key_hex;
   }
+  o.trusted_key_hex = trusted_key_hex;
   return tf__model_open(folder, &o);
 }
 

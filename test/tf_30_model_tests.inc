@@ -138,6 +138,10 @@ static struct {
   int progress_calls, progress_bad;
   int log_lines;
   char log_last[256];
+  /* SDK 3.1.0 */
+  int no_headers;      /* model requests that did not carry both the key and the app token */
+  char record[1400];   /* the install record's path: looked at when the first model request arrives */
+  int record_first;    /* 1: the record was there, state downloading, before the first model request; 0: not; -1: not looked */
 } g_m30;
 static int m30_stub(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
   (void)u;
@@ -153,6 +157,22 @@ static int m30_stub(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
   rel += 10;
   if (!strcmp(rel, "manifest.json")) g_m30.manifest_requests++;
   else g_m30.file_requests++;
+  {
+    /* SPEC 15.4: the key and the app token on every model request */
+    int has_key = 0, has_token = 0;
+    for (const char *const *h = q->headers; h && *h; ++h) {
+      has_key |= !strcmp(*h, "x-qlab-key: qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa");
+      has_token |= !strncmp(*h, "authorization: Bearer qlt_v1.test", 33);
+    }
+    g_m30.no_headers += !(has_key && has_token);
+    /* SPEC 15.2: the record is written before the first byte of a build is asked for */
+    if (g_m30.record[0] && g_m30.record_first < 0) {
+      size_t rn = 0;
+      char *rec = read_text(g_m30.record, &rn);
+      g_m30.record_first = rec && rn > 12 && !strncmp(rec, "downloading ", 12);
+      free(rec);
+    }
+  }
   char *p = tf_path_join(g_m30.cdn, rel), *data = NULL;
   size_t n = 0;
   const int have = p && !tf_read_file(p, &data, &n);
@@ -202,10 +222,36 @@ static void m30_log(void *user, int level, const char *message) {
   g_m30.log_lines++;
   snprintf(g_m30.log_last, sizeof g_m30.log_last, "%s", message);
 }
+/* SDK 3.1.0: fills storage `b` in advance with the build that storage `a` downloaded, exactly as a real download
+ * leaves it (the build folder and current.json). how 0: no install record; 1: a's record, byte for byte, without
+ * a's key file (as on another machine: b makes its own key); 2: a record that is not this build's, under this
+ * build's name, with b's own key present. */
+static void m30_fill(const char *a, const char *b, const char *build, int how) {
+  char from[1400], to[1400];
+  size_t n = 0;
+  snprintf(from, sizeof from, "%s/models/%s", a, build);
+  snprintf(to, sizeof to, "%s/models/%s", b, build);
+  m30_copy(from, to, NULL);
+  snprintf(from, sizeof from, "%s/models/current.json", a);
+  snprintf(to, sizeof to, "%s/models/current.json", b);
+  char *t = read_text(from, &n);
+  if (t) tf_write_file(to, t, n);
+  free(t);
+  snprintf(to, sizeof to, "%s/models/%s.install", b, build);
+  if (how == 1) {
+    snprintf(from, sizeof from, "%s/models/%s.install", a, build);
+    t = read_text(from, &n);
+    if (t) tf_write_file(to, t, n);
+    free(t);
+  } else if (how == 2) {
+    uint8_t dk[32];
+    tf__install_key(b, 1, dk);
+    tf_write_file(to, "installed 0000000000000000000000000000000000000000000000000000000000000000\n", 75);
+  }
+}
 static TfClient *m30_client(const char *dir, int debug) {
   tf_mkdirs(dir);
-  TfClient *c = tf_client_create(&(TfClientOptions){.key = "qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa", .app_id = "org.example.Api", .app_version = "1.0", .storage = dir,
-                                                    .trusted_key_hex = tf_json_str(tf_json_get(g_ap.fx, "public_key_hex")), .debug = debug, .on_log = m30_log});
+  TfClient *c = tf__client_create_with_key(&(TfClientOptions){.key = "qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa", .app_id = "org.example.Api", .app_version = "1.0", .storage = dir, .debug = debug, .on_log = m30_log}, tf_json_str(tf_json_get(g_ap.fx, "public_key_hex")));
   if (!c) fprintf(stderr, "client: %s\n", tf_last_error());
   return c;
 }
@@ -216,13 +262,13 @@ static int model30_tests(const char *local, const char *key, const char *work, c
   snprintf(full, sizeof full, "%s/%s-decoded/sdk/v4.0", local, variant);
   snprintf(bare, sizeof bare, "%s/bare-decoded/sdk/v4.0", local);
   tf_mkdirs(work);
-  const TfModelOptions mo = {.trusted_key_hex = key};
+  
   static const char *const kContexts[] = {"c16_l64", "c8_l64", "c24_l72", "c24_l256"};
   static const int kChunkMs[] = {320, 160, 480, 480};
 
   /* ---- 1. the Model's data ---- */
-  CHECK(tf_model_open(full, NULL) == NULL && tf_last_error_code() == TF_ERR_SIGNATURE_INVALID, "a folder signed with a test key opened without that key");
-  TfModel *m = tf_model_open(full, &mo);
+  CHECK(tf__model_open_folder(full, NULL, NULL) == NULL && tf_last_error_code() == TF_ERR_SIGNATURE_INVALID, "a folder signed with a test key opened without that key");
+  TfModel *m = tf__model_open_folder(full, NULL, key);
   if (!m) {
     fprintf(stderr, "open %s: %s\n", full, tf_last_error());
     return 2;
@@ -579,7 +625,7 @@ static int model30_tests(const char *local, const char *key, const char *work, c
 
   /* ---- 6. a build without the data, a folder where it was not fetched, damaged folders ---- */
   {
-    TfModel *b = tf_model_open(bare, &mo);
+    TfModel *b = tf__model_open_folder(bare, NULL, key);
     TfCalibration cal;
     CHECK(b && tf_model_calibration_json(b) == NULL && tf_model_calibration(b, &cal) == 0 && cal.json == NULL && tf_model_reference(b) == NULL &&
               tf_last_error_code() == 0 && !strcmp(tf_model_version(b), "4.0.0") && strcmp(tf_model_build(b), g_m30.build),
@@ -595,7 +641,7 @@ static int model30_tests(const char *local, const char *key, const char *work, c
      * has nothing to fetch from */
     snprintf(d, sizeof d, "%s/noref", work);
     m30_copy(full, d, "expected_tj3.zfx");
-    b = tf_model_open(d, &mo);
+    b = tf__model_open_folder(d, NULL, key);
     TfReference *ref = b ? tf_model_reference(b) : NULL;
     TfUnits u;
     CHECK(b && ref && !tf_reference_is_downloaded(ref) && tf_reference_units(ref, 1, 1, &u) == TF_ERR_REFERENCE_MISSING &&
@@ -616,7 +662,7 @@ static int model30_tests(const char *local, const char *key, const char *work, c
       snprintf(d, sizeof d, "%s/damage%d", work, (int)i);
       m30_copy(full, d, "expected_tj3.zfx");
       m30_flip(d, damage[i].rel);
-      b = tf_model_open(d, &mo);
+      b = tf__model_open_folder(d, NULL, key);
       const int code = tf_last_error_code();
       const int good = !b && (damage[i].code ? code == damage[i].code : code == TF_ERR_SIGNATURE_INVALID || code == TF_ERR_MODEL_INVALID) &&
                        (code != TF_ERR_CHECKSUM_MISMATCH || strstr(tf_last_error(), damage[i].rel));
@@ -628,7 +674,7 @@ static int model30_tests(const char *local, const char *key, const char *work, c
     remove(d);
     snprintf(d, sizeof d, "%s/damage0", work);
     m30_flip(d, "c16_l64/frames.zfw"); /* back as it was */
-    b = tf_model_open(d, &mo);
+    b = tf__model_open_folder(d, NULL, key);
     CHECK(!b && tf_last_error_code() == TF_ERR_MODEL_MISSING && strstr(tf_last_error(), "layers.zfw"), "a listed file that is gone: %s", tf_error_name(tf_last_error_code()));
     tf_model_close(b);
     tf__clear_error();
@@ -851,6 +897,235 @@ static int model30_tests(const char *local, const char *key, const char *work, c
               strstr(g_m30.log_last, "9.9.9"),
           "a pin that is unavailable: %s, %d log lines: %s", tf_error_name(tf_last_error_code()), g_m30.log_lines, g_m30.log_last);
     tf_client_destroy(c);
+    /* ---- 7b. SDK 3.1.0 (SPEC section 15): the Client opens only a build it downloaded itself, a refused Client
+     * does not run the model, and every model request carries the key and the app token ---- */
+    {
+      char a[1100], b[1100], to[1300], cur[1300];
+      g_ap.mode = 4;
+      g_ap.serve = "model";
+      /* a real download into storage A: the record is there before the first request, and says installed after */
+      snprintf(a, sizeof a, "%s/rec_a", work);
+      snprintf(g_m30.record, sizeof g_m30.record, "%s/models/%s.install", a, g_m30.build);
+      g_m30.record_first = -1;
+      g_m30.no_headers = 0;
+      c = m30_client(a, 0);
+      int before = g_m30.file_requests;
+      CHECK(c && tf_client_prefetch(c, NULL) == 0, "a download into a new storage: %s", tf_last_error() ? tf_last_error() : "");
+      const int full = g_m30.file_requests - before;
+      size_t rn = 0;
+      char *rtext = read_text(g_m30.record, &rn);
+      CHECK(g_m30.record_first == 1 && rtext && !strncmp(rtext, "installed ", 10) && rn == 10 + 64 + 1 && full > 5,
+            "the install record: there before the first model request %d, afterwards \"%.20s\", %d files fetched", g_m30.record_first, rtext ? rtext : "(none)", full);
+      free(rtext);
+      g_m30.record[0] = 0;
+      tf_client_destroy(c);
+      /* the next start: the build opens with no request for a file, and without a network too */
+      c = m30_client(a, 0);
+      before = g_m30.file_requests;
+      cm = c ? tf_client_model(c, NULL) : NULL;
+      CHECK(cm && g_m30.file_requests == before, "the next start after a real download: %s, %d files fetched", cm ? "opened" : tf_error_name(tf_last_error_code()),
+            g_m30.file_requests - before);
+      tf_model_close(cm);
+      tf_client_destroy(c);
+      g_ap.mode = 0;
+      c = m30_client(a, 0);
+      cm = c ? tf_client_model(c, NULL) : NULL;
+      CHECK(cm != NULL, "the next start without a network after a real download: %s", tf_error_name(tf_last_error_code()));
+      tf_model_close(cm);
+      tf_client_destroy(c);
+      g_ap.mode = 4;
+
+      /* storage filled in advance, exactly as a real download leaves it (the build folder and current.json), in three
+       * ways: no record; the record of the other storage without its key (as on another machine); a record of
+       * another build under this build's name. None is opened: the folder goes and the build is downloaded. */
+      static const char *const kFill[] = {"no record", "a record made with another key", "the record of another build"};
+      for (int k = 0; k < 3; ++k) {
+#ifndef _WIN32
+        if (k == 1) continue; /* on Linux the key is the machine's and the user's: a record of the same machine is this machine's own */
+#endif
+        snprintf(b, sizeof b, "%s/rec_b%d", work, k);
+        snprintf(to, sizeof to, "%s/models/%s", b, g_m30.build);
+        snprintf(cur, sizeof cur, "%s/models/current.json", b);
+        m30_fill(a, b, g_m30.build, k);
+        /* without a network nothing is opened, and the folder is gone */
+        g_ap.mode = 0;
+        c = m30_client(b, 0);
+        char mf[1500];
+        snprintf(mf, sizeof mf, "%s/manifest.json", to);
+        cm = c ? tf_client_model(c, NULL) : NULL;
+        CHECK(!cm && tf_last_error_code() == TF_ERR_NEEDS_CONNECTION && !tf_file_exists(mf) && !tf_file_exists(cur),
+              "a storage filled in advance (%s), no network: %s, the folder %s", kFill[k], cm ? "OPENED" : tf_error_name(tf_last_error_code()),
+              tf_file_exists(mf) ? "is still there" : "is gone");
+        tf_model_close(cm);
+        tf_client_destroy(c);
+        /* with one: the whole build is downloaded, nothing of the copy reused */
+        m30_fill(a, b, g_m30.build, k);
+        g_ap.mode = 4;
+        c = m30_client(b, 0);
+        before = g_m30.file_requests;
+        cm = c ? tf_client_model(c, NULL) : NULL;
+        CHECK(cm && g_m30.file_requests - before == full, "a storage filled in advance (%s): %s, %d files fetched, a whole download is %d", kFill[k],
+              cm ? "opened after a download" : tf_error_name(tf_last_error_code()), g_m30.file_requests - before, full);
+        tf_model_close(cm);
+        tf_client_destroy(c);
+      }
+
+      /* the key store: "there is no key" makes every record invalid (the build is downloaded again); a store that
+       * fails is not "no key": nothing is opened, nothing deleted, nothing downloaded, and the next call works */
+      c = m30_client(a, 0);
+      before = g_m30.file_requests;
+      int mbefore = g_m30.manifest_requests;
+      tf__install_key_test = -1;
+      cm = c ? tf_client_model(c, NULL) : NULL;
+      snprintf(to, sizeof to, "%s/models/%s/manifest.json", a, g_m30.build);
+      CHECK(!cm && tf_last_error_code() == TF_ERR_STORAGE_FAILED && tf_file_exists(to) && g_m30.file_requests == before && g_m30.manifest_requests == mbefore,
+            "the key store fails: %s, the model %s, %d model requests", cm ? "OPENED" : tf_error_name(tf_last_error_code()), tf_file_exists(to) ? "is still there" : "WAS DELETED",
+            g_m30.file_requests - before + g_m30.manifest_requests - mbefore);
+      tf_model_close(cm);
+      tf__install_key_test = 0;
+      cm = c ? tf_client_model(c, NULL) : NULL;
+      CHECK(cm && g_m30.file_requests == before, "after the key store works again: %s, %d files fetched", cm ? "opened" : tf_error_name(tf_last_error_code()),
+            g_m30.file_requests - before);
+      tf_model_close(cm);
+      tf__install_key_test = 1;
+      cm = c ? tf_client_model(c, NULL) : NULL;
+      CHECK(cm && g_m30.file_requests - before == full, "the key store has no key: %s, %d files fetched, a whole download is %d",
+            cm ? "opened after a download" : tf_error_name(tf_last_error_code()), g_m30.file_requests - before, full);
+      tf_model_close(cm);
+      tf__install_key_test = 0;
+      tf_client_destroy(c);
+
+      /* a refused Client with a model from a real download on this device (SPEC 15.3, contract 1.10.0): a reason
+       * of the list stops it AND removes it. When the call returns the storage holds no model file, no install
+       * record and no current.json; the remembered refusal and the device key are still there. */
+      char amf[1500], arec[1500], acur[1500], amodels[1300], astate[1300], akey[1300], b0[1100];
+      snprintf(amodels, sizeof amodels, "%s/models", a);
+      snprintf(amf, sizeof amf, "%s/models/%s/manifest.json", a, g_m30.build);
+      snprintf(arec, sizeof arec, "%s/models/%s.install", a, g_m30.build);
+      snprintf(acur, sizeof acur, "%s/models/current.json", a);
+      snprintf(astate, sizeof astate, "%s/client.json", a);
+      snprintf(akey, sizeof akey, "%s/install.key", a);
+      snprintf(b0, sizeof b0, "%s/rec_b0", work);
+      char (*left)[256] = (char (*)[256])malloc(8 * 256);
+      const int had_key = tf_file_exists(akey); /* Windows, and a Linux machine without a machine id */
+      CHECK(tf_file_exists(amf) && tf_file_exists(arec) && tf_file_exists(acur), "before the refusal the downloaded model is on the device");
+      g_ap.mode = 5;
+      g_ap.raw_status = 403;
+      g_ap.raw_body = "{\"error\":\"app_blocked\",\"message\":\"This app is not served.\",\"reason\":\"app_blocked\"}";
+      c = m30_client(a, 0);
+      cm = c ? tf_client_model(c, NULL) : NULL;
+      CHECK(!cm && tf_last_error_code() == TF_ERR_SERVER_REJECTED && strstr(tf_last_error(), "(app_blocked)"), "app_blocked with a model on disk: %s (%s)",
+            cm ? "THE MODEL RAN" : tf_error_name(tf_last_error_code()), tf_last_error() ? tf_last_error() : "");
+      int nleft = left ? tf__list_dir(amodels, left, 8) : -1;
+      size_t sn = 0;
+      char *stext = read_text(astate, &sn);
+      CHECK(nleft <= 0 && !tf_file_exists(amf) && !tf_file_exists(arec) && !tf_file_exists(acur), "app_blocked with a model on disk: %d entries are left under models/ (%s)",
+            nleft, nleft > 0 ? left[0] : "");
+      CHECK(stext && strstr(stext, "\"refused\":\"app_blocked\"") && strstr(stext, "\"remove_models\":false") && tf_file_exists(akey) == had_key,
+            "after the removal the remembered refusal and the device key are there: %s, key file %d (before: %d)", stext ? stext : "(no state)", tf_file_exists(akey), had_key);
+      free(stext);
+      tf_model_close(cm);
+      tf_client_destroy(c);
+      /* the next start, without a network, with the model put back by hand (the folder and current.json of
+       * another storage's real download): removed at the start, before any call, and the call is the refusal */
+      m30_fill(b0, a, g_m30.build, 0);
+      CHECK(tf_file_exists(amf) && tf_file_exists(acur), "the model put back by hand");
+      g_ap.mode = 0;
+      c = m30_client(a, 0);
+      nleft = left ? tf__list_dir(amodels, left, 8) : -1;
+      CHECK(c && nleft <= 0 && !tf_file_exists(amf), "a start with a remembered refusal and a model put back by hand: %d entries are left under models/", nleft);
+      cm = c ? tf_client_model(c, NULL) : NULL;
+      CHECK(!cm && tf_last_error_code() == TF_ERR_SERVER_REJECTED, "the next start without a network after app_blocked: %s",
+            cm ? "THE MODEL RAN" : tf_error_name(tf_last_error_code()));
+      tf_model_close(cm);
+      tf_client_destroy(c);
+      g_ap.mode = 5;
+      g_ap.raw_status = 401;
+      g_ap.raw_body = "{\"error\":\"invalid_key\",\"message\":\"This key is not valid.\",\"reason\":\"key_revoked\"}";
+      c = m30_client(a, 0);
+      cm = c ? tf_client_model(c, NULL) : NULL;
+      CHECK(!cm && tf_last_error_code() == TF_ERR_INVALID_KEY, "a revoked key with a model on disk: %s", cm ? "THE MODEL RAN" : tf_error_name(tf_last_error_code()));
+      tf_model_close(cm);
+      tf_client_destroy(c);
+      /* an answer that accepts the key: the device holds no model, so the build is downloaded as on a first
+       * install, every file of it (1.8.0 let it run again without a download: no longer) */
+      g_ap.mode = 4;
+      c = m30_client(a, 0);
+      before = g_m30.file_requests;
+      cm = c ? tf_client_model(c, NULL) : NULL;
+      CHECK(cm && g_m30.file_requests - before == full && tf_file_exists(amf) && tf_file_exists(arec),
+            "after an answer that accepts the key: %s, %d files fetched, a whole download is %d", cm ? "the model runs" : tf_error_name(tf_last_error_code()),
+            g_m30.file_requests - before, full);
+      /* a Model that is open when the refusal arrives keeps running, with its files, until the app closes it;
+       * then the files go (owed until then: remove_models is true in the state) */
+      g_ap.mode = 5;
+      g_ap.raw_status = 401;
+      g_ap.raw_body = "{\"error\":\"invalid_key\",\"message\":\"This key is not valid.\",\"reason\":\"key_revoked\"}";
+      CHECK(cm && tf_client_prefetch(c, NULL) == TF_ERR_INVALID_KEY && !strcmp(tf__client_gate(c), "key_revoked"), "a refusal while a Model is open: %s, remembered \"%s\"",
+            tf_error_name(tf_last_error_code()), c ? tf__client_gate(c) : "");
+      stext = read_text(astate, &sn);
+      CHECK(tf_file_exists(amf) && tf_file_exists(arec) && stext && strstr(stext, "\"remove_models\":true"), "while the Model is open its files stay and the removal is owed: %s",
+            stext ? stext : "(no state)");
+      free(stext);
+      {
+        static const float still[1600];
+        TfSession *os = cm ? tf_session_create(cm, NULL) : NULL;
+        int pushed = 0;
+        for (int i = 0; os && i < 20; ++i) pushed += tf_session_push(os, still, 1600) >= 0;
+        CHECK(os && pushed == 20 && tf_session_finish(os) >= 0, "the open Model after the refusal: a take of 2 s, %d of 20 pushes taken (%s)", pushed,
+              tf_last_error() ? tf_last_error() : "");
+        tf_session_destroy(os);
+      }
+      tf_model_close(cm);
+      nleft = left ? tf__list_dir(amodels, left, 8) : -1;
+      stext = read_text(astate, &sn);
+      CHECK(nleft <= 0 && !tf_file_exists(amf) && !tf_file_exists(arec) && stext && strstr(stext, "\"remove_models\":false") &&
+                strstr(stext, "\"refused\":\"key_revoked\""),
+            "once the Model is closed its files are gone: %d entries are left under models/, state %s", nleft, stext ? stext : "(none)");
+      free(stext);
+      tf_client_destroy(c);
+      /* accepted again: a whole download once more, for the answers below */
+      g_ap.mode = 4;
+      c = m30_client(a, 0);
+      before = g_m30.file_requests;
+      cm = c ? tf_client_model(c, NULL) : NULL;
+      CHECK(cm && g_m30.file_requests - before == full, "accepted again after the second refusal: %s, %d files fetched", cm ? "the model runs" : tf_error_name(tf_last_error_code()),
+            g_m30.file_requests - before);
+      tf_model_close(cm);
+      tf_client_destroy(c);
+      free(left);
+      /* an answer without a reason never stops a model that is here: a bare 401, the same 403 without its reason,
+       * the floor's answer, a network Quran Lab does not serve */
+      static const struct {
+        int status;
+        const char *body, *what;
+      } soft[] = {{401, "{\"error\":\"invalid_key\",\"message\":\"unknown key\"}", "401 invalid_key without a reason"},
+                  {403, "{\"error\":\"app_blocked\",\"message\":\"refused\"}", "403 app_blocked without a reason"},
+                  {403, "{\"error\":\"sdk_too_old\",\"message\":\"newer\",\"min_sdk\":\"3.2.0\"}", "403 sdk_too_old"},
+                  {503, "{\"error\":\"network_blocked\",\"message\":\"not served\",\"retry_after\":3600}", "503 network_blocked"}};
+      for (int k = 0; k < 4; ++k) {
+        g_ap.mode = 5;
+        g_ap.raw_status = soft[k].status;
+        g_ap.raw_body = soft[k].body;
+        c = m30_client(a, 0);
+        before = g_m30.file_requests;
+        cm = c ? tf_client_model(c, NULL) : NULL;
+        CHECK(cm && !*tf__client_gate(c) && g_m30.file_requests == before && tf_file_exists(amf) && tf_file_exists(arec),
+              "%s with a model on disk: %s, remembered \"%s\", %d files fetched (an answer that is no stop removes nothing)", soft[k].what,
+              cm ? "the model runs" : tf_error_name(tf_last_error_code()), c ? tf__client_gate(c) : "", g_m30.file_requests - before);
+        tf_model_close(cm);
+        tf_client_destroy(c);
+      }
+      g_ap.raw_body = NULL;
+      g_ap.mode = 4;
+      CHECK(g_m30.no_headers == 0, "%d model requests did not carry both the key and the app token", g_m30.no_headers);
+      printf("client 3.1.0: the install record (written before the first request, %d files in a whole download); a storage filled in advance is not opened and is "
+             "downloaded, in 3 ways; the key store's two failures; a refusal with a model on disk stops it and removes it (no file, no record; the refusal "
+             "and the device key stay), a model put back by hand goes at the next start without a network, an accepting answer downloads every file "
+             "again, a Model open at the refusal ran a take and its files went at its close; 4 answers without a reason stop nothing and remove "
+             "nothing; every model request carried the key and the token\n",
+             full);
+    }
     tf__model_key_override = NULL;
     tf_http_set_transport(NULL, NULL);
     tf__now_override = 0;

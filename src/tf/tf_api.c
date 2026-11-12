@@ -21,6 +21,7 @@ typedef struct {
   TfThread launch;
   int launch_on;
   TfModel *model;      /* the Model tf_client_model gave out, while it is open */
+  int orphan;          /* a Model outlived this Client (tf_client_destroy with it open): its files are not removed here */
   int refs;
   char *storage_json, *diag_json, *items_json;
   char d_version[24], d_build[41], d_context[32], d_reason[48], d_latest[24];
@@ -35,6 +36,34 @@ static void spin_lock(void) {
 static void spin_unlock(void) { __atomic_clear(&g_client_lock, __ATOMIC_RELEASE); }
 
 static Api *api(TfClient *c) { return c ? (Api *)*tf__client_api_slot(c) : NULL; }
+
+/* The Api's lock, with a count of how often this thread holds it: a refusal that arrives inside tf_client_model
+ * or tf_client_prefetch (which hold it over their requests) removes the models without taking it again. */
+static _Thread_local int t_api_held;
+static void api_lock(Api *a) {
+  tf_mutex_lock(&a->lock);
+  t_api_held++;
+}
+static void api_unlock(Api *a) {
+  t_api_held--;
+  tf_mutex_unlock(&a->lock);
+}
+
+/* SPEC 15.3: the server refused the key or the app, so the models leave this device. Now,
+ * when no Model is open; else the removal is owed: tf_model_close comes here again once the Model is closed,
+ * and the next start removes what is left before anything else. A Model that is open keeps running. */
+void tf__client_purge_models(TfClient *c) {
+  if (!c || (!*tf__client_gate(c) && !tf__client_purge_owed(c))) return;
+  Api *a = api(c);
+  if (!a) {
+    tf__store_purge(c);
+    return;
+  }
+  const int held = t_api_held > 0;
+  if (!held) api_lock(a);
+  if (!a->model && !a->orphan) tf__store_purge(c);
+  if (!held) api_unlock(a);
+}
 
 /* the catalogue code of a failure, remembered on the client for the diagnosis */
 static int fail(TfClient *c, int rc) {
@@ -72,6 +101,9 @@ static char *default_storage(const char *app_id) {
   free(a);
   return b;
 }
+
+/* NULL in every app: Quran Lab's key. tf__client_create_with_key sets it for one call (tests). */
+static _Thread_local const char *t_create_key;
 
 TfClient *tf_client_create(const TfClientOptions *options) {
   tf__clear_error();
@@ -115,7 +147,7 @@ TfClient *tf_client_create(const TfClientOptions *options) {
   cfg.debug_build = options->debug;
   cfg.on_log = options->on_log;
   cfg.log_user = options->user;
-  cfg.trusted_key_hex = options->trusted_key_hex;
+  cfg.trusted_key_hex = t_create_key;
   TfClient *c = NULL;
   Api *a = (Api *)calloc(1, sizeof *a);
   if (!cfg.storage_dir) tf__fail(TF_ERR_STORAGE_FAILED, "no storage folder was given and this user has no data folder");
@@ -147,10 +179,13 @@ void tf_client_destroy(TfClient *c) {
     /* the launch thread may be inside a request: it is abandoned, not waited for */
     tf__client_cancel_calls(c, 1);
     if (a->launch_on) tf_thread_join(a->launch);
-    tf_mutex_lock(&a->lock);
-    if (a->model) tf__model_detach(a->model); /* a Model that outlives its Client keeps running, alone */
+    api_lock(a);
+    if (a->model) {
+      tf__model_detach(a->model); /* a Model that outlives its Client keeps running, alone */
+      a->orphan = 1;
+    }
     a->model = NULL;
-    tf_mutex_unlock(&a->lock);
+    api_unlock(a);
   }
   tf__client_close(c); /* stops the timer, sends what was counted, frees */
   if (a) {
@@ -169,14 +204,22 @@ void tf_client_destroy(TfClient *c) {
 int tf__client_model_release(TfClient *c, TfModel *m) {
   Api *a = api(c);
   if (!a) return 0;
-  tf_mutex_lock(&a->lock);
+  api_lock(a);
   int keep = 0;
   if (a->model == m) {
     if (--a->refs > 0) keep = 1;
     else a->model = NULL;
   }
-  tf_mutex_unlock(&a->lock);
+  api_unlock(a);
   return keep;
+}
+
+/* tests only: the key tf_client_create gives the client for the signed config and the manifest */
+TfClient *tf__client_create_with_key(const TfClientOptions *options, const char *trusted_key_hex) {
+  t_create_key = trusted_key_hex;
+  TfClient *c = tf_client_create(options);
+  t_create_key = NULL;
+  return c;
 }
 
 TfModel *tf_client_model(TfClient *c, const TfModelOptions *options) {
@@ -186,12 +229,12 @@ TfModel *tf_client_model(TfClient *c, const TfModelOptions *options) {
     return NULL;
   }
   tf__clear_error();
-  tf_mutex_lock(&a->lock);
+  api_lock(a);
   if (a->model) {
     /* the Model is open already: the same one, held once more */
     a->refs++;
     TfModel *m = a->model;
-    tf_mutex_unlock(&a->lock);
+    api_unlock(a);
     return m;
   }
   TfFetch f;
@@ -205,7 +248,6 @@ TfModel *tf_client_model(TfClient *c, const TfModelOptions *options) {
     if (options) {
       open.threads = options->threads;
       open.pin = options->pin;
-      if (options->trusted_key_hex) open.trusted_key_hex = options->trusted_key_hex;
     }
     m = tf__model_open(dir, &open);
   }
@@ -216,7 +258,7 @@ TfModel *tf_client_model(TfClient *c, const TfModelOptions *options) {
   } else {
     fail(c, -1);
   }
-  tf_mutex_unlock(&a->lock);
+  api_unlock(a);
   return m;
 }
 
@@ -233,9 +275,9 @@ int tf_client_prefetch(TfClient *c, const TfPrefetchOptions *options) {
     f.user = options->user;
   }
   char dir[1024];
-  tf_mutex_lock(&a->lock);
+  api_lock(a);
   const int rc = tf__store_fetch(c, &f, dir, sizeof dir, NULL);
-  tf_mutex_unlock(&a->lock);
+  api_unlock(a);
   return fail(c, rc);
 }
 
@@ -246,10 +288,10 @@ const char *tf_client_storage_json(TfClient *c) {
     tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
     return NULL;
   }
-  tf_mutex_lock(&a->lock);
+  api_lock(a);
   free(a->storage_json);
   a->storage_json = tf__store_json(c, NULL, NULL);
-  tf_mutex_unlock(&a->lock);
+  api_unlock(a);
   return a->storage_json;
 }
 
@@ -257,9 +299,9 @@ int tf_client_remove_models(TfClient *c) {
   tf__clear_error();
   Api *a = api(c);
   if (!a) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
-  tf_mutex_lock(&a->lock);
+  api_lock(a);
   const int rc = a->model ? tf__fail(TF_ERR_STORAGE_FAILED, "a Model of these files is open: close it first") : tf__store_remove(c);
-  tf_mutex_unlock(&a->lock);
+  api_unlock(a);
   return fail(c, rc);
 }
 
@@ -308,7 +350,7 @@ int tf_client_diagnose(TfClient *c, TfDiagnosis *out) {
   /* the key: one request when this client has not heard from the server yet */
   if (strcmp(tf__client_config_state(c), "fresh") && !tf__client_stopped(c)) tf__client_refresh_config(c);
   tf__clear_error();
-  tf_mutex_lock(&a->lock);
+  api_lock(a);
   out->sdk_version = TF_SDK_VERSION;
   tf__client_check_latest(c);
   if (tf__client_latest(c)) {
@@ -400,7 +442,7 @@ int tf_client_diagnose(TfClient *c, TfDiagnosis *out) {
   free(a->diag_json);
   a->diag_json = tf_buf_take(&b);
   out->json = a->diag_json;
-  tf_mutex_unlock(&a->lock);
+  api_unlock(a);
   return 0;
 }
 
@@ -419,10 +461,10 @@ const char *tf_sharing_items_json(TfClient *c) {
     return NULL;
   }
   char *items = tf__sharing_outbox_json(c);
-  tf_mutex_lock(&a->lock);
+  api_lock(a);
   free(a->items_json);
   a->items_json = items;
-  tf_mutex_unlock(&a->lock);
+  api_unlock(a);
   if (!items) tf__error_as(TF_ERR_STORAGE_FAILED);
   return items;
 }
