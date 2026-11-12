@@ -675,6 +675,7 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
   CHECK(rec.calls == 1 && tf__client_sharing_state(c) == 1 && !strcmp(tf__sharing_consent_version(c), custom2), "a restart under the new wording: %d calls",
         rec.calls);
   CHECK(tf__sharing_outbox_pending(c) == 1, "the session recorded under the older custom version survived the restart");
+  int deleted = 0;
   {
     char *text = NULL;
     size_t n;
@@ -686,12 +687,20 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
       CHECK(tf__client_sharing_recovery_code(c, code) == 0, "a contributor exists");
       CHECK(tf__client_sharing_delete(c) == 0, "delete under an older custom version: %s", tf_last_error() ? tf_last_error() : "");
       CHECK(tf__client_sharing_recovery_code(c, code) != 0 && tf__sharing_outbox_pending(c) == 0, "the contributor or the queue survived the deletion");
+      deleted = 1;
       tf_http_set_transport(NULL, NULL);
       tf_json_free(g_rp.fx);
       g_rp.fx = NULL;
     }
   }
-  CHECK(tf__client_sharing_state(c) == 1 && rec.calls == 1, "deletion changed the grant or asked");
+  /* 3.0.1: a deletion the server took turns sharing off, as the settings switch does, and nobody is asked again;
+   * the learner turns it on again with the switch */
+  CHECK(deleted && tf__client_sharing_state(c) == 0 && status_has(c, "\"consent\":\"final\"") && status_has(c, "\"pendingAsk\":false") && rec.calls == 1,
+        "an accepted deletion left sharing on, or asked: %s", tf__client_sharing_status_json(c));
+  for (int i = 0; i < 30; ++i) feedback_session(c);
+  CHECK(tf__client_sharing_ask_now(c) == 0 && rec.calls == 1 && tf__client_sharing_state(c) == 0, "asked after the deletion: %d calls", rec.calls);
+  tf__client_sharing_set(c, 1);
+  CHECK(tf__client_sharing_state(c) == 1 && rec.calls == 1, "the switch after a deletion: %s", tf__client_sharing_status_json(c));
   /* withdrawal: never asked again; the settings switch records the version in force then */
   tf__client_sharing_set(c, 0);
   for (int i = 0; i < 30; ++i) feedback_session(c);
@@ -1015,7 +1024,7 @@ static int telemetry_tests(const char *dir) {
   CHECK(tf__client_background(c) == 0 && events_seen() == 1, "503: %d events", events_seen());
   TfJson *b0 = event_body(0);
   CHECK(b0 && is_hex32(tf_json_str(tf_json_get(b0, "report_id"))) && jnum(b0, "launches") == 1 && !strcmp(tf_json_str(tf_json_get(b0, "day")), "2026-11-09") &&
-            !strcmp(tf_json_str(tf_json_get(b0, "sdk_version")), "3.0.0") && tf_json_get(b0, "cohorts") && tf_json_get(b0, "cohorts")->n == 0,
+            !strcmp(tf_json_str(tf_json_get(b0, "sdk_version")), TF_SDK_VERSION) && tf_json_get(b0, "cohorts") && tf_json_get(b0, "cohorts")->n == 0,
         "the launch delta: %s", g_ts.bodies[0] ? g_ts.bodies[0] : "NULL");
   CHECK(count_files(d, "report-") == 1, "the delta is kept on disk");
   tf__client_background(c);
@@ -1247,7 +1256,7 @@ static int sdk_latest_tests(const char *configs, const char *dir) {
   if (!g_sl.fx) return 2;
   tf_mkdirs(dir);
   tf_http_set_transport(sl_stub, NULL);
-  static const char want[] = "Quran Lab SDK 3.0.1 is available (recommended), you have 3.0.0: https://github.com/Quran-Lab/tajweedformer-c/releases";
+  static const char want[] = "Quran Lab SDK 3.0.2 is available (recommended), you have " TF_SDK_VERSION ": https://github.com/Quran-Lab/tajweedformer-c/releases";
   char d[1100];
   /* newer: one line at launch; a second newer config (a refresh) adds none */
   snprintf(d, sizeof d, "%s/newer", dir);

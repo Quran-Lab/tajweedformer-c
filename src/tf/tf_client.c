@@ -29,6 +29,8 @@ void tf__sharing_init(TfClient *c);
 void tf__sharing_free(TfClient *c);
 void tf__share_init(TfClient *c);
 void tf__share_free(TfClient *c);
+void tf__share_cancel(TfClient *c);
+void tf__share_sweep(TfClient *c);
 void tf__share_background(TfClient *c);
 void tf__share_window_check(TfClient *c);
 int tf__sharing_outbox_resume(TfClient *c);
@@ -228,6 +230,12 @@ static int classify_stop(TfClient *c, const TfHttpResponse *r) {
 
 static int ensure_token(TfClient *c);
 
+/* 3.0.1: a thread may name its own abort flag for the calls it makes (the sharing uploader does: turning sharing
+ * off aborts its request in flight, whichever it is, without touching the client's other calls). Without one a
+ * call carries the client's flag, as before. */
+static _Thread_local volatile int *t_cancel;
+void tf__client_thread_cancel(volatile int *flag) { t_cancel = flag; }
+
 static int call_locked(TfClient *c, const Call *k, TfHttpResponse *r);
 static int call(TfClient *c, const Call *k, TfHttpResponse *r) {
   tf_mutex_lock(&c->lock);
@@ -258,7 +266,7 @@ static int call_locked(TfClient *c, const Call *k, TfHttpResponse *r) {
     q.body = k->body;
     q.body_n = k->body ? strlen(k->body) : 0;
     q.timeout_s = 30;
-    q.cancel = &c->cancel;
+    q.cancel = t_cancel ? t_cancel : &c->cancel;
     if (tf_http(&q, r)) return tf__error_code() ? tf__error_code() : TF__ERR_NETWORK;
     if (r->status == 401 && k->auth && attempt == 0 && r->body && strstr(r->body, "invalid_token")) {
       c->token[0] = 0;
@@ -411,6 +419,7 @@ TfClient *tf__client_open(const TfClientConfig *opt) {
   save_state(c);
   tf__sharing_init(c);
   tf__share_init(c);
+  tf__share_sweep(c); /* 3.0.1: recordings an earlier run's stop left behind (the process died, a file was in use) */
   /* telemetry: opening a client is a launch; the 15 minutes run from here */
   c->last_seal = now_unix();
   tf__telemetry_add(c, "launches", 1);
@@ -421,8 +430,12 @@ static void timer_stop(TfClient *c);
 static int telemetry_send_point(TfClient *c);
 
 void tf__client_cancel_calls(TfClient *c, int on) {
-  if (on) tf__http_cancel(&c->cancel);
-  else c->cancel = 0;
+  if (on) {
+    tf__http_cancel(&c->cancel);
+    tf__share_cancel(c); /* the uploader's calls carry its own flag (3.0.1) */
+  } else {
+    c->cancel = 0;
+  }
 }
 
 void tf__client_close(TfClient *c) {

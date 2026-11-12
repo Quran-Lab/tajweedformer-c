@@ -104,6 +104,18 @@ typedef struct {
   long long decided_at;
   char consent_version[40];   /* the version the learner agreed to */
   char consent_hash[65];      /* with the app's own wording: the SHA-256 of the text agreed to */
+  /* 3.0.1: how often the learner changed their mind (sharing turned off, a deletion the server took, sharing
+   * turned on). It is written with the consent, in the same write, and every recording carries the count it was
+   * begun under (the file `stamp` in its folder). A recording with another count than the one in force was begun
+   * before a stop: it is never uploaded and is deleted at the next upload pass or launch, also when the process
+   * died between the stop and its deletion, or the stop could not delete it. Under `lock`. */
+  int stamp;
+  /* A deletion is asking the server (under `lock`). While it is set the settings file is written as it will be
+   * when the server has taken the deletion: consent off and the count one higher. So the off is on disk before
+   * the server is asked, and a process that dies while it is asked, or between the server's answer and the
+   * device's deletes, starts with sharing off and deletes what is left. In memory nothing changes meanwhile:
+   * a deletion the server does not take changes nothing, and the file is then written back as it was. */
+  int deleting;
   /* the app's wording (tf_sharing_set_wording) and what follows from it */
   TfMutex lock;
   char **keys, **texts;
@@ -119,8 +131,8 @@ static char *state_path(const TfClient *c) { return tf_path_join(tf__client_dir(
 static void share_save(const TfClient *c, const Share *s) {
   TfBuf b;
   tf_buf_init(&b);
-  tf_buf_printf(&b, "{\"v\":1,\"consent\":\"%s\",\"asks\":%d,\"lastAskSession\":%d,\"sessions\":%d,\"thanked\":%s,\"decidedAt\":", s->consent,
-                s->asks, s->last_ask_session, s->sessions, s->thanked ? "true" : "false");
+  tf_buf_printf(&b, "{\"v\":1,\"consent\":\"%s\",\"asks\":%d,\"lastAskSession\":%d,\"sessions\":%d,\"thanked\":%s,\"decidedAt\":",
+                s->deleting ? "final" : s->consent, s->asks, s->last_ask_session, s->sessions, s->thanked ? "true" : "false");
   if (s->decided_at) tf_buf_printf(&b, "%lld", s->decided_at);
   else tf_buf_puts(&b, "null");
   tf_buf_puts(&b, ",\"consentVersion\":");
@@ -129,8 +141,8 @@ static void share_save(const TfClient *c, const Share *s) {
   tf_buf_puts(&b, ",\"consentTextSha256\":");
   if (s->consent_hash[0]) tf_buf_json_str(&b, s->consent_hash);
   else tf_buf_puts(&b, "null");
-  tf_buf_printf(&b, ",\"guardian\":%s,\"sharedSessions\":%d,\"pendingAsk\":%d}", s->guardian ? "true" : "false", s->shared_sessions,
-                s->pending_ask);
+  tf_buf_printf(&b, ",\"guardian\":%s,\"sharedSessions\":%d,\"pendingAsk\":%d,\"stamp\":%d}", s->guardian ? "true" : "false",
+                s->shared_sessions, s->pending_ask, s->stamp + (s->deleting ? 1 : 0));
   char *p = state_path(c);
   if (p && b.p) tf_write_file(p, b.p, b.n);
   free(p);
@@ -162,6 +174,7 @@ void tf__sharing_init(TfClient *c) {
     GETI("guardian", guardian);
     GETI("sharedSessions", shared_sessions);
     GETI("pendingAsk", pending_ask);
+    GETI("stamp", stamp); /* absent in a file of 3.0.0: 0, the stamp of a recording that has none */
 #undef GETI
     const TfJson *d = tf_json_get(j, "decidedAt");
     if (d && d->type == TJ_NUM) s->decided_at = (long long)d->num;
@@ -531,6 +544,7 @@ int tf__client_sharing_ask_now(TfClient *c) {
 /* the learner agreed (a sheet's answer, or the settings switch): records the version in force now, kept for good */
 static void grant(TfClient *c, Share *s) {
   tf_mutex_lock(&s->lock);
+  if (strcmp(s->consent, "granted")) s->stamp++; /* sharing comes on: whatever is on disk is from before */
   snprintf(s->consent, sizeof s->consent, "granted");
   snprintf(s->consent_version, sizeof s->consent_version, "%s", s->effective);
   snprintf(s->consent_hash, sizeof s->consent_hash, "%s", s->effective_hash);
@@ -569,14 +583,28 @@ int tf__client_sharing_set(TfClient *c, int on) {
   }
   tf_mutex_lock(&s->lock);
   snprintf(s->consent, sizeof s->consent, "final");
+  s->stamp++; /* in the same write as the consent: every recording on disk is now one from before the stop */
   tf_mutex_unlock(&s->lock);
   share_save(c, s);
-  /* off stops uploads at once: the PUT in flight is aborted, the unsent queue is deleted */
+  /* off stops uploads at once: the request in flight is aborted, the unsent queue is deleted */
   tf__share_wipe(c);
+  /* 3.0.1: written once more now that the uploader has stopped. A recording that finished uploading at the same
+   * moment writes this file too (its count), and could have written it with the consent it read before the off. */
+  share_save(c, s);
   return 0;
 }
 
 int tf__client_sharing_state(TfClient *c) { return c && share(c) && granted(share(c)) && sharing_enabled(c); }
+/* the learner's own yes, whatever the signed config offers now */
+int tf__sharing_granted(TfClient *c) { return c && share(c) && granted(share(c)); }
+int tf__sharing_stamp(TfClient *c) {
+  Share *s = c ? share(c) : NULL;
+  if (!s) return 0;
+  tf_mutex_lock(&s->lock);
+  const int v = s->stamp;
+  tf_mutex_unlock(&s->lock);
+  return v;
+}
 
 /* "updateNeeded" stays in the JSON for apps that read it, always false since 2.0.1 */
 const char *tf__client_sharing_status_json(TfClient *c) {
@@ -631,25 +659,67 @@ static int post_plain(TfClient *c, const char *path, const char *body, TfHttpRes
   return tf_http(&q, r);
 }
 
-/* "Delete what I shared": challenge, the device key's signature, delete (PLATFORM_CLIENT.md 9.1). On 202 the local
- * key, contributor id, recovery code and unsent queue are forgotten. */
-/* The server confirmed "Delete what I shared": the contributor id and its key are forgotten (the next shared
- * recording gets a new one), the count shown to the learner starts again, the unsent queue and the open
- * recording are deleted, the feed's ring is emptied, and the count of shared recordings (take_seq) and the end
- * of the previous one are forgotten. */
+/* The server confirmed "Delete what I shared". Since 3.0.1 sharing goes OFF with it, as the settings switch turns
+ * it off (asking has ended: the learner is not asked again, and turns sharing on again with the switch). Then:
+ * the unsent queue and the open recording are deleted and the feed's ring is emptied, the contributor id and its
+ * key are forgotten (a recording shared after the learner turned sharing on again gets a new one), the count shown
+ * to the learner starts again, and the count of shared recordings (take_seq) and the end of the previous one are
+ * forgotten. Sharing goes off first, so nothing is captured or sent while the rest is done. */
 void tf__sharing_deleted(TfClient *c) {
-  tf__contributor_forget(tf__client_dir(c));
-  share(c)->shared_sessions = 0;
-  share_save(c, share(c));
+  Share *s = share(c);
+  s->pending_ask = 0;
+  tf_mutex_lock(&s->lock);
+  snprintf(s->consent, sizeof s->consent, "final");
+  s->stamp++;
+  s->deleting = 0; /* what the file said while the server was asked is now what memory says */
+  tf_mutex_unlock(&s->lock);
+  share_save(c, s);
   tf__share_wipe(c);
+  tf__contributor_forget(tf__client_dir(c));
+  s->shared_sessions = 0;
+  share_save(c, s);
   tf__share_forget_seq(c);
 }
 
+/* "Delete what I shared": challenge, the device key's signature, delete (PLATFORM_CLIENT.md 9.1). 0 when the
+ * server took it (202). */
+static int delete_ask(TfClient *c, const char *id);
+void tf__share_hold(TfClient *c);
+void tf__share_resume(TfClient *c);
+
+/* 3.0.1: the queue is stopped BEFORE the server is asked (the request in flight is aborted, no pass begins), so
+ * no recording of the contributor being deleted reaches the server while it deletes or after; and the off is
+ * written to disk before the server is asked. When the server took the deletion, sharing goes off and everything
+ * unsent is deleted (tf__sharing_deleted). When it did not (an error, no connection), nothing has changed:
+ * sharing is as it was, the queue is whole and carries on. A process that dies in between starts with sharing
+ * off: the learner asked for a deletion, so nothing is sent until they say otherwise. */
 int tf__client_sharing_delete(TfClient *c) {
   tf__clear_error();
   if (!c) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
   char id[33];
   if (tf__contributor(tf__client_dir(c), 0, id, NULL, NULL)) return 0; /* nothing was ever shared from this install */
+  Share *s = share(c);
+  tf__share_hold(c);
+  /* the off goes to disk before the server is asked (see `deleting`) */
+  tf_mutex_lock(&s->lock);
+  s->deleting = 1;
+  tf_mutex_unlock(&s->lock);
+  share_save(c, s);
+  const int rc = delete_ask(c, id);
+  if (!rc) {
+    tf__sharing_deleted(c);
+  } else {
+    /* the server did not take it: the settings file is written back as it was (the error stays the call's) */
+    tf_mutex_lock(&s->lock);
+    s->deleting = 0;
+    tf_mutex_unlock(&s->lock);
+    share_save(c, s);
+  }
+  tf__share_resume(c);
+  return rc;
+}
+
+static int delete_ask(TfClient *c, const char *id) {
   char app[600];
   snprintf(app, sizeof app, "%s:%s", tf__client_platform(c), tf__client_app(c));
   int rc = 0;
@@ -685,10 +755,7 @@ int tf__client_sharing_delete(TfClient *c) {
     const int ds = r.status;
     const int retry = ds == 401 && r.body && (strstr(r.body, "nonce_invalid") || strstr(r.body, "timestamp_invalid"));
     tf_http_response_free(&r);
-    if (ds == 202) {
-      tf__sharing_deleted(c);
-      return 0;
-    }
+    if (ds == 202) return 0;
     if (!retry) return tf__fail(TF__ERR_HTTP, "deletion: HTTP %d", ds);
   }
   return tf__fail(TF__ERR_HTTP, "deletion: the challenge was refused twice");

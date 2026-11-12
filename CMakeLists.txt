@@ -208,11 +208,15 @@ add_test(NAME tf_errors COMMAND tf_tests errors "${TF_DATA}/sdk_3.0.0")
 add_test(NAME tf_vectors30 COMMAND tf_tests vectors30 "${TF_DATA}/sdk_3.0.0" "${TF_WORK}/vectors30")
 add_test(NAME tf_api COMMAND tf_tests api "${TF_WORK}/api" "${TF_DATA}/sdk_3.0.0")
 add_test(NAME tf_share30 COMMAND tf_tests share30 "${TF_DATA}/sdk_3.0.0" "${TF_WORK}/share30")
+# 3.0.1: sharing turned off, or what was shared deleted, while an upload is in flight: the 17 shared situations (12 during an upload, 5 restart) and two own rows, 20 runs each
+add_test(NAME tf_sharing_off COMMAND tf_tests sharing_off "${TF_WORK}/sharing_off")
 set(TF_LIBRARY_TESTS tf_ogg tf_codec tf_sharing tf_upload tf_client tf_bitrate tf_consent tf_telemetry tf_sdk_latest tf_manifest tf_takes
-    tf_errors tf_vectors30 tf_api tf_share30)
+    tf_errors tf_vectors30 tf_api tf_share30 tf_sharing_off)
 set_tests_properties(${TF_LIBRARY_TESTS} PROPERTIES FIXTURES_REQUIRED tf_work LABELS library TIMEOUT 600)
 # twenty-minute recordings are encoded for the cap cases of the shared vector: a few minutes on a slow runner
 set_tests_properties(tf_share30 PROPERTIES TIMEOUT 1500)
+# 380 runs; the two own rows wait 2 s per run by design
+set_tests_properties(tf_sharing_off PROPERTIES TIMEOUT 1500)
 if(Python3_FOUND)
   # the public surface is NAMING.md's and nothing else; the README's quick start is the example's marked region
   add_test(NAME tf_api_scan COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test/api_scan.py")

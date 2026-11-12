@@ -123,7 +123,7 @@ static int client_tests(const char *fx_path, const char *dir) {
   CHECK(reg && tf_json_get(reg, "new_install") && tf_json_get(reg, "new_install")->boolean, "register: new_install on the first launch");
   tf_json_free(att);
   tf_json_free(reg);
-  CHECK(strstr(g_rp.config_path, "sdk=3.0.0") && strstr(g_rp.config_path, "bucket="), "config query %s", g_rp.config_path);
+  CHECK(strstr(g_rp.config_path, "sdk=" TF_SDK_VERSION) && strstr(g_rp.config_path, "bucket="), "config query %s", g_rp.config_path);
   CHECK(tf__client_refresh_config(c) == 0 && g_rp.last_inm[0] == '"', "304 refresh (If-None-Match %s)", g_rp.last_inm);
   CHECK(tf__client_config_json(c) != NULL, "config lost after 304");
   /* within 1 h of expiry: an unconditional fetch; a tampered body and an unknown key id are refused */

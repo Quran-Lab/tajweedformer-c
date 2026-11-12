@@ -126,7 +126,7 @@ static int errors_tests(const char *data) {
     ok += good;
   }
   tf__fail_sdk_too_old("3.1.0");
-  CHECK(!strcmp(tf_last_error(), "This key needs SDK 3.1.0 or later; this is 3.0.0.") && strstr(tf_last_error_fix(), "to 3.1.0 or later"),
+  CHECK(!strcmp(tf_last_error(), "This key needs SDK 3.1.0 or later; this is " TF_SDK_VERSION ".") && strstr(tf_last_error_fix(), "to 3.1.0 or later"),
         "sdk_too_old: %s / %s", tf_last_error(), tf_last_error_fix());
   tf__fail_storage_full(60000000, 1024);
   CHECK(!strcmp(tf_last_error(), "Not enough free space for the model: 60000000 bytes needed, 1024 free."), "storage_full: %s", tf_last_error());
@@ -139,7 +139,7 @@ static int errors_tests(const char *data) {
   tf__clear_error();
   CHECK(tf__runtime_check() == 0 && tf_last_error_code() == 0, "this build is refused on the machine that runs its tests");
   tf__fail(TF_ERR_MODEL_UNAVAILABLE, NULL);
-  CHECK(!strcmp(tf_last_error(), "Quran Lab has no model build for SDK 3.0.0 yet."), "model_unavailable: %s", tf_last_error());
+  CHECK(!strcmp(tf_last_error(), "Quran Lab has no model build for SDK " TF_SDK_VERSION " yet."), "model_unavailable: %s", tf_last_error());
   tf__fail(TF_ERR_CHECKSUM_MISMATCH, "c16_l64/frames.zfw");
   CHECK(!strcmp(tf_last_error(), "A model file differs from the manifest: c16_l64/frames.zfw."), "checksum_mismatch: %s", tf_last_error());
   /* 3. no code outside the catalogue reaches the app: an internal failure reads as a catalogue code, 0 is "ok",
@@ -182,7 +182,14 @@ static void t30_manifest(const char *data) {
   }
   const char *key = tf_json_str(tf_json_get(v, "public_key_hex"));
   const TfJson *cases = tf_json_get(v, "cases");
-  CHECK(!strcmp(tf_json_str(tf_json_get(v, "sdk_version")), TF_SDK_VERSION), "the vector is for SDK %s", tf_json_str(tf_json_get(v, "sdk_version")));
+  /* the vectors are for the 3.0 line: built with `sdk_version`, held by that SDK and every later 3.0.x, which runs
+   * them as itself (the shared README 4.5) */
+  {
+    const char *built = tf_json_str(tf_json_get(v, "sdk_version"));
+    const int cmp = built ? tf__version_cmp(built, TF_SDK_VERSION) : -2;
+    CHECK(built && (cmp == 0 || cmp == -1) && !strncmp(built, TF_SDK_VERSION, 4), "the vector was built with SDK %s, this is %s", built ? built : "(none)",
+          TF_SDK_VERSION);
+  }
   int ok = 0, accepted = 0;
   for (int i = 0; cases && i < cases->n; ++i) {
     const TfJson *c = &cases->kids[i], *e = tf_json_get(c, "expect"), *cfg = tf_json_get(c, "config");

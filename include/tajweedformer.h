@@ -1,4 +1,4 @@
-/* tajweedformer.h: the TajweedFormer SDK for Windows and Linux (C API, SDK 3.0.0).
+/* tajweedformer.h: the TajweedFormer SDK for Windows and Linux (C API, SDK 3.0.1).
  *
  * A pure inference engine: audio in, the model's own output out. Five things, with the same names and the same
  * order of calls as the Android, Apple and web SDKs:
@@ -58,9 +58,9 @@ extern "C" {
 #define TF_API
 #endif
 
-#define TF_SDK_VERSION "3.0.0"
+#define TF_SDK_VERSION "3.0.1"
 
-TF_API const char *tf_version(void); /* "3.0.0" */
+TF_API const char *tf_version(void); /* "3.0.1" */
 
 /* ============================================================================ errors */
 
@@ -315,7 +315,7 @@ TF_API int tf_client_remove_models(TfClient *c);
 
 /* One structured report, safe to paste into an issue: no audio, text or identifiers. */
 typedef struct {
-  const char *sdk_version;     /* "3.0.0" */
+  const char *sdk_version;     /* "3.0.1" */
   const char *sdk_latest;      /* the SDK release the signed config in force names, or NULL when it names none */
   int key_accepted;            /* 1 accepted, 0 refused, -1 not known yet (no answer from the server) */
   const char *key_reason;      /* why not: the server's code, or NULL */
@@ -500,7 +500,13 @@ TF_API int tf_sharing_feed(TfClient *c, const float *samples, int n, int sample_
 TF_API const char *tf_sharing_items_json(TfClient *c);
 /* The learner's summary: {"you":{"sessions","minutes"},"app":...|null,"all":...}, or NULL. */
 TF_API const char *tf_sharing_summary_json(TfClient *c);
-/* "Delete what I shared": deleted from Quran Lab's servers at once, with the unsent queue. */
+/* "Delete what I shared": deleted from Quran Lab's servers at once, with the unsent queue. The queue stops before
+ * the server is asked. When the server took the deletion (0), sharing is off afterwards, as after
+ * tf_sharing_set_on(client, 0): the learner turns it on again with the switch and is not asked again. When it did
+ * not (an error code), nothing has changed and the queue carries on. The off is written to disk before the server
+ * is asked: when the process ends while the server is asked and the server never took the deletion, the learner
+ * finds sharing off at the next launch and the unsent queue deleted; the switch turns sharing on again and they
+ * are not asked again (they had said yes before: only a learner who shared can delete). */
 TF_API int tf_sharing_delete(TfClient *c);
 /* The code for deletion when the device is lost (26 characters in groups of 4), for the learner only; "" before
  * the first shared recording. */

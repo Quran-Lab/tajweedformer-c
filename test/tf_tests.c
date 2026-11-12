@@ -640,6 +640,7 @@ static int layers(const char *fx, const char *dir16, const char *dir24, const ch
 #include "tf_share_tests.inc"
 #include "tf_201_tests.inc"
 #include "tf_203_tests.inc"
+#include "tf_301_tests.inc"
 #include "tf_manifest_tests.inc"
 #include "tf_30_tests.inc"
 #include "tf_30_api_tests.inc"
@@ -834,6 +835,7 @@ int main(int argc, char **argv) {
   if (argc >= 4 && !strcmp(argv[1], "sdk_latest")) return sdk_latest_tests(argv[2], argv[3]);
   if (argc >= 4 && !strcmp(argv[1], "manifest")) return manifest_tests(argv[2], argv[3]);
   if (argc >= 4 && !strcmp(argv[1], "takes")) return takes_tests(argv[2], argv[3]);
+  if (argc >= 3 && !strcmp(argv[1], "sharing_off")) return sharing_off_tests(argv[2], argc > 3 ? atoi(argv[3]) : 20, argc > 4 ? atoi(argv[4]) : 1);
   if (argc >= 3 && !strcmp(argv[1], "telemetry")) return telemetry_tests(argv[2]);
   fprintf(stderr, "usage: see the comment at the top of test/tf_tests.c\n");
   return 2;

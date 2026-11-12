@@ -1,5 +1,86 @@
 # Changelog
 
+## 3.0.1
+
+One subject, the same in the Android, Apple, web and C SDKs: what "sharing off" and "delete what I shared" must
+guarantee. The rules, held by one shared test of 17 situations, each run 20 times: after the call returns no audio
+leaves the device, whatever was in flight; the call returns within 3 seconds even when a request hangs; nothing
+unsent stays on disk, also when the request that was in flight comes back later; turning sharing on again works
+right away; and a recording made under an earlier consent is never uploaded, whatever happened in between. The
+API is unchanged (the same 67 functions); one behaviour changes, see the third point.
+In production the sharing sheet has been on for iOS and macOS only, so no app built on this SDK had sharing on.
+
+- **Sharing off ends the request in flight, whichever it is.** In 3.0.0 only a segment PUT could be aborted. The
+  start of an upload, a batch of upload URLs and a take list could not, so `tf_sharing_set_on(client, 0)` and
+  `tf_sharing_delete` waited their whole 3 seconds for such a request and returned after 3.0 to 3.4 s (the rule
+  is within 3 s), and a batch of URLs that arrived after the call was followed by one more request (a PUT of a
+  segment that was already deleted: no audio in it, but a request). While such a request hung, `tf_sharing_is_on`
+  and every call that reads the signed config waited for it too. Now every request of the uploader carries its
+  abort flag; the uploader asks before every request and before every write whether sharing went off since its
+  pass began; a request that comes back late sends nothing more and writes nothing back. The call returns in
+  about 20 ms, and in 2 s at most with a transport that cannot abort a request (the uploader's request then
+  finishes by itself and does nothing after it).
+- **"Delete what I shared" stops the queue before it asks the server** and holds it until the answer. In 3.0.0 it
+  asked first, so a recording could still be uploaded under the contributor being deleted while the server was
+  deleting.
+- **Behaviour change: a deletion the server took turns sharing off**, as it always did on Android and Apple.
+  After `tf_sharing_delete` returned 0, `tf_sharing_is_on` is 0 and the learner is not asked again; they turn
+  sharing on again with the switch (`tf_sharing_set_on(client, 1)`), and what they share after that goes under a
+  new contributor id. A deletion the server did not take (an error code) changes nothing: sharing stays as it
+  was and the queue carries on with the recording that was in flight. An app that shows the state of the switch
+  reads `tf_sharing_is_on` after the deletion. With nothing ever shared from the install the call still returns
+  0 and changes nothing.
+- **A recording made under an earlier consent is never uploaded.** In 3.0.0, and in every version with sharing
+  before it, a recording that a stop left on the device was uploaded when sharing came on again: when the process
+  ended between the off and the deletion of the queue, or when a recording could not be deleted (a file in use).
+  Nothing deleted it at the next launch either. In a test with nine such recordings all nine were uploaded after
+  a restart (389,931 bytes of audio; there is no limit, it is whatever the stop left). Now the settings file
+  carries a count of the learner's changes of mind (sharing turned off, a deletion the server took, sharing turned
+  on), written in the same write as the consent, and every recording carries the count it was begun under (a file
+  `stamp` in its folder, never uploaded). A recording with another count than the one in force is never uploaded
+  and is deleted before every upload pass and at launch; at a launch with sharing off the whole unsent queue is
+  deleted. This holds for any number of recordings and when the process ends at any point after the call began. A
+  queue of 3.0.0 uploads as before while sharing stays on.
+- **`tf_sharing_delete` writes the off to disk before it asks the server**, and writes the earlier state back when
+  the server does not take the deletion (nothing changes then, as before). A process that ends while the server
+  is asked, or between its answer and the device's deletes, starts with sharing off and deletes what is left: the
+  learner asked for a deletion, so nothing is sent until they say otherwise.
+- **What can still leave after the call.** The request is aborted by closing its handle (WinHTTP) or by stopping
+  the transfer (libcurl). Bytes the system had already taken for the connection may still go out; the SDK hands
+  over nothing more, and a PUT cut short does not complete. In the test, with a stub in place of the network,
+  0 bytes left after the call in every run, before and after this fix: 3.0.0 already aborted a PUT in flight.
+- **The settings file is written once more after the stop.** A recording that finished uploading at the moment
+  of the off call writes the same file (its count) and could, in a narrow window, have written it back with the
+  consent it had read before; sharing would then have been on again at the next launch. Not seen in a test.
+- The test: `tf_tests sharing_off <work dir> [runs]` (ctest `tf_sharing_off`): the 17 shared situations (12 during
+  an upload, 5 where a stop leaves nine recordings behind and the process may end) and two rows of this SDK's own
+  (a request that the transport cannot abort). Runs passed of 20:
+
+  | situation | 3.0.0 | 3.0.1 |
+  | - | - | - |
+  | put held, off | 20 | 20 |
+  | put held, delete | 0 (the server was asked first; sharing stayed on) | 20 |
+  | start held, off | 0 (the call took 3.03 s) | 20 |
+  | start held, delete | 0 (3.03 s; asked first; sharing stayed on) | 20 |
+  | urls held, off | 0 (3.04 s; one request after the call) | 20 |
+  | urls held, delete | 0 (3.04 s; one request after the call; asked first; sharing stayed on) | 20 |
+  | takes held, off | 0 (3.03 s) | 20 |
+  | takes held, delete | 0 (3.39 s; asked first; sharing stayed on) | 20 |
+  | put held, delete refused | 0 (the server was asked while the PUT was still going) | 20 |
+  | start held, delete refused | 0 (the server was asked while the start was still going) | 20 |
+  | put held, off, on again at once | 20 | 20 |
+  | start held, off, on again at once | 0 (3.04 s) | 20 |
+  | nine left by off, on again | 0 (all nine uploaded) | 20 |
+  | nine left by off, the process ends, sharing off | 0 (not deleted at the next launch) | 20 |
+  | nine left by off, the process ends, on again | 0 (all nine uploaded) | 20 |
+  | nine left by an accepted delete, the process ends, on again | 0 (sharing was still on; all nine uploaded) | 20 |
+  | delete, the process ends while the server is asked | 0 (sharing was still on; all nine uploaded) | 20 |
+  | own: the start cannot be aborted, off | 0 (3.03 s) | 20 (2.02 s) |
+  | own: the start cannot be aborted, delete | 0 (3.03 s; sharing stayed on) | 20 (2.02 s) |
+- The vectors hold for every SDK of the 3.0 line: `manifest_30.json`'s patch case names 3.0.100, the recorder
+  vector turns sharing on again after its deletion, and the tests no longer require the files to be built with
+  this SDK's exact version.
+
 ## 3.0.0
 
 A breaking release. The SDK is now a pure inference engine: recitation audio in, the model's own output out. The
