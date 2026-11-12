@@ -6,8 +6,9 @@ One subject, the same in the Android, Apple, web and C SDKs: what "sharing off" 
 guarantee. The rules, held by one shared test of 17 situations, each run 20 times: after the call returns no audio
 leaves the device, whatever was in flight; the call returns within 3 seconds even when a request hangs; nothing
 unsent stays on disk, also when the request that was in flight comes back later; turning sharing on again works
-right away; and a recording made under an earlier consent is never uploaded, whatever happened in between. The
-API is unchanged (the same 67 functions); one behaviour changes, see the third point.
+right away; and a recording made under an earlier consent is never uploaded, whatever happened in between (the
+web SDK holds the first four rules in its 3.0.1 and this last one from its 3.0.2). The API is unchanged (the
+same 67 functions); one behaviour changes, see the third point.
 In production the sharing sheet has been on for iOS and macOS only, so no app built on this SDK had sharing on.
 
 - **Sharing off ends the request in flight, whichever it is.** In 3.0.0 only a segment PUT could be aborted. The
