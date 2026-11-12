@@ -1,4 +1,4 @@
-# The C API: `tajweedformer.h` (SDK 3.0.0)
+# The C API: `tajweedformer.h` (SDK 3.0.1)
 
 One library for Windows and Linux apps and for servers: `tajweedformer.dll` / `libtajweedformer.so` (or the static
 library) and one header, `include/tajweedformer.h`. It includes nothing but `<stddef.h>` and names no engine type.
@@ -18,7 +18,7 @@ Five things, with the same names and the same order of calls as the Android, App
 
 Every options struct (`TfClientOptions`, `TfModelOptions`, `TfPrefetchOptions`, `TfSessionOptions`) may be NULL or
 zeroed: zero is the default of every field. Strings and arrays returned as `const` belong to the object they came
-from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"3.0.0"`.
+from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"3.0.1"`.
 
 ## Errors
 
@@ -303,14 +303,14 @@ strings and reports the learner's own tap.
 | - | - |
 | `tf_sharing_status(client, &s)` | `TfSharing`: `is_available`, `is_on`, `asks`, `pending_ask`, `guardian`, `shared`, `consent_version`, `consent_text`, `consent_sha256` |
 | `tf_sharing_is_available(client)`, `tf_sharing_is_on(client)` | the two answers alone |
-| `tf_sharing_set_on(client, on)` | the settings switch. Off stops uploads at once and deletes the unsent queue |
+| `tf_sharing_set_on(client, on)` | the settings switch. Off stops uploads at once and deletes the unsent queue: the request in flight is aborted, nothing is sent after the call has returned, and it returns within 3 s even when a request hangs |
 | `tf_sharing_ask(client)` | ask now, if an ask is still allowed. `sharing_unavailable` when the config does not offer sharing to this app |
 | `tf_sharing_answer(client, share)` | the learner's answer to a sheet: 1 share, 0 not now |
 | `tf_sharing_copy_json(client)` | the copy deck in the client's language, with the app's own wording applied |
 | `tf_sharing_feed(client, samples, n, sample_rate)` | audio the app already captures outside takes: the last second before a take and the half second after it go into the shared recording. Dropped at once without a yes. The model never sees it |
 | `tf_sharing_items_json(client)` | the queue: `[{"id","created","ended","completed","segments","uploaded","takes","error"}]` |
 | `tf_sharing_summary_json(client)` | the learner's summary: `{"you":{"sessions","minutes"},"app":...,"all":...}` |
-| `tf_sharing_delete(client)` | "Delete what I shared": deleted from Quran Lab's servers at once, with the unsent queue |
+| `tf_sharing_delete(client)` | "Delete what I shared": deleted from Quran Lab's servers at once, with the unsent queue. The queue stops before the server is asked. When the server took the deletion (0), sharing is OFF afterwards, as after `tf_sharing_set_on(client, 0)`: the learner turns it on again with the switch and is not asked again. When it did not (an error code), nothing has changed and the queue carries on. 0 and no change when nothing was ever shared from this install |
 | `tf_sharing_recovery_code(client, out)` | the code for deletion when the device is lost, for the learner only |
 | `tf_sharing_set_wording(client, keys, texts, n)` | the app's own wording for deck strings. Call it right after `tf_client_create` at every start and send `TfSharing.consent_text` to Quran Lab for review |
 

@@ -164,7 +164,33 @@ static struct {
   char takes_id[16][33], takes_contributor[16][33];
   int takes_after_puts[16]; /* segment PUTs answered 200 before the call */
   char start_contributor[33]; /* the contributor of the last session JSON */
+  /* 3.0.1, sharing off during an upload: the first request of kind `hold` ("put", "start", "urls", "takes") waits
+   * until `release` or until it is cancelled; once `mark` is set, every upload request that STARTS is counted,
+   * and the bytes of audio of a PUT that starts */
+  const char *hold;
+  int hold_deaf; /* the held request cannot be aborted: it does not look at its cancel flag */
+  volatile int held, held_done, held_cancelled, release, mark;
+  int after_requests;
+  long long after_audio;
+  int delete_calls;
+  int delete_status; /* nonzero: the deletion answers this status (the server does not take it) */
+  /* when the deletion's first request arrived: the upload requests started since `mark`, and whether the held
+   * request had ended by then */
+  int ask_seen, ask_requests, ask_held_done;
+  /* the settings file as it is on disk at that moment (what a process that dies there leaves): `snap_path` is
+   * copied into `snap` */
+  const char *snap_path;
+  char *snap;
+  size_t snap_n;
 } g_st;
+static long long stub_file_size(const char *path) {
+  FILE *f = path ? fopen(path, "rb") : NULL;
+  if (!f) return 0;
+  fseek(f, 0, SEEK_END);
+  const long n = ftell(f);
+  fclose(f);
+  return n > 0 ? n : 0;
+}
 static StubSession *stub_session(const char *id) {
   for (int i = 0; i < g_st.n_s; ++i)
     if (!strcmp(g_st.s[i].id, id)) return &g_st.s[i];
@@ -201,7 +227,46 @@ static int stub(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
   if (!path) return tf__fail(TF__ERR_NETWORK, "bad url");
   tf_mutex_lock(&g_st.m);
   int rc = 0;
-  if (strstr(q->url, "https://r2.test/")) {
+  {
+    const char *kind = strstr(q->url, "https://r2.test/") ? "put"
+                       : !strcmp(path, "/v1/uploads") ? "start"
+                       : !strncmp(path, "/v1/uploads/", 12) && strlen(path) == 50 && !strcmp(path + 44, "/takes") ? "takes"
+                       : !strncmp(path, "/v1/uploads/", 12) ? "urls" : NULL;
+    if (kind && g_st.mark) {
+      g_st.after_requests++;
+      if (!strcmp(kind, "put")) g_st.after_audio += stub_file_size(q->upload_file);
+    }
+    if (kind && g_st.hold && !g_st.held && !strcmp(kind, g_st.hold)) {
+      g_st.held = 1;
+      tf_mutex_unlock(&g_st.m);
+      int cancelled = 0;
+      for (int i = 0; i < 1400 && !g_st.release && !cancelled; ++i) {
+        cancelled = !g_st.hold_deaf && q->cancel && *q->cancel;
+        if (!cancelled) SLEEP_MS(5);
+      }
+      tf_mutex_lock(&g_st.m);
+      g_st.held_cancelled = cancelled;
+      g_st.held_done = 1;
+      /* a held PUT that was let go after the call, not cancelled by it: its audio left after the call */
+      if (!cancelled && g_st.mark && !strcmp(kind, "put")) g_st.after_audio += stub_file_size(q->upload_file);
+      if (cancelled) {
+        tf_mutex_unlock(&g_st.m);
+        return tf__fail(TF__ERR_NETWORK, "cancelled");
+      }
+    }
+  }
+  if (!strcmp(path, "/v1/contributions/challenge")) {
+    if (!g_st.ask_seen) {
+      g_st.ask_seen = 1;
+      g_st.ask_requests = g_st.after_requests;
+      g_st.ask_held_done = !g_st.held || g_st.held_done;
+      if (g_st.snap_path && !g_st.snap) tf_read_file(g_st.snap_path, &g_st.snap, &g_st.snap_n);
+    }
+    reply(r, 200, "{\"nonce\":\"nonce-for-the-test\"}");
+  } else if (!strcmp(path, "/v1/contributions/delete")) {
+    g_st.delete_calls++;
+    reply(r, g_st.delete_status ? g_st.delete_status : 202, "{}");
+  } else if (strstr(q->url, "https://r2.test/")) {
     /* a presigned PUT: content-type audio/ogg and nothing else */
     int nh = 0;
     for (const char *const *h = q->headers; h && *h; ++h) nh++;

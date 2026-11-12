@@ -104,6 +104,9 @@ int tf__contributor(const char *dir, int create, char id[33], char contributor_k
 void tf__contributor_forget(const char *dir);
 int tf__client_flag_int(const TfClient *c, const char *name, int lo, int hi, int dflt);
 void tf__client_token_forget(TfClient *c);
+void tf__client_thread_cancel(volatile int *flag);
+int tf__sharing_stamp(TfClient *c);
+int tf__sharing_granted(TfClient *c);
 void tf__client_log(TfClient *c, int level, const char *message);
 extern long long tf__now_override;
 extern int tf__client_no_timer;
@@ -158,8 +161,15 @@ typedef struct {
   char active[16][33]; /* sessions being captured in this process */
   int n_active;
   int passes;          /* finished upload passes (tests) */
-  int in_pass;         /* the uploader is inside a pass: it may hold a segment file open and will write the
-                          session's state when it leaves (under m) */
+  int in_pass;         /* the uploader is inside a pass (under m) */
+  /* 3.0.1, stops (under m): sharing went off, what was shared was deleted, or a deletion is asking the server.
+   * Every stop counts stop_gen up. A pass remembers the count it began under (pass_gen) and looks at it, under m,
+   * before every request and before every write: a pass of an older count sends nothing and writes nothing, so a
+   * request that comes back after the stop cannot put a recording back on disk or send its next segment. */
+  int stop_gen, pass_gen;
+  int held;            /* > 0: a deletion is asking the server: no pass begins until it has its answer */
+  int stuck;           /* a stop waited its full time for the pass that is still running: the next stop does not
+                          wait for the same pass again (a deletion stops twice: before it asks, and when it deletes) */
   char outbox[1024];
   /* 2.0.3, the recorder. rm guards it: takes begin, push and end on the app's audio thread, the window ends on the
    * timer's, the app's life and the settings switch arrive on others. Lock order: rm, then m or tm; never back. */
@@ -294,7 +304,10 @@ static int list_dir(const char *dir, char (*names)[64], int max) {
 #endif
   return n;
 }
+/* tests: deleting a recording fails (a file in use, or the process dying before the stop's deletion) */
+int tf__share_no_delete;
 static void remove_session(const Share *s, const char *id) {
+  if (tf__share_no_delete) return;
   char *d = sess_path(s, id, NULL);
   if (!d) return;
   char names[256][64];
@@ -859,11 +872,20 @@ static Rec *rec_open(TfClient *c, Share *s, int rate, const char *route, const c
   snprintf(x->consent_hash, sizeof x->consent_hash, "%s", ch);
   snprintf(x->revision, sizeof x->revision, "%s", revision);
   x->n_takes = 1; /* the first take: {0, 0} */
+  /* 3.0.1, the stamp: the count is read first and the consent after it. A stop between the two is seen here (the
+   * recording is not begun); a stop after it counts up, so the stamp written below is an old one. */
+  char stamp[16];
+  snprintf(stamp, sizeof stamp, "%d", tf__sharing_stamp(c));
+  if (!tf__client_sharing_state(c)) {
+    free(x);
+    tf__fail(TF__ERR_NOT_AVAILABLE, "sharing is off");
+    return NULL;
+  }
   char *dir = sess_path(s, x->id, NULL);
   long long take_seq, gap_prev;
   seq_next(c, start_wall, &take_seq, &gap_prev);
   char *body = session_json(contributor, key, rhash, cv, ch, rate, route, revision, take_seq, gap_prev);
-  if (!dir || !body || tf_mkdirs(dir) || write_text(s, x->id, "session.json", body)) {
+  if (!dir || !body || tf_mkdirs(dir) || write_text(s, x->id, "stamp", stamp) || write_text(s, x->id, "session.json", body)) {
     free(dir);
     free(body);
     free(x);
@@ -1540,6 +1562,92 @@ static void item_save(Share *s, const char *id, const Item *it) {
   tf_buf_free(&b);
 }
 
+/* ------------------------------------------------------------------ stops (3.0.1) */
+/* The uploader's question before every request and every write. 1, with m held (the caller unlocks): sharing is
+ * on and no stop came since this pass began. 0, m not held: the pass is over, it sends and writes nothing more.
+ * A stop takes m to count up and to delete, so what the uploader does under this lock is done before the stop
+ * deletes, and nothing is done after it. */
+static int live_lock(TfClient *c, Share *s) {
+  const int on = tf__client_sharing_state(c);
+  tf_mutex_lock(&s->m);
+  if (on && s->pass_gen == s->stop_gen) return 1;
+  tf_mutex_unlock(&s->m);
+  return 0;
+}
+static int live(TfClient *c, Share *s) {
+  if (!live_lock(c, s)) return 0;
+  tf_mutex_unlock(&s->m);
+  return 1;
+}
+/* the recording's state is written when the pass is live; 0 when it was not */
+static int live_save(TfClient *c, Share *s, const char *id, const Item *it) {
+  if (!live_lock(c, s)) return 0;
+  item_save(s, id, it);
+  tf_mutex_unlock(&s->m);
+  return 1;
+}
+/* the uploader drops a recording (uploaded, refused for good, too old): only a live pass does */
+static void live_remove(TfClient *c, Share *s, const char *id) {
+  if (!live_lock(c, s)) return;
+  remove_session(s, id);
+  tf_mutex_unlock(&s->m);
+}
+/* The stamp of a recording: the count of the learner's changes of mind it was begun under (the file `stamp`,
+ * written when its folder is made; 0 for a recording of 3.0.0, which has none). A recording whose stamp is not
+ * the count in force was begun before a stop (sharing turned off, a deletion the server took) or before sharing
+ * came on: it is never uploaded, and it is deleted by the next upload pass and at the next launch. This holds
+ * however many recordings a stop could not delete and whether or not the process lived on, because the count is
+ * written with the consent itself and the stamp is on disk. */
+static int rec_stamp(const Share *s, const char *id) {
+  char *p = sess_path(s, id, "stamp"), *t = NULL;
+  size_t n = 0;
+  int v = 0;
+  if (p && !tf_read_file(p, &t, &n) && n > 0 && n < 12) v = atoi(t);
+  free(p);
+  free(t);
+  return v;
+}
+static int stale(TfClient *c, const Share *s, const char *id) { return rec_stamp(s, id) != tf__sharing_stamp(c); }
+static int session_left(const Share *s, const char *id) { /* a file of the recording is still on disk */
+  char *d = sess_path(s, id, NULL);
+  char one[1][64];
+  const int n = d ? list_dir(d, one, 1) : 0;
+  free(d);
+  return n > 0;
+}
+/* m held. What a stop left behind is deleted: every recording that is not being captured when the learner's yes
+ * is not in force (none can rightly be there), and every one with a stamp that is not the count in force. Before
+ * every upload pass and at launch. */
+static void sweep(TfClient *c, Share *s) {
+  const int granted = tf__sharing_granted(c);
+  char names[256][64];
+  for (int round = 0; round < 64; ++round) {
+    const int n = list_dir(s->outbox, names, 256);
+    int removed = 0;
+    for (int i = 0; i < n; ++i) {
+      if (!is_id(names[i]) || is_active(s, names[i])) continue;
+      if (granted && !stale(c, s, names[i])) continue;
+      remove_session(s, names[i]);
+      removed += !session_left(s, names[i]);
+    }
+    if (!removed || n < 256) break;
+  }
+}
+/* m held: the uploader's request in flight is aborted and the caller waits until the pass has ended. A request
+ * the transport cannot abort is not waited for longer than STOP_WAIT_S (the call that stops must return within
+ * 3 s): when it comes back, the pass finds the count changed and does nothing more. */
+#define STOP_WAIT_S 2.0
+static void stop_wait(Share *s) {
+  tf__http_cancel(&s->cancel);
+  if (s->stuck) return;
+  const double t0 = tf__now_s();
+  while (s->in_pass && tf__now_s() - t0 < STOP_WAIT_S) {
+    tf__http_cancel(&s->cancel);
+    tf_cond_wait_ms(&s->cv, &s->m, 10);
+  }
+  s->stuck = s->in_pass;
+}
+
 static double frand(void) {
   uint8_t r[2];
   tf_random_bytes(r, 2);
@@ -1594,8 +1702,11 @@ static int answer(TfClient *c, Share *s, const char *id, Item *it, int call_rc, 
   if (!strcmp(code, "contributor_revoked") || !strcmp(code, "contributor_key_mismatch")) {
     /* this contributor id can never upload again: a new contributor, device key and recovery code at the next
      * session; this session (recorded under the old id) is dropped */
-    tf__contributor_forget(tf__client_dir(c));
-    remove_session(s, id);
+    if (live_lock(c, s)) {
+      tf__contributor_forget(tf__client_dir(c));
+      remove_session(s, id);
+      tf_mutex_unlock(&s->m);
+    }
     return ANS_GONE;
   }
   if (!strcmp(code, "volume_limit") || !strcmp(code, "capped_limit")) {
@@ -1604,27 +1715,30 @@ static int answer(TfClient *c, Share *s, const char *id, Item *it, int call_rc, 
     return ANS_WAIT;
   }
   if (!strcmp(code, "segment_cap")) {
-    remove_session(s, id); /* the capped tier's last allowed segment went: what arrived is valid audio */
+    live_remove(c, s, id); /* the capped tier's last allowed segment went: what arrived is valid audio */
     return ANS_GONE;
   }
   if (r->status == 404 || r->status == 410) {
-    remove_session(s, id);
+    live_remove(c, s, id);
     return ANS_GONE;
   }
   if (r->status == 401) retry(it, why, it->attempts < 3, 0);
   else if (r->status >= 500 || r->status == 408 || r->status == 425 || r->status == 429) retry(it, why, 0, 0);
   else if (!strcmp(code, "contributions_disabled") || !strcmp(code, "attestation_required")) retry(it, why, 0, 1);
   else {
-    remove_session(s, id); /* a refused body (an SDK bug) is never retried */
+    live_remove(c, s, id); /* a refused body (an SDK bug) is never retried */
     return ANS_GONE;
   }
   return ANS_WAIT;
 }
 
+/* 3.0.1: every request of the uploader is asked for first (a stop since the pass began: nothing is sent), and its
+ * answer is looked at only when no stop came meanwhile (ANS_OFFLINE ends the pass; nothing is written then) */
 static int fetch_urls(TfClient *c, Share *s, const char *id, Item *it, int from) {
   char path[128], hdr[80], contributor[33];
+  if (!live(c, s)) return ANS_OFFLINE;
   if (tf__contributor(tf__client_dir(c), 0, contributor, NULL, NULL)) {
-    remove_session(s, id);
+    live_remove(c, s, id);
     return ANS_GONE;
   }
   snprintf(path, sizeof path, "/v1/uploads/%s/urls?from=%d", id, from);
@@ -1632,6 +1746,10 @@ static int fetch_urls(TfClient *c, Share *s, const char *id, Item *it, int from)
   TfHttpResponse r;
   memset(&r, 0, sizeof r);
   const int rc = tf__client_call(c, "POST", path, NULL, 1, hdr, &r);
+  if (s->cancel || !live(c, s)) { /* aborted (a stop, or the client closing): not a failed request */
+    tf_http_response_free(&r);
+    return ANS_OFFLINE;
+  }
   const int a = answer(c, s, id, it, rc, &r);
   tf_http_response_free(&r);
   return a;
@@ -1668,27 +1786,35 @@ static int put_segment(Share *s, const char *id, int n, const char *url, int *st
  * the bitrate ladder never hears of this call. Returns 1 when the pass should stop (no connection). */
 static int step_takes(TfClient *c, Share *s, const char *id, Item *it) {
   if (now_s() - it->created > MAX_AGE_S) { /* a list that could not be sent for 7 days */
-    remove_session(s, id);
+    live_remove(c, s, id);
     return 0;
   }
   if (it->next_at > now_s()) return 0;
   char *body = takes_body(s, id, -1, NULL);
   if (!body || !it->contributor[0]) {
     free(body);
-    remove_session(s, id);
+    live_remove(c, s, id);
     return 0;
   }
   char path[96], hdr[80];
   snprintf(path, sizeof path, "/v1/uploads/%s/takes", id);
   snprintf(hdr, sizeof hdr, "x-qlab-contributor: %s", it->contributor);
+  if (!live(c, s)) { /* 3.0.1: a stop since the pass began: the list is not sent */
+    free(body);
+    return 1;
+  }
   it->attempts++;
   TfHttpResponse r;
   memset(&r, 0, sizeof r);
   const int rc = tf__client_call(c, "POST", path, body, 1, hdr, &r);
   free(body);
+  if (s->cancel || !live(c, s)) { /* aborted, or a stop while the list was on its way: nothing changes on disk */
+    tf_http_response_free(&r);
+    return 1;
+  }
   if (rc) {
     retry(it, "takes: offline", 0, 0);
-    item_save(s, id, it);
+    live_save(c, s, id, it);
     return 1;
   }
   const int st = r.status;
@@ -1702,7 +1828,7 @@ static int step_takes(TfClient *c, Share *s, const char *id, Item *it) {
       tf__client_report_issue(c, "other", "bad_request:takes", NULL);
     }
     retry(it, "takes: HTTP 400", 0, 0);
-    item_save(s, id, it);
+    live_save(c, s, id, it);
     return 0;
   }
   if ((st >= 200 && st < 300) || st == 404 || st == 410) {
@@ -1710,17 +1836,17 @@ static int step_takes(TfClient *c, Share *s, const char *id, Item *it) {
       s->takes_404 = 1;
       tf__client_log(c, TF_LOG_INFO, "the server has no take list for this upload (HTTP 404): the take boundaries are not sent");
     }
-    remove_session(s, id);
+    live_remove(c, s, id);
     return 0;
   }
   char why[48];
   snprintf(why, sizeof why, "takes: HTTP %d", st);
   if (st == 401) tf__client_token_forget(c);
   retry(it, why, st == 401 && it->attempts < 3, 0);
-  item_save(s, id, it);
+  live_save(c, s, id, it);
   return 0;
 }
-/* every file of a session folder but item.json and takes.json */
+/* every file of a session folder but item.json, takes.json and the stamp */
 static void keep_item_and_takes(const Share *s, const char *id) {
   char *d = sess_path(s, id, NULL);
   if (!d) return;
@@ -1729,7 +1855,7 @@ static void keep_item_and_takes(const Share *s, const char *id) {
     const int n = list_dir(d, names, 256);
     int removed = 0;
     for (int i = 0; i < n; ++i) {
-      if (!strcmp(names[i], "item.json") || !strcmp(names[i], "takes.json")) continue;
+      if (!strcmp(names[i], "item.json") || !strcmp(names[i], "takes.json") || !strcmp(names[i], "stamp")) continue;
       char *f = tf_path_join(d, names[i]);
       if (f) removed += remove(f) == 0;
       free(f);
@@ -1744,6 +1870,15 @@ static int step(TfClient *c, Share *s, const char *id) {
   tf_mutex_lock(&s->m);
   const int active = is_active(s, id);
   tf_mutex_unlock(&s->m);
+  if (!live(c, s)) return 1; /* 3.0.1: a stop since the pass began */
+  if (stale(c, s, id)) {
+    /* begun before a stop that could not delete it (or whose deletion never ran): never uploaded. It is deleted
+     * here as soon as nothing captures into it; the pass's sweep tries again every time. */
+    tf_mutex_lock(&s->m);
+    if (!is_active(s, id)) remove_session(s, id);
+    tf_mutex_unlock(&s->m);
+    return 0;
+  }
   {
     /* an uploaded recording whose take list is still to send (2.0.3) */
     Item list;
@@ -1763,7 +1898,7 @@ static int step(TfClient *c, Share *s, const char *id) {
       char *p = sess_path(s, id, "session.json");
       const int has_session = p && tf_file_exists(p);
       free(p);
-      if (!has_session) remove_session(s, id); /* a folder with no session at all */
+      if (!has_session) live_remove(c, s, id); /* a folder with no session at all */
     }
     return 0;
   }
@@ -1771,7 +1906,12 @@ static int step(TfClient *c, Share *s, const char *id) {
   const TfJson *ev = tf_json_get(cap, "ended");
   int ended = ev && ev->type == TJ_BOOL && ev->boolean;
   if (!ended && !active) { /* the capture died (crash, restart): close the session at its last whole page */
+    if (!live_lock(c, s)) {
+      tf_json_free(cap);
+      return 1;
+    }
     recover(s, id, cap);
+    tf_mutex_unlock(&s->m);
     tf_json_free(cap);
     cap = read_json(s, id, "capture.json");
     if (!cap) return 0;
@@ -1780,7 +1920,7 @@ static int step(TfClient *c, Share *s, const char *id) {
   const int closed = tf_json_get(cap, "closed") ? (int)tf_json_get(cap, "closed")->num : 0;
   tf_json_free(cap);
   if (now_s() - created > MAX_AGE_S) { /* unsent sessions older than 7 days are deleted */
-    remove_session(s, id);
+    live_remove(c, s, id);
     return 0;
   }
   Item it;
@@ -1794,17 +1934,27 @@ static int step(TfClient *c, Share *s, const char *id) {
     const int rd = p ? tf_read_file(p, &body, &bn) : -1;
     free(p);
     if (rd) {
-      remove_session(s, id);
+      live_remove(c, s, id);
       item_free(&it);
       return 0;
     }
     char hdr[64];
     snprintf(hdr, sizeof hdr, "x-qlab-id: %s", id);
+    if (!live(c, s)) { /* 3.0.1: a stop since the pass began: the upload is not started */
+      free(body);
+      item_free(&it);
+      return 1;
+    }
     it.attempts++;
     TfHttpResponse r;
     memset(&r, 0, sizeof r);
     const int rc = tf__client_call(c, "POST", "/v1/uploads", body, 1, hdr, &r);
     free(body);
+    if (s->cancel || !live(c, s)) { /* aborted, or a stop while the start was on its way: nothing is written */
+      tf_http_response_free(&r);
+      item_free(&it);
+      return 1;
+    }
     const int a = answer(c, s, id, &it, rc, &r);
     tf_http_response_free(&r);
     if (a == ANS_GONE) {
@@ -1817,11 +1967,14 @@ static int step(TfClient *c, Share *s, const char *id) {
     }
     it.started = 1;
     it.attempts = 0;
-    item_save(s, id, &it);
+    if (!live_save(c, s, id, &it)) {
+      item_free(&it);
+      return 1;
+    }
   }
   for (int n = 1; n <= closed; ++n) {
     if (item_done(&it, n)) continue;
-    if (s->cancel || !tf__client_sharing_state(c)) goto out;
+    if (!live(c, s)) goto out; /* sharing went off, or a stop: no further segment (out writes nothing then) */
     const Url *u = item_url(&it, n);
     if (!u || u->exp - now_s() <= URL_MARGIN_S) {
       const int a = fetch_urls(c, s, id, &it, n);
@@ -1843,9 +1996,10 @@ static int step(TfClient *c, Share *s, const char *id) {
     if (!url) goto out;
     strcpy(url, u->url);
     int status = 0;
-    const int rc = put_segment(s, id, n, url, &status);
+    /* asked again right before the audio goes: URLs may have been fetched since the look above */
+    const int rc = live(c, s) ? put_segment(s, id, n, url, &status) : -1;
     free(url);
-    if (s->cancel || !tf__client_sharing_state(c)) goto out; /* sharing went off during the PUT */
+    if (s->cancel || !live(c, s)) goto out; /* aborted (a stop, the client closing), or sharing went off */
     if (rc) {
       ladder_failed(s); /* no connection, a timeout or a transport error */
       retry(&it, "PUT: offline", 0, 0);
@@ -1857,12 +2011,14 @@ static int step(TfClient *c, Share *s, const char *id) {
       item_drop_url(&it, n);
       it.error[0] = 0;
       it.attempts = 0;
+      if (!live_lock(c, s)) goto out;
       item_save(s, id, &it);
       char name[32];
       snprintf(name, sizeof name, "seg-%05d.opus", n);
       char *p = sess_path(s, id, name);
       if (p) remove(p);
       free(p);
+      tf_mutex_unlock(&s->m);
       ladder_ok(s, backlog_s(s));
       continue;
     }
@@ -1873,7 +2029,7 @@ static int step(TfClient *c, Share *s, const char *id) {
     if (status == 403) { /* an expired or wrong URL: ask again from this segment (at once, a few times) */
       item_drop_url(&it, n);
       if (it.attempts < 5) {
-        item_save(s, id, &it);
+        if (!live_save(c, s, id, &it)) goto out;
         n--; /* the same segment again, with a fresh URL */
         continue;
       }
@@ -1907,8 +2063,10 @@ static int step(TfClient *c, Share *s, const char *id) {
         tf_json_free(sj);
         free(list);
         item_free(&it);
+        if (!live_lock(c, s)) return 1;
         remove_session(s, id);
         tf__sharing_uploaded(c);
+        tf_mutex_unlock(&s->m);
         return 0;
       }
       free(list);
@@ -1922,16 +2080,23 @@ static int step(TfClient *c, Share *s, const char *id) {
       it.next_at = 0;
       it.error[0] = 0;
       while (it.n_urls) item_drop_url(&it, it.urls[0].n);
+      if (!live_lock(c, s)) {
+        item_free(&it);
+        return 1;
+      }
       item_save(s, id, &it);
       keep_item_and_takes(s, id);
       tf__sharing_uploaded(c);
+      tf_mutex_unlock(&s->m);
       stop = step_takes(c, s, id, &it);
       item_free(&it);
       return stop;
     }
   }
 out:
-  item_save(s, id, &it);
+  /* 3.0.1: the recording's state is written only by a live pass. After a stop the folder is gone (or about to be
+   * deleted): writing it back would leave a recording on the device after the learner turned sharing off. */
+  if (!live_save(c, s, id, &it)) stop = 1;
   item_free(&it);
   return stop;
 }
@@ -1963,7 +2128,7 @@ static long long pass(TfClient *c, Share *s) {
   for (int i = 0; i < n; ++i) {
     if (!is_id(names[i])) continue;
     if (!may) break;
-    if (s->cancel || s->quit) break;
+    if (s->cancel || s->quit || !live(c, s)) break;
     if (step(c, s, names[i])) break;
   }
   long long next = 0;
@@ -1980,16 +2145,25 @@ static long long pass(TfClient *c, Share *s) {
 static void share_thread(void *arg) {
   TfClient *c = (TfClient *)arg;
   Share *s = sh(c);
+  /* 3.0.1: this thread's calls to the API (the start, the URLs, the take list, and the token they may need) carry
+   * the uploader's own abort flag, as its PUTs always did: a stop aborts whichever request is in flight */
+  tf__client_thread_cancel(&s->cancel);
   tf_mutex_lock(&s->m);
   for (;;) {
+    if (s->quit) break;
+    /* a deletion is asking the server: no pass begins until it has its answer */
+    while (s->held && !s->quit) tf_cond_wait_ms(&s->cv, &s->m, 50);
     if (s->quit) break;
     s->wake = 0;
     s->cancel = 0;
     s->in_pass = 1;
+    s->pass_gen = s->stop_gen;
+    sweep(c, s);
     tf_mutex_unlock(&s->m);
     const long long next = pass(c, s);
     tf_mutex_lock(&s->m);
     s->in_pass = 0;
+    s->stuck = 0;
     s->passes++;
     tf_cond_signal(&s->cv);
     if (s->quit) break;
@@ -2178,22 +2352,73 @@ void tf__share_wipe(TfClient *c) {
   Share *s = sh(c);
   if (!s) return;
   recorder_stop(s);
-  /* The uploader may be in the middle of a PUT: it holds the segment file open (Windows cannot delete an open
-   * file) and writes the session's state when it leaves. Deleting under its feet could leave the recording on
-   * disk after the learner turned sharing off. So: abort under the uploader's lock (its own reset of the flag
-   * cannot lose the abort), wait until it has left its pass (it signals; at most 3 s), then delete. A new pass
-   * cannot start while this holds the lock, and the next one sees that sharing is off. */
+  /* 3.0.1. The uploader may be inside a request (a PUT, or a call to the API) and would write the recording's
+   * state when it comes back. So, under the uploader's lock: the stop is counted (from here on the pass in flight
+   * sends nothing and writes nothing, whenever its request comes back), the request is aborted (under the lock,
+   * so the uploader's own reset of the flag cannot lose the abort), the pass is waited for (it signals; a request
+   * the transport cannot abort is waited for 2 s at most), and then everything is deleted. No pass begins while
+   * this holds the lock, and the next one sees that sharing is off. What cannot be deleted now (a file still in
+   * use on Windows) is looked at a second time. What is left then carries a stamp from before this stop (the
+   * caller counted up when it saved the consent), so it is never uploaded, and the sweep before every upload pass
+   * and at the next launch deletes it: however many recordings that is, and also when this process dies here. */
+  tf_mutex_lock(&s->m);
+  s->stop_gen++;
+  stop_wait(s);
+  for (int look = 0; look < 2; ++look) {
+    char names[256][64];
+    const int n = list_dir(s->outbox, names, 256);
+    int left = 0;
+    for (int i = 0; i < n; ++i) {
+      if (!is_id(names[i]) || is_active(s, names[i])) continue;
+      remove_session(s, names[i]);
+      left += session_left(s, names[i]);
+    }
+    if (!left) break;
+    if (look == 0) tf_cond_wait_ms(&s->cv, &s->m, 50);
+    else {
+      s->wake = 1; /* the uploader, when it runs, sweeps before its next pass */
+      tf_cond_signal(&s->cv);
+    }
+  }
+  tf_mutex_unlock(&s->m);
+}
+
+/* launch: what a stop of an earlier run left behind is deleted before anything else happens */
+void tf__share_sweep(TfClient *c) {
+  Share *s = sh(c);
+  if (!s) return;
+  tf_mutex_lock(&s->m);
+  sweep(c, s);
+  tf_mutex_unlock(&s->m);
+}
+
+/* "Delete what I shared" stops the queue BEFORE it asks the server (3.0.1): the stop is counted, the request in
+ * flight is aborted and the pass waited for, and no pass begins until tf__share_resume. Nothing is deleted here:
+ * a deletion the server does not take changes nothing, and the queue carries on where it was. */
+void tf__share_hold(TfClient *c) {
+  Share *s = sh(c);
+  if (!s) return;
+  tf_mutex_lock(&s->m);
+  s->held++;
+  s->stop_gen++;
+  stop_wait(s);
+  tf_mutex_unlock(&s->m);
+}
+void tf__share_resume(TfClient *c) {
+  Share *s = sh(c);
+  if (!s) return;
+  tf_mutex_lock(&s->m);
+  if (s->held > 0) s->held--;
+  s->wake = 1;
+  tf_cond_signal(&s->cv);
+  tf_mutex_unlock(&s->m);
+}
+/* the client is being destroyed: the uploader's request in flight is abandoned with the client's other calls */
+void tf__share_cancel(TfClient *c) {
+  Share *s = sh(c);
+  if (!s) return;
   tf_mutex_lock(&s->m);
   tf__http_cancel(&s->cancel);
-  const double t0 = tf__now_s();
-  while (s->in_pass && tf__now_s() - t0 < 3.0) {
-    tf__http_cancel(&s->cancel);
-    tf_cond_wait_ms(&s->cv, &s->m, 20);
-  }
-  char names[256][64];
-  const int n = list_dir(s->outbox, names, 256);
-  for (int i = 0; i < n; ++i)
-    if (is_id(names[i]) && !is_active(s, names[i])) remove_session(s, names[i]);
   tf_mutex_unlock(&s->m);
 }
 

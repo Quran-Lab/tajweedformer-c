@@ -71,7 +71,7 @@ Copy the setup prompt from [sdk.quranlab.ai](https://sdk.quranlab.ai) and paste 
   `c24_l72`, `c24_l256`), addressed by version (`4.0.0`). SDK 3.0.0 runs 3.0 builds; 2.x builds stay on the 2.x
   SDKs.
 - **Who it is for:** desktop apps on Windows and Linux, and servers decoding many recitations.
-- **Status:** released, 3.0.0. Through the library's own API on Windows x86-64 (clang on the Microsoft runtime): V4
+- **Status:** released, 3.0.1. Through the library's own API on Windows x86-64 (clang on the Microsoft runtime): V4
   conformance 35/35 through Sessions (all twelve outputs of every chunk, bit for bit), the shared 3.0 vectors
   (manifest, speech events, settled tokens, telemetry, contexts, names), the error catalogue, and the Model,
   Session and reference tests on a 3.0 model folder. Linux: built and tested by the CI workflow (see
@@ -85,9 +85,9 @@ One model, one engine, the same bits on every platform. Each SDK compiles the sa
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
 | [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+ on arm64-v8a and armeabi-v7a, desktop JVM | Maven Central `ai.quranlab:tajweedformer:3.0.0` |
-| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.0.0"`, product `TajweedFormer` |
+| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.0.1"`, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node 20+ | `npm install @quran-lab/tajweedformer` |
-| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 3.0.0 |
+| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 3.0.1 |
 | [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) | The engine: exact C runtime, inference library, conformance suite | everything above | Git submodule |
 
 The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), hosted by Quran Lab and served by
@@ -108,7 +108,7 @@ project(app C CXX)
 include(FetchContent)
 FetchContent_Declare(tajweedformer
   GIT_REPOSITORY https://github.com/Quran-Lab/tajweedformer-c.git
-  GIT_TAG        3.0.0)
+  GIT_TAG        3.0.1)
 FetchContent_MakeAvailable(tajweedformer)
 
 add_executable(quickstart quickstart.c)
@@ -125,7 +125,7 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCM
 cmake --build build
 ```
 
-To build the repository by itself (the library, the `tajweedformer` command-line tool and the tests), clone it with `git clone --recurse-submodules --branch 3.0.0 https://github.com/Quran-Lab/tajweedformer-c`, then `cmake --preset linux` or `cmake --preset windows-clang`, and `cmake --build --preset` with the same name.
+To build the repository by itself (the library, the `tajweedformer` command-line tool and the tests), clone it with `git clone --recurse-submodules --branch 3.0.1 https://github.com/Quran-Lab/tajweedformer-c`, then `cmake --preset linux` or `cmake --preset windows-clang`, and `cmake --build --preset` with the same name.
 
 ## Before you start
 
@@ -529,7 +529,10 @@ same page in every TajweedFormer SDK); the C calls are in [docs/api.md](docs/api
   keeps that second in memory only, drops the feed at once without a yes, and the model never sees it. An app
   that captures only during takes gets no pre-roll and no tail.
 - **Stop and delete** at any time (`tf_sharing_set_on(client, 0)`, `tf_sharing_delete`), whatever wording the
-  learner agreed to.
+  learner agreed to. Both stop an upload that is in flight: the request is aborted, nothing more is sent once the
+  call has returned, the call returns within 3 seconds, and nothing unsent stays on disk. A deletion the server
+  took also turns sharing off (the learner turns it on again with the switch and is not asked again); one the
+  server did not take changes nothing.
 
 ## Telemetry
 

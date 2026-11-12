@@ -28,6 +28,19 @@ answers "Share", and a learner who never answers never shares.
 - The learner can stop at any time (uploads stop at once and the unsent queue is deleted) and delete
   everything they shared (signed with a key that never leaves the device; a one-time recovery code works
   at portal.quranlab.ai/delete). Both work whatever wording the learner agreed to.
+- What "at once" means (3.0.1): the request in flight is aborted, whichever it is (a segment, the start of an
+  upload, a batch of upload URLs, a take list); once the call has returned no audio leaves the device; the call
+  returns within 3 seconds even when a request hangs; nothing unsent is left on disk, also when the aborted
+  request comes back later; and turning sharing on again works right away.
+- A recording made under an earlier consent is never uploaded, whatever happened in between: sharing turned
+  off and on again, the process ending between the off and the deletion of the queue, a recording that could
+  not be deleted at once. The settings file carries a count of the learner's changes of mind, written with the
+  consent, and every recording carries the count it was begun under (the file `stamp` in its folder, which is
+  never uploaded); a recording with another count is deleted before every upload pass and at launch.
+- A deletion the server took turns sharing off, as the settings switch does: the learner turns it on again
+  with the switch and is never asked again, and what they share after that goes under a new contributor id.
+  A deletion the server did not take (an error, no connection) changes nothing: sharing stays as it was and
+  the queue carries on.
 
 ### The default sheet, a themed sheet, or your own
 

@@ -318,7 +318,7 @@ static int api_tests(const char *work, const char *data) {
     c = ap_client(d);
     CHECK(c && tf_client_model(c, NULL) == NULL && tf_last_error_code() == refused[i].code, "%s: model() gave %s", refused[i].reason, tf_error_name(tf_last_error_code()));
     if (refused[i].mode == 2)
-      CHECK(!strcmp(tf_last_error(), "This key needs SDK 3.1.0 or later; this is 3.0.0.") && strstr(tf_last_error_fix(), "3.1.0"),
+      CHECK(!strcmp(tf_last_error(), "This key needs SDK 3.1.0 or later; this is " TF_SDK_VERSION ".") && strstr(tf_last_error_fix(), "3.1.0"),
             "sdk_too_old names the version of the answer: %s / %s", tf_last_error(), tf_last_error_fix());
     r = c ? ap_diagnose(c, refused[i].reason) : NULL;
     CHECK(r && ap_false(r, "key", "accepted") && !strcmp(ap_str(r, "key", "reason"), refused[i].reason) &&
@@ -400,7 +400,16 @@ static int api_tests(const char *work, const char *data) {
       tf_mkdirs(d);
       c = tf_client_create(&(TfClientOptions){.key = "qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa", .app_id = app, .app_version = "1.0", .storage = d,
                                               .trusted_key_hex = tf_json_str(tf_json_get(g_ap.fx, "public_key_hex"))});
-      const char *code = tf_json_str(tf_json_get(e, "code")), *msg = tf_json_str(tf_json_get(e, "message")), *fix = tf_json_str(tf_json_get(e, "fix"));
+      const char *code = tf_json_str(tf_json_get(e, "code")), *fix = tf_json_str(tf_json_get(e, "fix"));
+      /* a message that carries the SDK's version has the version the file was built with (`sdk`): this SDK's own
+       * goes in its place (the shared README 4.5) */
+      char msg[512];
+      {
+        const char *m = tf_json_str(tf_json_get(e, "message")), *built = tf_json_str(tf_json_get(v, "sdk"));
+        const char *at = m && built && *built ? strstr(m, built) : NULL;
+        if (at) snprintf(msg, sizeof msg, "%.*s%s%s", (int)(at - m), m, TF_SDK_VERSION, at + strlen(built));
+        else snprintf(msg, sizeof msg, "%s", m ? m : "");
+      }
       const int good = c && text && tf_client_model(c, NULL) == NULL && !strcmp(tf_error_name(tf_last_error_code()), code) &&
                        !strcmp(tf_last_error(), msg) && tf_last_error_fix() && !strcmp(tf_last_error_fix(), fix);
       CHECK(good, "refusals.json %s: %s / %s / %s", tf_json_str(tf_json_get(cs, "name")), tf_error_name(tf_last_error_code()), tf_last_error(),
@@ -426,7 +435,7 @@ static int api_tests(const char *work, const char *data) {
   snprintf(d, sizeof d, "%s/nomodel", work);
   c = ap_client(d);
   g_ap.config_calls = 0;
-  CHECK(c && tf_client_model(c, NULL) == NULL && tf_last_error_code() == TF_ERR_MODEL_UNAVAILABLE && !strcmp(tf_last_error(), "Quran Lab has no model build for SDK 3.0.0 yet."),
+  CHECK(c && tf_client_model(c, NULL) == NULL && tf_last_error_code() == TF_ERR_MODEL_UNAVAILABLE && !strcmp(tf_last_error(), "Quran Lab has no model build for SDK " TF_SDK_VERSION " yet."),
         "no build for this SDK: %s", tf_error_name(tf_last_error_code()));
   CHECK(c && tf_client_prefetch(c, NULL) == TF_ERR_MODEL_UNAVAILABLE && g_ap.config_calls == 2, "prefetch: %s after %d config requests", tf_error_name(tf_last_error_code()),
         g_ap.config_calls);
@@ -441,7 +450,7 @@ static int api_tests(const char *work, const char *data) {
   CHECK(c && tf_client_model(c, &(TfModelOptions){.version = "4.0"}) == NULL && tf_last_error_code() == TF_ERR_INVALID_ARGUMENT && g_ap.config_calls == 0,
         "a pin that is not a version: %s, %d config requests", tf_error_name(tf_last_error_code()), g_ap.config_calls);
   CHECK(c && tf_client_prefetch(c, &(TfPrefetchOptions){.version = "4.1.0"}) == TF_ERR_MODEL_UNAVAILABLE && strstr(g_ap.config_path, "model_version=4.1.0") &&
-            strstr(g_ap.config_path, "sdk=3.0.0"),
+            strstr(g_ap.config_path, "sdk=" TF_SDK_VERSION),
         "a pinned version in the config request: %s", g_ap.config_path);
   CHECK(c && tf_client_prefetch(c, NULL) == TF_ERR_MODEL_UNAVAILABLE && !strstr(g_ap.config_path, "model_version"), "no pin, no model_version: %s", g_ap.config_path);
   tf_client_destroy(c);
