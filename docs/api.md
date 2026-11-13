@@ -1,4 +1,4 @@
-# The C API: `tajweedformer.h` (SDK 3.1.0)
+# The C API: `tajweedformer.h` (SDK 3.1.2)
 
 One library for Windows and Linux apps and for servers: `tajweedformer.dll` / `libtajweedformer.so` (or the static
 library) and one header, `include/tajweedformer.h`. It includes nothing but `<stddef.h>` and names no engine type.
@@ -18,7 +18,7 @@ Five things, with the same names and the same order of calls as the Android, App
 
 Every options struct (`TfClientOptions`, `TfModelOptions`, `TfPrefetchOptions`, `TfSessionOptions`) may be NULL or
 zeroed: zero is the default of every field. Strings and arrays returned as `const` belong to the object they came
-from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"3.1.0"`.
+from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"3.1.2"`.
 
 ## Errors
 

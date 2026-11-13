@@ -520,6 +520,49 @@ static int keys_sorted(const TfJson *j) {
   return j != NULL;
 }
 
+/* removed_2026-11-12.json, {lang: {string key: {"bytes", "sha256"}}}: one entry's length and hash; 0 when it is
+ * not well formed */
+static size_t gone_entry(const TfJson *e, uint8_t want[32]) {
+  const TfJson *b = tf_json_get(e, "bytes");
+  const char *hex = tf_json_str(tf_json_get(e, "sha256"));
+  return b && b->type == TJ_NUM && b->num >= 24 && hex && strlen(hex) == 64 && !tf_hex_decode(hex, want, 32) ? (size_t)b->num : 0;
+}
+static int gone_entries(const TfJson *gone) {
+  int n = 0;
+  uint8_t want[32];
+  for (int l = 0; gone && l < gone->n; ++l)
+    for (int k = 0; k < gone->kids[l].n; ++k) n += gone_entry(&gone->kids[l].kids[k], want) > 0;
+  return n;
+}
+/* how many windows of the UTF-8 bytes of `s` have the length and the SHA-256 of an entry (an entry equal to the
+ * one before it in its language, the same sentence in both strings, is searched once) */
+static int gone_windows(const TfJson *gone, const char *s) {
+  const size_t n = strlen(s);
+  int hits = 0;
+  for (int l = 0; gone && l < gone->n; ++l) {
+    uint8_t before[32] = {0};
+    for (int k = 0; k < gone->kids[l].n; ++k) {
+      uint8_t want[32], got[32];
+      const size_t w = gone_entry(&gone->kids[l].kids[k], want);
+      if (!w || (k > 0 && !memcmp(want, before, 32))) continue;
+      memcpy(before, want, 32);
+      for (size_t at = 0; at + w <= n; ++at) {
+        tf_sha256(s + at, w, got);
+        hits += !memcmp(got, want, 32);
+      }
+    }
+  }
+  return hits;
+}
+/* the same over every string anywhere in the JSON value `j` (a copy deck: its strings, and the strings in them) */
+static int gone_in(const TfJson *j, const TfJson *gone) {
+  if (!j) return 0;
+  int n = j->type == TJ_STR && j->str ? gone_windows(gone, j->str) : 0;
+  if (j->type == TJ_OBJ || j->type == TJ_ARR)
+    for (int i = 0; i < j->n; ++i) n += gone_in(&j->kids[i], gone);
+  return n;
+}
+
 static int consent_tests(const char *vdir, const char *fx_path, const char *dir) {
   tf_mkdirs(dir);
   char *vp = tf_path_join(vdir, "consent_text.json");
@@ -595,11 +638,11 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
   TfClient *c = consent_client(d, &rec);
   CHECK(tf__sharing_session_begin(c, 48000, NULL) == NULL, "default path: a capture before any answer");
   feedback_session(c);
-  CHECK(rec.calls == 1 && rec.reask == 0 && !strcmp(rec.version, "share-2026-11-12"), "the first ask: %d calls, version %s", rec.calls, rec.version);
+  CHECK(rec.calls == 1 && rec.reask == 0 && !strcmp(rec.version, "share-2026-11-09"), "the first ask: %d calls, version %s", rec.calls, rec.version);
   CHECK(rec.copy && !strcmp(rec.copy, tf__sharing_deck_json("en")), "the ask's copy is the bundled deck without own wording");
   tf__client_sharing_answer(c, 1);
   CHECK(tf__client_sharing_state(c) == 1, "granted under the deck");
-  CHECK(session_version_is(c, d, "share-2026-11-12", NULL), "without own wording the session JSON has the deck's version and no hash");
+  CHECK(session_version_is(c, d, "share-2026-11-09", NULL), "without own wording the session JSON has the deck's version and no hash");
   static const char *const kw[] = {"sheet.what", "impact.minutes.other"};
   static const char *const tw[] = {"The audio of your recitations in this app and basic technical details. Nothing else.",
                                    "You shared {minutes} minutes. Thank you."};
@@ -622,12 +665,12 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
   for (int i = 0; i < 30; ++i) feedback_session(c);
   CHECK(tf__client_sharing_ask_now(c) == 0, "ask_now after a yes");
   CHECK(rec.calls == 1, "own wording after a deck grant asked again: %d calls", rec.calls);
-  CHECK(tf__client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-12\"") && status_has(c, "\"updateNeeded\":false") &&
+  CHECK(tf__client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-09\"") && status_has(c, "\"updateNeeded\":false") &&
             status_has(c, "\"pendingAsk\":false"),
         "own wording after a deck grant paused sharing: %s", tf__client_sharing_status_json(c));
-  CHECK(session_version_is(c, d, "share-2026-11-12", NULL), "own wording after a deck grant: the session JSON lost the deck's version");
+  CHECK(session_version_is(c, d, "share-2026-11-09", NULL), "own wording after a deck grant: the session JSON lost the deck's version");
   /* clearing the wording again changes nothing for this learner */
-  CHECK(tf_sharing_set_wording(c, NULL, NULL, 0) == 0 && !strcmp(tf__sharing_consent_version(c), "share-2026-11-12") &&
+  CHECK(tf_sharing_set_wording(c, NULL, NULL, 0) == 0 && !strcmp(tf__sharing_consent_version(c), "share-2026-11-09") &&
             tf__sharing_consent_sha256(c) == NULL && tf__sharing_consent_text(c) == NULL,
         "cleared wording");
   CHECK(tf__client_sharing_state(c) == 1 && rec.calls == 1, "a cleared wording paused or asked");
@@ -718,8 +761,9 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
 
   /* 3. upgrades: a 2.0.0 sharing.json (the exact 2.0.0 format; 2.0.0 recorded consentVersion with every grant, and
    * its decks were share-2026-11-07), one without a version, a 2.0.1 grant to an earlier deck, and a recording-fix
-   * build's paused grant, and a 3.0 grant to the deck of 2026-11-09. With this SDK's deck in force: no ask before
-   * or after sessions, sharing on, the old version in the session JSON, across a restart. */
+   * build's paused grant, a 3.0 grant to the deck of 2026-11-09, and a 3.1 grant to the deck of 2026-11-12. With
+   * this SDK's deck in force: no ask before or after sessions, sharing on, the stored version in the session
+   * JSON, across a restart. */
   static const struct {
     const char *name, *state, *want;
   } up[] = {
@@ -735,19 +779,25 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
        "{\"v\":1,\"consent\":\"granted\",\"asks\":1,\"lastAskSession\":1,\"sessions\":3,\"thanked\":false,\"decidedAt\":1762600000,"
        "\"consentVersion\":\"share-2026-11-08\",\"consentTextSha256\":null,\"guardian\":false,\"sharedSessions\":0,\"pendingAsk\":0}",
        "share-2026-11-08"},
-      /* SPEC 11.8: a yes given to the deck before this one (3.0.x, share-2026-11-09) is kept with its version:
-       * not asked again, and the next recording carries share-2026-11-09, not this SDK's share-2026-11-12 */
+      /* SPEC 11.8: a yes given in 3.0.x (share-2026-11-09) is kept with its version and not asked again */
       {"a 3.0 grant to the deck of 2026-11-09",
        "{\"v\":1,\"consent\":\"granted\",\"asks\":1,\"lastAskSession\":1,\"sessions\":3,\"thanked\":false,\"decidedAt\":1762700000,"
        "\"consentVersion\":\"share-2026-11-09\",\"consentTextSha256\":null,\"guardian\":false,\"sharedSessions\":1,\"pendingAsk\":0}",
        "share-2026-11-09"},
+      /* SPEC 11.8: a yes given in 3.1.0 or 3.1.1 to the deck of 2026-11-12, whose name is
+       * NEWER than the deck this SDK bundles (share-2026-11-09 again). The state is the file 3.1.0 writes. It is
+       * kept with its version: not asked again, and the next recording carries share-2026-11-12 */
+      {"a 3.1 grant to the deck of 2026-11-12",
+       "{\"v\":1,\"consent\":\"granted\",\"asks\":1,\"lastAskSession\":1,\"sessions\":4,\"thanked\":false,\"decidedAt\":1762950000,"
+       "\"consentVersion\":\"share-2026-11-12\",\"consentTextSha256\":null,\"guardian\":false,\"sharedSessions\":1,\"pendingAsk\":0,\"stamp\":1}",
+       "share-2026-11-12"},
       {"a recording-fix build's paused grant",
        "{\"v\":1,\"consent\":\"unknown\",\"asks\":0,\"lastAskSession\":1,\"sessions\":4,\"thanked\":false,\"decidedAt\":1762500000,"
        "\"consentVersion\":\"share-2026-11-07\",\"consentTextSha256\":null,\"guardian\":false,\"sharedSessions\":0,\"pendingAsk\":0,\"update\":1}",
        "share-2026-11-07"},
   };
   int up_ok = 0;
-  for (int k = 0; k < 5; ++k) {
+  for (int k = 0; k < 6; ++k) {
     const int f0 = fails;
     snprintf(d, sizeof d, "%s/upgrade%d", dir, k);
     seed_config(d, "{\"contributions\":true}");
@@ -770,6 +820,9 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
     feedback_session(c);
     CHECK(tf__client_sharing_state(c) == 1 && status_has(c, want) && status_has(c, "\"pendingAsk\":false"), "%s: after a restart %s", up[k].name,
           tf__client_sharing_status_json(c));
+    tf__client_sharing_ask_now(c);
+    CHECK(status_has(c, "\"pendingAsk\":false") && session_version_is(c, d, up[k].want, NULL), "%s: after a restart and ask-now, an ask is pending or the session JSON does not carry %s",
+          up[k].name, up[k].want);
     if (k == 0) {
       /* withdrawal under 2.0.0's version: uploads stop, the queue goes, no ask; the settings switch then records the
        * version in force */
@@ -782,9 +835,9 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
       for (int i = 0; i < 20; ++i) feedback_session(c);
       CHECK(status_has(c, "\"pendingAsk\":false") && status_has(c, "\"consent\":\"final\""), "asked after the withdrawal: %s", tf__client_sharing_status_json(c));
       tf__client_sharing_set(c, 1);
-      CHECK(tf__client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-12\""), "the settings switch after an upgrade: %s",
+      CHECK(tf__client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-09\""), "the settings switch after an upgrade: %s",
             tf__client_sharing_status_json(c));
-      CHECK(session_version_is(c, d, "share-2026-11-12", NULL), "the settings switch's grant in the session JSON");
+      CHECK(session_version_is(c, d, "share-2026-11-09", NULL), "the settings switch's grant in the session JSON");
     }
     tf__client_close(c);
     up_ok += fails == f0;
@@ -845,8 +898,8 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
            "remembered refusal stayed, also across a restart\n");
   }
   free(noise);
-  CHECK(up_ok == 5, "%d of 5 stored answers of earlier decks were kept with their version and without an ask", up_ok);
-  printf("upgrades kept the grant with no ask (2.0.0 and earlier decks, the deck of 2026-11-09 among them): %d/5\n", up_ok);
+  CHECK(up_ok == 6, "%d of 6 stored answers of other decks were kept with their version and without an ask", up_ok);
+  printf("upgrades kept the grant with no ask (2.0.0 and earlier decks, the decks of 2026-11-09 and 2026-11-12 among them): %d/6\n", up_ok);
 
   /* 4. three sheets per install, ever. "Not now" three times: asks at sessions 1, 8 and 15 (7 apart), then none in
    * 40 sessions and none after a restart; the settings switch still turns sharing on. */
@@ -872,7 +925,7 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
   for (int i = 0; i < 30; ++i) feedback_session(c);
   CHECK(rec.calls == 3 && tf__client_sharing_state(c) == 0, "a fourth sheet after a restart: %d calls", rec.calls);
   tf__client_sharing_set(c, 1);
-  CHECK(tf__client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-12\""), "the settings switch after three Not now");
+  CHECK(tf__client_sharing_state(c) == 1 && status_has(c, "\"consentVersion\":\"share-2026-11-09\""), "the settings switch after three Not now");
   tf__client_close(c);
 
   /* sheets left unanswered (no callback, the pending ask never answered) count too: three, 7 sessions apart */
@@ -954,27 +1007,35 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
   CHECK(rec.calls == 0 && tf__client_sharing_state(c) == 0, "2.0.0's five unanswered asks: %d more", rec.calls);
   tf__client_close(c);
   free(rec.copy);
-  /* 5. the decks: eight languages, version 2026-11-12.1, consent share-2026-11-12, the new keys, no {days} */
+  /* 5. the decks: eight languages, version 2026-11-13.1, consent share-2026-11-09, the new keys, no {days} */
   static const char *const langs[] = {"ar", "bn", "en", "fr", "id", "ms", "tr", "ur"};
-  int decks = 0, shown_ok = 0;
+  int decks = 0, shown_ok = 0, clean = 0;
+  /* SPEC 11.8: the sentence that deck 2026-11-12.1 added is in no string an app is handed.
+   * The test data holds its length and SHA-256 per language and string, never its text
+   * (tools/gen_removed_sentence.py, from the contract's archived deck) */
+  char *gone_path = tf_path_join(vdir, "removed_2026-11-12.json");
+  TfJson *gone_doc = read_json_file(gone_path);
+  free(gone_path);
+  const TfJson *gone = tf_json_get(gone_doc, "removed");
+  CHECK(gone && gone->type == TJ_OBJ && gone->n == 8 && gone_entries(gone) == 16, "removed_2026-11-12.json does not hold a length and a hash for two strings in each of eight languages");
   for (int i = 0; i < 8; ++i) {
     const char *t = tf__sharing_deck_json(langs[i]);
     TfJson *j = t ? tf_json_parse(t, strlen(t), NULL) : NULL;
     const TfJson *s = tf_json_get(j, "strings");
-    const int good = j && !strcmp(tf_json_str(tf_json_get(j, "lang")), langs[i]) && !strcmp(tf_json_str(tf_json_get(j, "version")), "2026-11-12.1") &&
-                     !strcmp(tf_json_str(tf_json_get(j, "consent_version")), "share-2026-11-12") && tf_json_get(s, "recovery.keep") &&
+    const int good = j && !strcmp(tf_json_str(tf_json_get(j, "lang")), langs[i]) && !strcmp(tf_json_str(tf_json_get(j, "version")), "2026-11-13.1") &&
+                     !strcmp(tf_json_str(tf_json_get(j, "consent_version")), "share-2026-11-09") && tf_json_get(s, "recovery.keep") &&
                      tf_json_get(s, "delete.failed.network") && tf_json_get(s, "delete.retry") && !strstr(t, "{days}");
     CHECK(good, "deck %s", langs[i]);
     /* the bundled deck is the contract's file, byte for byte (sharing_copy/READY has these hashes) */
     static const char *const kDeckSha[] = {
-      "b8a3402a262ac0f295af5e485ae99804fcbab0dde44f403dc9f38e1bc18be5f0",
-      "56225ba6ebe642793b288d13b82874f9ada8184df8e83ea679aac3ca28a01acb",
-      "1600ab0625db9dab1483d1a2bfd0f0ec9e0e636880909a2d47df2eb7fefd52c0",
-      "aba381efd20462db4864e8328b9a2f231597ffbffac7f42096b89e59e0950be2",
-      "8d32f968b66b6b9176a3e2c152c69903a96fa20601d53f47d23cf3d20edba4f5",
-      "78bd9055b9c3f1ffa05efee1a15778897ee27f7d15aa1887142682d80f21848c",
-      "258a04a68c4e4d44739ca73da170a052cdb2a2f41914e5067314982190e0b9d9",
-      "6d50705ea642f30711207b7093337a15cb7afba5d12b5c4d80bf0fe7e192c1d1"};
+      "03fc6aa2eed9134b5b5780ba2abcc5590c043024d0c6daf829c876742519f599",
+      "e6b0a844386437838adcd0c3693ae39f93d40e5c3dba3b614c7f71574028a6b6",
+      "3bac94a18f4691e7fb51021e9aa4f241d409a6dc4f8f89ec22a82761ebd75051",
+      "9895b3eaf3e67afa250629b9ea3d93613d0298168d068fb6aba2e00450dda7ca",
+      "f0621036f69d8f3754a0dfffea58b6c99e13a22c8356ba4cece0b20c3ba9abd0",
+      "2c15cf8515885ef1bebe59117c61926dfd93ce406100fe2434e4b10d6c8e3e9d",
+      "227783a34b2fdf6870ebd5d32eafb9e3ebcf496bed44797de87b571744200099",
+      "755e2b9873180336b7e06bb44c0a9910441d8ee59dced42142c8f420ae77875a"};
     uint8_t dh[32];
     char dhex[65];
     tf_sha256(t ? t : "", t ? strlen(t) : 0, dh);
@@ -994,9 +1055,15 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
       const char *who = tf_json_str(tf_json_get(s, "sheet.who")), *detail = tf_json_str(tf_json_get(s, "what.detail"));
       const char *who2 = tf_json_str(tf_json_get(ss2, "sheet.who")), *detail2 = tf_json_str(tf_json_get(ss2, "what.detail"));
       const int same = wr.calls == 1 && who && who2 && !strcmp(who, who2) && detail && detail2 && !strcmp(detail, detail2) && strlen(who) > 40 &&
-                       !strcmp(wr.version, "share-2026-11-12");
+                       !strcmp(wr.version, "share-2026-11-09");
       CHECK(same, "the sheet's lines for %s: %d asks, version %s, sheet.who %s", langs[i], wr.calls, wr.version, who2 ? "differs from the deck's" : "is missing");
       shown_ok += same;
+      /* no window of any string of what the app is handed, nor of the bundled deck, has the length and the hash
+       * of that sentence, in any of the eight languages */
+      const int held = gone_in(shown, gone), held_deck = gone_in(j, gone);
+      CHECK(shown && j && held == 0 && held_deck == 0, "%s: the sentence that deck 2026-11-12.1 added is in %d places of the copy handed over and %d of the bundled deck",
+            langs[i], held, held_deck);
+      clean += shown && j && held == 0 && held_deck == 0;
       tf_json_free(shown);
       tf__client_close(wc);
       free(wr.copy);
@@ -1005,8 +1072,10 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
     tf_json_free(j);
   }
   CHECK(shown_ok == 8, "%d of 8 languages are handed the deck's sheet.who and what.detail whole", shown_ok);
-  printf("copy decks: %d/8 at 2026-11-12.1 (share-2026-11-12), the contract's bytes, recovery and delete.failed keys, no {days}; the sheet's "
-         "sheet.who and what.detail handed over whole: %d/8\n", decks, shown_ok);
+  CHECK(clean == 8, "%d of 8 languages are handed a copy without the sentence that deck 2026-11-12.1 added", clean);
+  tf_json_free(gone_doc);
+  printf("copy decks: %d/8 at 2026-11-13.1 (share-2026-11-09), the contract's bytes, recovery and delete.failed keys, no {days}; the sheet's "
+         "sheet.who and what.detail handed over whole: %d/8; without the sentence that deck 2026-11-12.1 added: %d/8\n", decks, shown_ok, clean);
   printf("consent (own text, a yes kept across decks, wording and upgrades, three sheets at most, session JSON, no capture before a grant, withdrawal, deletion): %s\n", fails ? "FAIL" : "ok");
   return fails ? 1 : 0;
 }
@@ -1358,7 +1427,7 @@ static int sdk_latest_tests(const char *configs, const char *dir) {
   if (!g_sl.fx) return 2;
   tf_mkdirs(dir);
   tf_http_set_transport(sl_stub, NULL);
-  static const char want[] = "Quran Lab SDK 3.1.1 is available (recommended), you have " TF_SDK_VERSION ": https://github.com/Quran-Lab/tajweedformer-c/releases";
+  static const char want[] = "Quran Lab SDK 3.1.3 is available (recommended), you have " TF_SDK_VERSION ": https://github.com/Quran-Lab/tajweedformer-c/releases";
   char d[1100];
   /* newer: one line at launch; a second newer config (a refresh) adds none */
   snprintf(d, sizeof d, "%s/newer", dir);
