@@ -451,6 +451,7 @@ static int sharing_tests(const char *vdir, const char *fx_path, const char *dir)
  * Range resume after an interrupted transfer, gzip decoding, every hash; then the downloaded folder opens */
 static char g_cdn[1024];
 static int g_cut_once, g_requests, g_ranged, g_bad_url;
+static int g_link_down, g_down_requests; /* 3.1.3: after the cut every file request fails until the test lets the link up */
 static int serve_cdn(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
   (void)u;
   g_requests++;
@@ -474,6 +475,11 @@ static int serve_cdn(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
     r->body_n = n;
     return 0;
   }
+  if (g_link_down) {
+    g_down_requests++;
+    free(data);
+    return tf__fail(TF__ERR_NETWORK, "the link is down (simulated)");
+  }
   const long long from = q->range_from > 0 ? q->range_from : 0;
   g_ranged += from > 0;
   FILE *f = fopen(q->download_file, from > 0 ? "ab" : "wb");
@@ -483,6 +489,7 @@ static int serve_cdn(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
     len /= 2; /* the connection drops half way */
     cut = 1;
     g_cut_once = 0;
+    g_link_down = 1;
   }
   fwrite(data + from, 1, len, f);
   fclose(f);
@@ -501,8 +508,13 @@ static int download_tests(const char *cdn, const char *dest, const char *key) {
   d.dest = dest;
   d.contexts = "c16_l64";
   d.trusted_key_hex = key;
+  /* 3.1.3: the call itself resumes a transfer that breaks, five times (the pauses are 1 to 16 ms here); the
+   * link stays down for all five, so this call ends with the error and the partial file is kept */
+  tf__download_pause_ms = 1;
   const int first = tf__download_model(&d);
-  CHECK(first == TF_ERR_DOWNLOAD_FAILED, "the interrupted download: %d", first);
+  tf__download_pause_ms = 1000;
+  CHECK(first == TF_ERR_DOWNLOAD_FAILED && g_down_requests == 5, "the interrupted download: %d after %d resumes (want 5)", first, g_down_requests);
+  g_link_down = 0;
   const int second = tf__download_model(&d);
   CHECK(second == 0, "the resumed download: %s", tf_last_error() ? tf_last_error() : "");
   CHECK(g_ranged >= 1, "no Range request after the interruption");

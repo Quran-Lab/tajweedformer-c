@@ -71,7 +71,7 @@ Copy the setup prompt from [sdk.quranlab.ai](https://sdk.quranlab.ai) and paste 
   `c24_l72`, `c24_l256`), addressed by version (`4.0.0`). SDK 3.0.0 runs 3.0 builds; 2.x builds stay on the 2.x
   SDKs.
 - **Who it is for:** desktop apps on Windows and Linux, and servers decoding many recitations.
-- **Status:** released, 3.1.2. Through the library's own API on Windows x86-64 (clang on the Microsoft runtime): V4
+- **Status:** released, 3.1.3. Through the library's own API on Windows x86-64 (clang on the Microsoft runtime): V4
   conformance 35/35 through Sessions (all twelve outputs of every chunk, bit for bit), the shared 3.0 vectors
   (manifest, speech events, settled tokens, telemetry, contexts, names), the error catalogue, and the Model,
   Session and reference tests on a 3.0 model folder. Linux: built and tested by the CI workflow (see
@@ -84,10 +84,10 @@ One model, one engine, the same bits on every platform. Each SDK compiles the sa
 
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
-| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+ on arm64-v8a and armeabi-v7a, desktop JVM | Maven Central `ai.quranlab:tajweedformer:3.1.1` |
-| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.1.2"`, product `TajweedFormer` |
+| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+ on arm64-v8a and armeabi-v7a, desktop JVM | Maven Central `ai.quranlab:tajweedformer:3.1.2` |
+| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.1.3"`, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node 20+ | `npm install @quran-lab/tajweedformer` |
-| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 3.1.2 |
+| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 3.1.3 |
 | [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) | The engine: exact C runtime, inference library, conformance suite | everything above | Git submodule |
 
 The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), hosted by Quran Lab and served by
@@ -108,7 +108,7 @@ project(app C CXX)
 include(FetchContent)
 FetchContent_Declare(tajweedformer
   GIT_REPOSITORY https://github.com/Quran-Lab/tajweedformer-c.git
-  GIT_TAG        3.1.2)
+  GIT_TAG        3.1.3)
 FetchContent_MakeAvailable(tajweedformer)
 
 add_executable(quickstart quickstart.c)
@@ -125,7 +125,7 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCM
 cmake --build build
 ```
 
-To build the repository by itself (the library, the `tajweedformer` command-line tool and the tests), clone it with `git clone --recurse-submodules --branch 3.1.2 https://github.com/Quran-Lab/tajweedformer-c`, then `cmake --preset linux` or `cmake --preset windows-clang`, and `cmake --build --preset` with the same name.
+To build the repository by itself (the library, the `tajweedformer` command-line tool and the tests), clone it with `git clone --recurse-submodules --branch 3.1.3 https://github.com/Quran-Lab/tajweedformer-c`, then `cmake --preset linux` or `cmake --preset windows-clang`, and `cmake --build --preset` with the same name.
 
 ## Before you start
 
@@ -202,8 +202,8 @@ Everything is in [docs/api.md](docs/api.md); an app coming from 2.x reads
   keep a way to stop (the app finishes the Session with `tf_session_finish`); the 20-minute limit ends it in
   any case. Values under 1000 can end a take in a breath pause between two words; the quick start uses 1500;
   the minimum is 500.
-- **One report for support.** `tf_client_diagnose_json`: SDK, key, config, model, context, backend, storage and
-  the last error, with nothing private in it.
+- **One report for support.** `tf_client_diagnose_json`: SDK, key, config, model, context, backend, storage, the
+  last error and the protocol of the last model download, with nothing private in it.
 
 ## Calibration and reference data
 
@@ -228,6 +228,10 @@ How the 2.x scorer used them, step by step: [docs/migrating-to-3.md](docs/migrat
   `unmetered_only` option of `tf_client_prefetch` cannot be honoured here: this library cannot tell what kind of
   connection the machine has (the diagnose report says `"connection": "unknown"`), so the download goes ahead.
 - **Without a network** a model the Client downloaded runs; a first run without one is `needs_connection`.
+- **On a poor connection** the download goes on by itself: a file whose transfer breaks, or brings no byte for
+  30 seconds, is resumed from the bytes on disk, up to five times with a growing pause, before the call fails
+  with `download_failed`; the next call goes on from the same bytes. A slow link that keeps delivering is never
+  cut. `tf_client_destroy` from another thread ends a download in flight.
 - **The model comes from Quran Lab's server, through the Client.** No call opens a model folder of the app's own,
   and a model folder put into the Client's storage by anything but the Client itself is deleted and downloaded
   (the Client keeps a record of its own downloads that is bound to this machine and user: on Windows a key

@@ -5,6 +5,10 @@
  * profile comes from the tags, gzip files are checked as stored, decoded and checked again, and only the decoded
  * file is kept. The manifest is written last, so a folder with a manifest.json is complete for what was asked.
  *
+ * 3.1.3: every request of one download goes on one kept connection; a request ends when no byte arrives for 30 s
+ * (it has no limit on its whole time); and a file whose transfer breaks is resumed inside the call from its .part,
+ * with the validator of the answer that started it, at most five times (fetch_raw).
+ *
  * SPEC 2a: files come from the build URL ({base}/{repo}/{build}/{folder}/{path}, immutable); the manifest must name
  * its version in the signed text, the version must be the one the signed config named, and the manifest's SHA-256
  * must start with the build the config named. */
@@ -19,6 +23,9 @@
 
 int tf_gunzip_file(const char *in_path, const char *out_path);
 
+int tf__download_stall_ms = 30000;
+int tf__download_pause_ms = 1000;
+
 TfDownload tf__download_defaults(void) {
   TfDownload o;
   memset(&o, 0, sizeof o);
@@ -31,7 +38,24 @@ TfDownload tf__download_defaults(void) {
 typedef struct {
   const TfDownload *o;
   long long done, total; /* bytes as stored, over the files asked for */
+  TfHttpConn *conn;      /* 3.1.3: the one connection to the model host, kept from the manifest to the last file */
 } Run;
+/* one request for a file: what the transport's callbacks need */
+typedef struct {
+  Run *run;
+  const char *part;       /* the partial file the body goes to; NULL for the manifest */
+  const char *whole;      /* where a whole file sent for a range goes, beside the partial file */
+  long long from, before; /* the request's first byte; run->done before this file */
+  long long size;         /* the file's size, from the manifest */
+  char etag[80];          /* the validator of a whole file that came for a range, until it is in place */
+} Xfer;
+
+/* The network failures of one file that one call rides out: after each the call waits (tf__download_pause_ms,
+ * doubling: 1, 2, 4, 8, 16 s) and resumes from the partial file; the failure after the fifth resume is the
+ * call's error. Progress does not start the count again: with it a server that sends a little and breaks off
+ * each time could hold one call for hours, and nothing is lost at the bound, because the partial file and its
+ * validator stay and the next call goes on from them with five resumes of its own. */
+#define TF_DOWNLOAD_RESUMES 5
 
 static long long file_size(const char *p) {
   FILE *f = fopen(p, "rb");
@@ -117,22 +141,84 @@ int tf__model_url(char *out, size_t n, const char *base, const char *repo, const
   return w < 0 || (size_t)w >= n ? -1 : 0;
 }
 
-static void on_bytes(void *user, long long n);
-/* bytes that came over the network in this call (the telemetry's downloads entry counts them) */
-static void net_bytes(void *user, long long n) {
-  const Run *run = (const Run *)user;
-  if (run->o->fetched) *run->o->fetched += n;
-  on_bytes(user, n);
-}
-static void on_bytes(void *user, long long n) {
-  Run *run = (Run *)user;
+/* bytes of the files asked for that are here: the progress callback's count */
+static void add_done(Run *run, long long n) {
   run->done += n;
   if (run->o->progress) run->o->progress(run->o->user, run->done > run->total ? run->total : run->done, run->total);
 }
+/* bytes that came over the network in this call (the telemetry's downloads entry counts them) */
+static void net_bytes(void *user, long long n) {
+  Run *run = ((Xfer *)user)->run;
+  if (run->o->fetched) *run->o->fetched += n;
+  add_done(run, n);
+}
 
-static int get(Run *run, const char *rel, const char *to_file, long long from, TfHttpResponse *r) {
+/* The validator of a partial file: the ETag of the answer that started it, kept beside it as <file>.part.etag.
+ * A resume sends it as If-Range with the Range, so a server whose file is no longer that one answers 200 with
+ * the whole file, which replaces the partial file, and not with bytes that do not belong to it. Only a strong
+ * ETag validates a range (RFC 9110, 13.1.5); a weak one is not kept. Without a validator the resume goes with
+ * the Range alone, as before 3.1.3: the URL names the build, and the SHA-256 of the whole file is checked
+ * before it is moved into place, whatever was sent. That check is the last word in every case. */
+static char *etag_path(const char *part) {
+  char *p = (char *)malloc(strlen(part) + sizeof(".etag"));
+  if (p) snprintf(p, strlen(part) + sizeof(".etag"), "%s.etag", part);
+  return p;
+}
+static void etag_write(const char *part, const char *etag) {
+  char *p = etag_path(part);
+  if (!p) return;
+  if (etag && etag[0] == '"') tf_write_file(p, etag, strlen(etag));
+  else remove(p);
+  free(p);
+}
+static void etag_read(const char *part, char out[80]) {
+  char *p = etag_path(part), *text = NULL;
+  size_t n = 0;
+  out[0] = 0;
+  if (p && !tf_read_file(p, &text, &n) && text) {
+    while (n && (text[n - 1] == '\n' || text[n - 1] == '\r' || text[n - 1] == ' ')) n--;
+    if (n >= 2 && n < 80 && text[0] == '"') {
+      memcpy(out, text, n);
+      out[n] = 0;
+    }
+  }
+  free(text);
+  free(p);
+}
+/* the status and the headers of a file request are in, the file is open and no byte of the body is written */
+static void on_head(void *user, const TfHttpResponse *r) {
+  Xfer *x = (Xfer *)user;
+  if (!x->part || r->status != 200) return; /* a 206 continues the partial file: its validator stays */
+  if (x->from > 0) {
+    /* a whole file for a range request: it is written beside the partial file, which keeps its bytes and
+     * its validator until all of the whole file is here (fetch_raw). The count starts again for it */
+    snprintf(x->etag, sizeof x->etag, "%s", r->etag);
+    x->run->done = x->before;
+    add_done(x->run, 0);
+    return;
+  }
+  /* a 200 to a request without a range starts the partial file, with this answer's validator */
+  etag_write(x->part, r->etag);
+}
+/* Is this the answer a file request asked for? Asked before a byte of it is written. A 200 whose length,
+ * when the answer names one, is the file's; or a 206, to a request that named a range, whose Content-Range
+ * starts at the request's first byte and names the file's size. A 200 of another length, a 206 of another
+ * start or total or without a Content-Range, and a 206 nobody asked for are refused: a failed attempt, with
+ * nothing written. Every other status passes here (fetch_raw says what it is). */
+static int accept_head(void *user, const TfHttpResponse *r) {
+  const Xfer *x = (const Xfer *)user;
+  if (!x->part) return 1;
+  if (r->status == 200) return r->content_length < 0 || r->content_length == x->size;
+  if (r->status == 206) return x->from > 0 && r->range_start == x->from && r->range_total == x->size;
+  return 1;
+}
+
+/* One model request. `net` is set to 1 when it failed on the network (no answer, a connection that ended, a
+ * stall): the failures a file request is resumed after. */
+static int get(Run *run, const char *rel, Xfer *x, const char *if_range, TfHttpResponse *r, int *net) {
   const TfDownload *o = run->o;
   char url[4096], key[512];
+  *net = 0;
   if (tf__model_url(url, sizeof url, o->cdn_url ? o->cdn_url : "https://cdn.quranlab.ai/models", o->repo, o->revision, o->folder, rel))
     return tf__fail(TF_ERR_INVALID_ARGUMENT, "the model URL of %s is too long", rel);
   /* SPEC 15.4: every model request (the manifest, a file, a Range request) carries the install's app token, and
@@ -151,18 +237,27 @@ static int get(Run *run, const char *rel, const char *to_file, long long from, T
     q.method = "GET";
     q.url = url;
     q.headers = hdr;
-    q.download_file = to_file;
-    q.range_from = from;
-    q.timeout_s = 3600;
-    if (to_file) {
-      q.on_bytes = net_bytes;
-      q.bytes_user = run;
-    }
+    q.download_file = x->part;
+    q.download_whole = x->whole;
+    q.download_size = x->part ? x->size : 0;
+    q.accept = accept_head;
+    q.range_from = x->from;
+    q.if_range = if_range;
+    /* 3.1.3: no byte for 30 s ends the request; there is no limit on the whole transfer (it was one hour) */
+    q.stall_ms = tf__download_stall_ms;
+    q.conn = run->conn;
+    q.cancel = o->cancel;
+    q.on_head = on_head;
+    q.bytes_user = x;
+    if (x->part) q.on_bytes = net_bytes;
     if (tf_http(&q, r)) {
-      /* no answer: the .part stays and the next call resumes */
+      /* a failed write is the device's, not the network's; the .part stays either way */
       if (tf__error_code() == TF__ERR_IO) return tf__error_as(TF_ERR_STORAGE_FAILED);
+      *net = !(o->cancel && *o->cancel);
       return tf__error_as(TF_ERR_DOWNLOAD_FAILED);
     }
+    /* the protocol this answer came on, for the diagnosis: a record on this device, in no telemetry */
+    if (o->client && r->protocol[0]) tf__client_set_download_protocol(o->client, r->protocol);
     /* 401 invalid_token without a reason: the token is renewed once and the request repeated once */
     char why[48];
     if (r->status == 401 && o->client && attempt == 0 && r->body && strstr(r->body, "invalid_token") &&
@@ -179,6 +274,10 @@ static int get(Run *run, const char *rel, const char *to_file, long long from, T
  * download */
 static int http_error(const Run *run, const char *rel, const TfHttpResponse *r) {
   const char *b = r->body ? r->body : "";
+  /* SPEC 15.4: a redirect is not followed (tf_http.c). It is a failed download and never a stop: whatever its
+   * body says, no refusal is remembered and nothing is removed */
+  if (r->status >= 300 && r->status < 400)
+    return tf__fail(TF_ERR_DOWNLOAD_FAILED, "the model host answered the request for %s with a redirect (HTTP %d), which is never followed", rel, r->status);
   /* SPEC 15.3: a reason of the list refuses the key or the app, and stops the model on this device */
   char stop[48];
   if (tf__body_stop_reason(r->body, r->body_n, stop)) {
@@ -209,54 +308,139 @@ static int http_error(const Run *run, const char *rel, const TfHttpResponse *r) 
   return tf__fail(TF_ERR_DOWNLOAD_FAILED, "HTTP %d for %s", r->status, rel);
 }
 
-/* download `rel` (stored bytes: size, sha) to `to` through `to`.part, resuming; 0 when `to` is verified */
+/* The pause before the `nth` resume (0 for the first). 1 when the download was cancelled, at once. */
+static int pause_before_resume(const TfDownload *o, int nth) {
+  long long ms = (long long)tf__download_pause_ms << nth;
+  while (ms > 0 && !(o->cancel && *o->cancel)) {
+    const int step = ms > 50 ? 50 : (int)ms;
+    tf__sleep_ms(step);
+    ms -= step;
+  }
+  return o->cancel && *o->cancel;
+}
+
+/* download `rel` (stored bytes: size, sha) to `to` through `to`.part, resuming; 0 when `to` is verified.
+ *
+ * 3.1.3: a failure of the network does not end the call. Resumed, up to TF_DOWNLOAD_RESUMES times with a pause
+ * that grows: no answer, a connection that ended, a stall, an answer that ended before its last byte, and a 5xx.
+ * Never asked again in this call: an answer with a stop reason (SPEC 15.3), any 401, 403 or 429 (beyond the one
+ * token renewal in get), a 503 network_blocked (the server names an hour), a redirect (never followed: SPEC
+ * 15.4), any other status, a failed write.
+ *
+ * Only the answer that was asked for is taken: a 200 of the file's length, or a 206 whose Content-Range starts
+ * at the request's first byte and names the file's size (accept_head, before a byte is written). Any other 2xx
+ * (a 204, a 200 of another length, a 206 of another start or total, an answer that brings no byte) is a failed
+ * attempt: it counts against the resumes and the pause applies, so nothing is asked for ever. A failed attempt
+ * never takes a byte from the partial file: a whole file sent for a range is written beside it (.part.new) and
+ * takes its place only when all of it has come. The partial file is removed in two cases only: a 416 (the
+ * server has no such range: the bytes here are past its file), and a file of the full size whose SHA-256 is not
+ * the manifest's (every byte of it came in an answer that was the one asked for, and it is still not the
+ * file: no part of it can be told from another, and kept it would fail every later call the same way). */
 static int fetch_raw(Run *run, const char *rel, long long size, const char *sha, const char *to) {
   if (file_ok(to, size, sha)) {
-    on_bytes(run, size);
+    add_done(run, size);
     return 0;
   }
-  char *part = (char *)malloc(strlen(to) + sizeof(".part"));
-  if (!part) return tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
-  snprintf(part, strlen(to) + sizeof(".part"), "%s.part", to);
-  int rc = 0;
+  const size_t tn = strlen(to);
+  char *part = (char *)malloc(tn + sizeof(".part")), *whole = (char *)malloc(tn + sizeof(".part.new"));
+  if (!part || !whole) {
+    free(part);
+    free(whole);
+    return tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
+  }
+  snprintf(part, tn + sizeof(".part"), "%s.part", to);
+  snprintf(whole, tn + sizeof(".part.new"), "%s.part.new", to);
+  int rc = 0, resumes = 0, mismatches = 0;
   const long long before = run->done;
-  for (int attempt = 0; attempt < 2; ++attempt) {
+  for (;;) {
+    /* a whole file beside the partial file, left by a call that ended between its two steps: it is the
+     * partial file when it has the size and nothing else is there; else it goes */
+    if (file_size(whole) == size && file_size(part) < 0) rename(whole, part);
+    else remove(whole);
     long long from = file_size(part);
     if (from < 0 || from > size) {
       remove(part);
       from = 0;
     }
+    if (from == 0) etag_write(part, NULL); /* no bytes, so nothing to validate */
     run->done = before;
-    on_bytes(run, from); /* what an earlier call already fetched */
-    if (from > 0 && from < size && run->o->resumed) *run->o->resumed = 1;
+    add_done(run, from); /* what an earlier request already fetched */
+    /* resumed, as the telemetry counts it: this call went on from a partial file an earlier call left. A resume
+     * inside the call is not counted (it would make every download that rode out one break a resumed one) */
+    if (from > 0 && from < size && resumes == 0 && run->o->resumed) *run->o->resumed = 1;
     if (from < size) {
+      char tag[80] = "";
+      if (from > 0) etag_read(part, tag);
+      Xfer x;
+      memset(&x, 0, sizeof x);
+      x.run = run;
+      x.part = part;
+      x.whole = whole;
+      x.from = from;
+      x.before = before;
+      x.size = size;
       TfHttpResponse r;
-      if ((rc = get(run, rel, part, from, &r)) != 0) break; /* the .part stays for the next run */
-      const int st = r.status;
-      if (st == 200 && from > 0 && file_size(part) != size) {
+      int again = 0; /* 1: a failed attempt of the kind a resume is for */
+      rc = get(run, rel, &x, tag[0] ? tag : NULL, &r, &again);
+      if (!rc) {
+        const int st = r.status;
+        char why[48];
+        if (st == 200 && from > 0 && file_size(whole) >= 0) {
+          /* the whole file came for a range, beside the partial file: all of it, and it takes the partial
+           * file's place with its own validator; less, and the partial file stays as it was */
+          if (file_size(whole) == size) {
+            remove(part);
+            if (rename(whole, part)) rc = tf__fail(TF_ERR_STORAGE_FAILED, "cannot put %s in the place of its partial file", rel);
+            else etag_write(part, x.etag);
+          } else {
+            again = 1;
+            rc = tf__fail(TF_ERR_DOWNLOAD_FAILED, "the answer for %s ended early", rel);
+          }
+        } else if (st == 200 || st == 206) {
+          /* an answer that ended before the file's last byte, or brought none, without an error of the
+           * transport, is a connection that ended */
+          if (file_size(part) < size) {
+            again = 1;
+            rc = tf__fail(TF_ERR_DOWNLOAD_FAILED, "the answer for %s ended early", rel);
+          }
+        } else if (st >= 200 && st < 300) {
+          /* a 204 or any other 2xx is not an answer to a file request */
+          again = 1;
+          rc = tf__fail(TF_ERR_DOWNLOAD_FAILED, "HTTP %d is not an answer to the request for %s", st, rel);
+        } else {
+          again = st >= 500 && !tf__body_stop_reason(r.body, r.body_n, why) && !(r.body && strstr(r.body, "network_blocked"));
+          /* no answer takes the bytes already here, but a 416: the server has no such range, so they are past
+           * its file */
+          if (st == 416) {
+            remove(part);
+            etag_write(part, NULL);
+          }
+          rc = http_error(run, rel, &r);
+        }
         tf_http_response_free(&r);
-        remove(part); /* the server ignored the range: start again */
+      }
+      if (rc) {
+        remove(whole); /* part of a whole file that did not all come */
+        /* the failure after the last resume, and every failure a resume is not for, is the call's error */
+        if (!again || resumes == TF_DOWNLOAD_RESUMES || pause_before_resume(run->o, resumes)) break;
+        resumes++;
         continue;
       }
-      if (st != 200 && st != 206) {
-        /* a refusal or a limit says nothing about the bytes already here: the .part stays for the next call */
-        if (st != 401 && st != 403 && st != 429) remove(part);
-        rc = http_error(run, rel, &r);
-        tf_http_response_free(&r);
-        break;
-      }
-      tf_http_response_free(&r);
     }
     if (file_ok(part, size, sha)) {
       remove(to);
       rc = rename(part, to) ? tf__fail(TF_ERR_STORAGE_FAILED, "cannot move %s into place", rel) : 0;
+      etag_write(part, NULL);
       run->done = before + size;
       break;
     }
-    remove(part); /* a mismatch deletes the file and retries once */
+    remove(part); /* the full size and not the file: it goes with its validator, and the file is fetched once more */
+    etag_write(part, NULL);
     rc = tf__fail(TF_ERR_CHECKSUM_MISMATCH, "%s", rel);
+    if (++mismatches == 2) break;
   }
   free(part);
+  free(whole);
   return rc;
 }
 
@@ -294,7 +478,7 @@ static int fetch_entry(Run *run, const TfJson *f) {
   char *dfull = tf_path_join(o->dest, dp), *gz = tf_path_join(o->dest, p);
   int rc = 0;
   if (!dfull || !gz) rc = tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
-  else if (file_ok(dfull, dsize, dsha)) on_bytes(run, size);
+  else if (file_ok(dfull, dsize, dsha)) add_done(run, size);
   else {
     mkparent(gz);
     mkparent(dfull);
@@ -347,12 +531,23 @@ int tf__download_model(const TfDownload *opt) {
   Run run;
   memset(&run, 0, sizeof run);
   run.o = &o;
+  /* 3.1.3: one connection for the whole download, opened by the manifest's request and closed below (without
+   * one, each request opens its own, as before) */
+  run.conn = tf__http_conn_open();
   TfHttpResponse r;
-  int rc = get(&run, "manifest.json", NULL, 0, &r);
-  if (rc) return rc;
-  if (r.status != 200) {
+  /* The manifest is asked once: there is no partial file to go on from, nothing is lost when the call ends
+   * here, and a start with a model on disk is not held up when the model host does not answer. */
+  Xfer mx;
+  memset(&mx, 0, sizeof mx);
+  mx.run = &run;
+  int net = 0;
+  int rc = get(&run, "manifest.json", &mx, NULL, &r, &net);
+  if (!rc && r.status != 200) {
     rc = http_error(&run, "manifest.json", &r);
     tf_http_response_free(&r);
+  }
+  if (rc) {
+    tf__http_conn_close(run.conn);
     return rc;
   }
   /* the same acceptance checks, in the same order, as an open from disk (tf__manifest_accept) */
@@ -430,5 +625,6 @@ int tf__download_model(const TfDownload *opt) {
   }
   tf_json_free(m);
   tf_http_response_free(&r);
+  tf__http_conn_close(run.conn);
   return rc;
 }

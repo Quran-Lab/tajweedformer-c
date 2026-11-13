@@ -133,6 +133,7 @@ static void m30_flip(const char *folder, const char *rel) {
 static struct {
   char cdn[1024];
   int file_requests, manifest_requests, ranged, cut_at_half, bad_url;
+  int link_down, down_requests; /* 3.1.3: after the cut every file request fails until the test lets the link up */
   char build[41];
   long long last_done, last_total;
   int progress_calls, progress_bad;
@@ -187,6 +188,11 @@ static int m30_stub(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
     r->body_n = n;
     return 0;
   }
+  if (g_m30.link_down) {
+    g_m30.down_requests++;
+    free(data);
+    return tf__fail(TF__ERR_NETWORK, "the link is down (simulated)");
+  }
   const long long from = q->range_from > 0 ? q->range_from : 0;
   g_m30.ranged += from > 0;
   FILE *f = fopen(q->download_file, from > 0 ? "ab" : "wb");
@@ -196,6 +202,7 @@ static int m30_stub(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
     len /= 2; /* the connection drops half way through the weights */
     cut = 1;
     g_m30.cut_at_half = 0;
+    g_m30.link_down = 1;
   }
   /* in four pieces, as bytes arrive */
   for (int k = 0; k < 4; ++k) {
@@ -693,6 +700,10 @@ static int model30_tests(const char *local, const char *key, const char *work, c
     snprintf(slash ? slash + 1 : data_dir, sizeof data_dir - (size_t)(slash ? slash + 1 - data_dir : 0), "data");
   }
   g_ap.fx = configs ? read_json_file(configs) : t30_json(data_dir, "model_configs.json");
+  /* the diagnose report's optional fields and their values come from names.json here too (this command does
+   * not go through the api tests, which load them for their own run); kept for the whole run */
+  g_t30_diag_names = tf_json_get(t30_json(data_dir, "sdk_3.0.0/names.json"), "diagnosis");
+  CHECK(tf_json_get(g_t30_diag_names, "optional_fields") != NULL, "names.json: no diagnosis.optional_fields (%s/sdk_3.0.0/names.json)", data_dir);
   snprintf(g_m30.cdn, sizeof g_m30.cdn, "%s/%s/sdk/v4.0", local, variant);
   {
     TfModel *probe = tf__model_open(full, &(TfModelOpen){.trusted_key_hex = key, .no_engine = 1});
@@ -723,10 +734,16 @@ static int model30_tests(const char *local, const char *key, const char *work, c
     }
     tf__connection_override = -1;
     CHECK(tf__connection() == TF__CONNECTION_UNKNOWN, "the library's own answer about the connection is not unknown");
-    /* the download drops half way through the weights; the next call resumes it with a Range request */
+    /* the download drops half way through the weights and the link stays down: the call resumes five times
+     * (3.1.3; the pauses are 1 to 16 ms here) and ends with the error; the next call resumes it with a Range
+     * request */
     g_m30.cut_at_half = 1;
+    tf__download_pause_ms = 1;
     CHECK(c && tf_client_prefetch(c, &(TfPrefetchOptions){.on_progress = m30_progress}) == TF_ERR_DOWNLOAD_FAILED && strstr(tf_last_error(), "The model download stopped"),
           "a download that drops: %s", tf_error_name(tf_last_error_code()));
+    tf__download_pause_ms = 1000;
+    CHECK(g_m30.down_requests == 5, "a download that drops: %d resumes inside the call, want 5", g_m30.down_requests);
+    g_m30.link_down = 0;
     const long long at_cut = g_m30.last_done;
     char *st = c ? (char *)tf_client_storage_json(c) : NULL;
     CHECK(st && strstr(st, "\"version\":\"4.0.0\"") && strstr(st, g_m30.build), "storage while the download is incomplete: %s", st ? st : "");

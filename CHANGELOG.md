@@ -1,5 +1,85 @@
 # Changelog
 
+## 3.1.3
+
+The model download holds up on a poor connection. No call changes; the diagnose report's JSON has one key more.
+
+- **Changed: a download that breaks or stalls goes on by itself.** When the transfer of a file stops (no
+  answer, a connection that ends, a server error, or no byte for 30 seconds), `tf_client_model` and
+  `tf_client_prefetch` wait and go on from the bytes already on disk: up to five times per file, after 1, 2, 4,
+  8 and 16 seconds, and only then fail with `download_failed`. Before, the first such failure ended the call.
+  The partial file stays after a failure, so the next call goes on from it, as before. A refusal is asked once
+  and never again in the call: a revoked key, a blocked or paused app, a daily limit, a network Quran Lab does
+  not serve.
+- **Changed: no limit on the time of a download, a limit on its silence.** Before, a request that had stopped
+  delivering was ended only after an hour, and on Linux a file that took longer than an hour was cut even
+  while it was arriving. Now a request ends when no byte arrives for 30 seconds (on Windows up to 34: WinHTTP
+  looks about every four seconds), and a link that keeps delivering is never cut, however slow it is.
+- **Changed: a resumed file is checked against the file it began with.** The server's ETag is kept beside a
+  partial file (`<file>.part.etag`) and sent with the range request (`If-Range`). When the server answers with
+  the whole file, that file replaces the partial one; before, on Linux, it was added to the partial file, which
+  was then thrown away, and the file was downloaded once more. Every file's SHA-256 is still checked against
+  the signed manifest before the file is put in place.
+- **Changed: one connection for a download, and HTTP/2 where the system has it.** The manifest and every file
+  of a download go over one kept connection (one WinHTTP session and connection, or one libcurl handle). On it
+  HTTP/2 is asked for: on Windows through WinHTTP, with HTTP/3 as well on Windows 11 and Server 2022; on Linux
+  where the system's libcurl was built with it. Where the system has neither, the download runs on HTTP/1.1,
+  as before.
+- **Added: the protocol of the last model download in the diagnose report's JSON**: `"downloadProtocol"`, one
+  of `"h3"`, `"h2"`, `"http/1.1"`, or null while this Client has asked for no model file in this process. It
+  is kept in memory on the device and is in no telemetry. The key is in the JSON (`tf_client_diagnose_json`,
+  and `json` in `TfDiagnosis`); the struct itself is as it was.
+- **Changed: `tf_client_destroy` does not wait for a download.** Called while `tf_client_prefetch` or
+  `tf_client_model` is downloading on another thread, it ends the download at once (also in a pause before a
+  resume), and that call returns `download_failed`. Before, it waited until the download was over.
+- **Fixed, Windows: a connection that the server closed in the middle of a file was taken for the end of the
+  file.** The short file failed its checksum, was deleted, and the file was downloaded again from its first
+  byte. It is a broken connection now, and the download goes on from where it was.
+- **Fixed, Linux: the answer of a refused file request was written into the partial file.** The refusal's
+  reason was not read from that request, and the next resume began from a spoiled file.
+- **Fixed: an answer that says success and is not the file cost the bytes already downloaded.** A request for
+  a file now takes a 200 whose length is the file's, or a 206 whose `Content-Range` starts where the request
+  did and names the file's size. Anything else that says success (a 204, a 200 of another length or with an
+  error page, a 206 for another range, an answer that brings no byte) is a failed attempt: it counts against
+  the five, and the bytes already on disk stay as they were; a whole file sent in answer to a range request is
+  written beside the partial file and takes its place only when all of it has arrived. A released build (seen
+  on 3.1.2, on Windows), given such an answer, lost the part of the file it had stored and fetched the file
+  again from its first byte at a later call. It never opened wrong bytes, because every file's SHA-256 is
+  checked before the file is put in place, and it never asked without end: two requests for a file in one
+  call at most.
+- **Fixed, Windows: a redirect answered to a request of the SDK was followed.** Before 3.1.3 (3.1.0 and 3.1.2
+  included) a build on Windows followed a redirect answered to any of its requests, because WinHTTP does so by
+  itself, and sent the request's own headers on with it: the key and the app token. The upload of a
+  recording's segment went on with the recording's bytes, on a 302 as well as on a 307 (measured on a stand-in
+  server). Quran Lab's servers never answered a redirect, so nothing was sent anywhere. From 3.1.3 no
+  request of the SDK follows a redirect, on Windows or on Linux (where none was followed before): a redirect
+  answered to a model request ends the download with `download_failed`, and one answered to another call is
+  that call's failure.
+- Tests: `test/net_stand_in.py` is a stand-in model host on 127.0.0.1 (Python's standard library) that can
+  stall, end a connection, refuse, answer 503 and ignore a range, and that counts its connections and
+  requests; ctest `tf_net` runs the library's real WinHTTP and libcurl code against it, on Windows and on
+  Ubuntu: a stall ends the request after the stall limit and the call resumes; a connection that ends at 40
+  percent is resumed inside the call with `Range` and `If-Range`, no byte fetched twice; six failures in a row
+  end the call after the fifth resume with growing pauses, and the partial file is kept and used by the next
+  call; a 200 to a range request replaces the partial file; ten answers that are not the one asked for (a
+  204, a 200 shorter or longer than the file with and without a length, an empty 206, a 206 with another
+  start, another total or no `Content-Range`, a 200 with a JSON body), given at every attempt to a download
+  that has 100000 bytes of the file on disk, end the call with an error after at most seven requests and
+  leave those bytes as they were, and the next call finishes from them; a refusal is asked once (401, 403,
+  429, 503
+  `network_blocked`), and a stop in a Client's download removes the model as in 3.1.0; a link that delivers 64
+  bytes every 300 ms for longer than the stall limit is not cut; six requests of one download on one
+  connection; a cancel ends the pause and a request in flight; `tf_client_destroy` with a download in flight;
+  the diagnose report says `http/1.1`; a redirect (302 and 307) answered to a model request, to the API call
+  that carries the key, to a call that carries the token, to the uploader's sharing start and to its upload of
+  a segment is not followed, and nothing arrives at the place it names (another path of the stand-in, and once
+  the host name localhost; on the code before this release every one of them arrived there, on Windows). What
+  these do not show: a redirect from https to plain http was not run; the stand-in speaks plain HTTP/1.1 only, so
+  HTTP/2 and HTTP/3 are asked for but never negotiated in a test, and the report's `h2` and `h3` are not
+  seen; and the stall and the broken connection are made by the server on the same machine, not by a real
+  mobile or lossy link. Seen once by hand, on one Windows 11 machine: the model host answered two requests
+  over the kept connection on `h2`.
+
 ## 3.1.2
 
 - **Changed: the sharing sheet and "What is shared" have the text of copy deck `2026-11-09.1` again.** Copy

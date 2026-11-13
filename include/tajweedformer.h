@@ -1,4 +1,4 @@
-/* tajweedformer.h: the TajweedFormer SDK for Windows and Linux (C API, SDK 3.1.2).
+/* tajweedformer.h: the TajweedFormer SDK for Windows and Linux (C API, SDK 3.1.3).
  *
  * A pure inference engine: audio in, the model's own output out. Five things, with the same names and the same
  * order of calls as the Android, Apple and web SDKs:
@@ -58,9 +58,9 @@ extern "C" {
 #define TF_API
 #endif
 
-#define TF_SDK_VERSION "3.1.2"
+#define TF_SDK_VERSION "3.1.3"
 
-TF_API const char *tf_version(void); /* "3.1.2" */
+TF_API const char *tf_version(void); /* "3.1.3" */
 
 /* ============================================================================ errors */
 
@@ -304,7 +304,10 @@ typedef struct {
 } TfPrefetchOptions;
 
 /* Downloads and verifies the model ahead of use. Safe at every start: a no-op when done; it resumes where an
- * earlier call stopped. Returns 0 when the model is on disk. */
+ * earlier call stopped. Returns 0 when the model is on disk. A file whose transfer breaks, or brings no byte for
+ * 30 seconds, is resumed inside the call, up to five times with a growing pause, before the call fails with
+ * TF_ERR_DOWNLOAD_FAILED; a slow link that keeps delivering is never cut. tf_client_destroy from another thread
+ * ends a download in flight, and this call then returns TF_ERR_DOWNLOAD_FAILED. */
 TF_API int tf_client_prefetch(TfClient *c, const TfPrefetchOptions *options);
 /* What the SDK holds on disk: {"models":[{"version","build","bytes"}],"sharingQueueBytes":n}, one entry per model
  * build, ordered by version then build. */
@@ -314,7 +317,7 @@ TF_API int tf_client_remove_models(TfClient *c);
 
 /* One structured report, safe to paste into an issue: no audio, text or identifiers. */
 typedef struct {
-  const char *sdk_version;     /* "3.1.2" */
+  const char *sdk_version;     /* "3.1.3" */
   const char *sdk_latest;      /* the SDK release the signed config in force names, or NULL when it names none */
   int key_accepted;            /* 1 accepted, 0 refused, -1 not known yet (no answer from the server) */
   const char *key_reason;      /* why not: the server's code, or NULL */
@@ -331,7 +334,9 @@ typedef struct {
   int dropped_chunks;          /* chunks dropped because the app did not read them: always 0 here (chunks come
                                   by callback, none waits) */
   const char *connection;      /* "unmetered", "metered", "none" or "unknown": always "unknown" here */
-  const char *json;            /* all of it as JSON */
+  const char *json;            /* all of it as JSON; it also has "downloadProtocol", for which this struct
+                                  has no field: the protocol the last request for a model file ran on ("h3",
+                                  "h2" or "http/1.1"), null while this Client has made none in this process */
 } TfDiagnosis;
 TF_API int tf_client_diagnose(TfClient *c, TfDiagnosis *out);
 TF_API const char *tf_client_diagnose_json(TfClient *c);

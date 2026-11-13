@@ -1,4 +1,4 @@
-# The C API: `tajweedformer.h` (SDK 3.1.2)
+# The C API: `tajweedformer.h` (SDK 3.1.3)
 
 One library for Windows and Linux apps and for servers: `tajweedformer.dll` / `libtajweedformer.so` (or the static
 library) and one header, `include/tajweedformer.h`. It includes nothing but `<stddef.h>` and names no engine type.
@@ -18,7 +18,7 @@ Five things, with the same names and the same order of calls as the Android, App
 
 Every options struct (`TfClientOptions`, `TfModelOptions`, `TfPrefetchOptions`, `TfSessionOptions`) may be NULL or
 zeroed: zero is the default of every field. Strings and arrays returned as `const` belong to the object they came
-from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"3.1.2"`.
+from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"3.1.3"`.
 
 ## Errors
 
@@ -78,7 +78,7 @@ version pin the server could not honour), `user`.
 
 | Call | What it does |
 | - | - |
-| `tf_client_model(client, options)` | the Model for this app: downloads on first use (resumable), verifies every file, opens and warms the engine. The same Model while it is open. `needs_connection` without a network and without a model on disk; `model_unavailable` while Quran Lab has no build for this SDK version |
+| `tf_client_model(client, options)` | the Model for this app: downloads on first use (resumed by itself after a break, see below), verifies every file, opens and warms the engine. The same Model while it is open. `needs_connection` without a network and without a model on disk; `model_unavailable` while Quran Lab has no build for this SDK version |
 | `tf_client_prefetch(client, options)` | downloads and verifies ahead of use. Safe at every start: a no-op when done, and it resumes where an earlier call stopped. `TfPrefetchOptions`: `unmetered_only` (this library cannot tell what kind of connection the machine has, so the download goes ahead), `on_progress(user, bytes_done, bytes_total)`, `version` |
 | `tf_client_storage_json(client)` | `{"models":[{"version","build","bytes"}],"sharingQueueBytes":n}` |
 | `tf_client_remove_models(client)` | removes the model files, never the consent state or the sharing queue. Close the Model first |
@@ -94,6 +94,20 @@ What is downloaded: the CPU files of the context in force and the sample clips, 
 against the signed manifest; another context's files come on first use, the reference data only when the app
 asks. The files live under `<storage>/models/<build>/`.
 
+How a download goes: all of it over one kept connection, HTTP/2 where the system has it (WinHTTP on Windows,
+with HTTP/3 too on Windows 11; the system's libcurl on Linux), else HTTP/1.1. A request ends when no byte
+arrives for 30 seconds (on Windows up to 34) and has no limit on its whole time, so a slow link is never cut.
+A file whose transfer breaks (no answer, a connection that ends, a stall, a server error) is resumed inside
+the call from its partial file, with the server's ETag as the validator (`If-Range`), up to five times after
+pauses of 1, 2, 4, 8 and 16 seconds; then the call fails with `download_failed`, the partial file stays, and
+the next call goes on from it. Only the answer that was asked for is taken (a 200 of the file's length, or a
+206 whose `Content-Range` starts where the request did and names the file's size); any other answer that
+says success is a failed attempt and takes no byte from the partial file. A refusal (a revoked key, a
+blocked app, a limit, a network that is not served)
+is asked once. `tf_client_destroy` from another thread ends a download in flight: the downloading call returns
+`download_failed`. No request of the SDK follows a redirect: one answered to a model request ends the download
+with `download_failed`, and one answered to another call is that call's failure.
+
 ### Diagnose
 
 `TfDiagnosis` has the SDK version and the newest release the config names, whether the key was accepted (and the
@@ -101,7 +115,10 @@ server's reason when not), the config's state (`fresh`, `stale`, `none`), the mo
 verified), the context in force, the backend, the bytes held (models, sharing queue) and the code of the last
 error. `json` is all of it with the same eleven keys in every SDK: `sdk`, `key`, `config`, `model`, `context`,
 `backend`, `microphone` (always `"none"` here), `storage`, `lastError`, `droppedChunks` (always 0 here: chunks come
-by callback, none waits) and `connection` (always `"unknown"` here). No audio, text or identifiers.
+by callback, none waits) and `connection` (always `"unknown"` here); and, in `json` only (the struct has no
+field for it), a twelfth, `downloadProtocol`: the protocol the last request for a model file ran on, `"h3"`,
+`"h2"` or `"http/1.1"`, null while this Client has made none in this process. It is kept in memory on the
+device and is never sent. No audio, text or identifiers.
 
 ## Model
 

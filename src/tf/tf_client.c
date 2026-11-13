@@ -61,6 +61,8 @@ struct TfClient {
   long long token_exp;
   int stopped;         /* a stop code this launch: no more network calls */
   volatile int cancel; /* the client is being destroyed: requests in flight are abandoned */
+  char download_protocol[12]; /* 3.1.3: what the last model request ran on ("h2"), "" before the first; in
+                                 memory only, for the diagnosis */
   char *config;        /* the last verified config body */
   char etag[80];
   long long config_exp;
@@ -110,6 +112,17 @@ const char *tf__client_app(const TfClient *c) { return c->app_id; }
 const char *tf__client_platform(const TfClient *c) { return c->platform; }
 const char *tf__client_api(const TfClient *c) { return c->api; }
 const char *tf__client_cdn(const TfClient *c) { return c->cdn; }
+volatile int *tf__client_cancel_flag(TfClient *c) { return &c->cancel; }
+void tf__client_set_download_protocol(TfClient *c, const char *protocol) {
+  tf_mutex_lock(&c->lock);
+  snprintf(c->download_protocol, sizeof c->download_protocol, "%s", protocol ? protocol : "");
+  tf_mutex_unlock(&c->lock);
+}
+void tf__client_download_protocol(TfClient *c, char out[12]) {
+  tf_mutex_lock(&c->lock);
+  snprintf(out, 12, "%s", c->download_protocol);
+  tf_mutex_unlock(&c->lock);
+}
 const char *tf__client_key(const TfClient *c) { return c->key; }
 const char *tf__client_trusted_hex(const TfClient *c) { return c->trusted_hex; }
 const char *tf__model_key_override;
@@ -372,7 +385,9 @@ static int call_locked(TfClient *c, const Call *k, TfHttpResponse *r) {
     /* SPEC 15.3: only a reason of the list stops the model on this device */
     if (tf__body_stop_reason(r->body, r->body_n, why)) gate_set(c, why, 0);
   }
-  if (r->status >= 200 && r->status < 400) {
+  /* an answer that accepts the key: a 2xx, or the config's 304 (not changed). A redirect is neither a refusal
+   * nor an acceptance: it is not followed (SPEC 15.4), it is the call's failure, and it clears nothing */
+  if ((r->status >= 200 && r->status < 300) || r->status == 304) {
     c->answered = 1;
     /* an answer that accepts the key clears a remembered refusal of the API (SPEC 15.3); one that came from
      * a model request is asked again by the next model call (tf__client_gate_retry) */

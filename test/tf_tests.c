@@ -10,6 +10,8 @@
  *   tf_tests model30 <local30 dir> <key_hex> <work dir> [<configs.json> [full|prod]]   the local 3.0 model folders:
  *                                               Model, Session, listen, reference, the Client's download path
  *   tf_tests share30 <data dir> <work dir>      shared recordings in 3.0: sharing_30.json, the ring, the tail wait
+ *   tf_tests net <url> <work dir>               the model download through the real HTTP code, against the stand-in
+ *                                               server that test/net_stand_in.py starts (3.1.3: tf_313_net_tests.inc)
  *   tf_tests conformance <folder> <key_hex|-> <clips.txt> <out.jsonl> [heads_mask [context]]
  *   tf_tests layers <fixture_dir> <c16 folder> <c24 folder> <out.jsonl>     the decoded layer and top-K on heads from files
  *   tf_tests folder <folder> <key_hex|->        open a folder, print the info JSON or the error's code
@@ -646,6 +648,7 @@ static int layers(const char *fx, const char *dir16, const char *dir24, const ch
 #include "tf_30_api_tests.inc"
 #include "tf_30_model_tests.inc"
 #include "tf_30_share_tests.inc"
+#include "tf_313_net_tests.inc"
 
 static int folder(const char *dir, const char *key) {
   TfModel *m = open_folder(dir, key, 1, NULL);
@@ -813,6 +816,7 @@ int main(int argc, char **argv) {
   if (argc >= 3 && !strcmp(argv[1], "errors")) return errors_tests(argv[2]);
   if (argc >= 4 && !strcmp(argv[1], "vectors30")) return vectors30_tests(argv[2], argv[3]);
   if (argc >= 4 && !strcmp(argv[1], "api")) return api_tests(argv[2], argv[3]);
+  if (argc >= 4 && !strcmp(argv[1], "net")) return net_tests(argv[2], argv[3]);
   if (argc >= 4 && !strcmp(argv[1], "share30")) return share30_tests(argv[2], argv[3]);
   if (argc >= 5 && !strcmp(argv[1], "model30")) return model30_tests(argv[2], argv[3], argv[4], argc > 5 ? argv[5] : NULL, argc > 6 ? argv[6] : NULL);
   if (argc >= 5 && !strcmp(argv[1], "pin"))

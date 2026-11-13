@@ -323,6 +323,7 @@ int tf__store_fetch(TfClient *c, const TfFetch *f, char *out_dir, size_t n, TfMo
   d.fetched = &fetched;
   d.resumed = &resumed;
   d.client = c;
+  d.cancel = tf__client_cancel_flag(c); /* destroying the Client ends the download */
   /* the record is written before the first byte of the build is asked for */
   if (pst == REC_NONE && rec_write(c, p.build, "downloading")) return rec_failed();
   const int rc = tf__download_model(&d);
@@ -391,6 +392,7 @@ int tf__store_fetch_role(TfClient *c, const TfModel *m, const char *context, con
   d.only_role = role;
   d.trusted_key_hex = tf__client_model_key(c);
   d.client = c;
+  d.cancel = tf__client_cancel_flag(c);
   d.want_version = p.version;
   d.check_build = 1;
   return tf__download_model(&d);

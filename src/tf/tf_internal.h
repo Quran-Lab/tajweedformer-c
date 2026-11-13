@@ -120,7 +120,17 @@ typedef struct {
   char key_id[40];      /* x-qlab-key-id */
   char etag[80];
   long long content_length;
+  long long range_start, range_total; /* the answer's Content-Range (bytes S-E/T): S and T; -1 without one */
+  char protocol[12];    /* what the answer came on: "h3", "h2" or "http/1.1" (HTTP/1.1 or older); "" from a test's
+                           transport */
 } TfHttpResponse;
+/* A connection kept for several requests to one host, one after another on one thread (the model download):
+ * one WinHTTP session and connection, or one curl handle. HTTP/2 is asked for on it (WinHTTP: HTTP/3 too, where
+ * the system has it), and the system's HTTP/1.1 is what is left where it is refused. */
+typedef struct TfHttpConn TfHttpConn;
+TfHttpConn *tf__http_conn_open(void);    /* NULL: out of memory; a request without one opens its own connection */
+extern int tf__http_opened;              /* tests: the WinHTTP sessions, or curl handles, this process has opened */
+void tf__http_conn_close(TfHttpConn *k); /* NULL is fine */
 typedef struct {
   const char *method;   /* GET, POST, PUT */
   const char *url;
@@ -128,18 +138,38 @@ typedef struct {
   const void *body;
   size_t body_n;
   const char *upload_file; /* PUT the file's bytes instead of body */
-  const char *download_file; /* GET into this file (appending from `range_from`) instead of body */
+  const char *download_file; /* GET into this file instead of body: a 206 to a Range is appended, a 200 is the
+                                whole file and replaces what the file held; any other status goes to body */
   long long range_from; /* > 0: Range: bytes=N- */
-  int timeout_s;
+  const char *download_whole; /* optional: where a 200 to a Range request is written (the whole file), so that
+                           the bytes in download_file are not touched before all of the file is here */
+  long long download_size; /* > 0: the file's size. The body of a 200 may be that long, the body of a 206 that
+                           minus range_from: a body that runs past it is cut off there and the request fails */
+  const char *if_range; /* with range_from: If-Range, the validator (ETag) of the bytes already here */
+  int timeout_s;        /* the limit of the whole request (and of each of its steps); not used with stall_ms */
+  int stall_ms;         /* > 0: the request ends when no byte of the answer arrives for this long, and has no
+                           limit on its whole time (resolving, connecting and sending keep 30 s each) */
+  TfHttpConn *conn;     /* optional: the kept connection this request goes on */
   volatile int *cancel; /* optional: tf__http_cancel(cancel) from another thread aborts the request */
+  int (*accept)(void *user, const TfHttpResponse *r); /* optional: asked when the status and the headers are
+                           in and before any file is opened. 0: this is not the answer that was asked for;
+                           nothing of it is written and the request fails */
+  void (*on_head)(void *user, const TfHttpResponse *r); /* optional: the status and the headers are in; for a
+                           download the file is open (emptied by a 200) and no byte of the body is written yet */
   void (*on_bytes)(void *user, long long n); /* optional: called as bytes of a download reach its file */
-  void *bytes_user;
+  void *bytes_user;     /* the user pointer of on_head and on_bytes */
 } TfHttpRequest;
 /* Sets *flag and aborts every request in flight that carries it (WinHTTP: its handle is closed; libcurl: the
  * progress callback stops the transfer). */
 void tf__http_cancel(volatile int *flag);
-int tf_http(const TfHttpRequest *req, TfHttpResponse *resp); /* 0: got a response (any status) */
+/* 0: got a response (any status). On a failure the status and the headers that had arrived stay in resp.
+ * No request follows a redirect (SPEC 15.4): a 3xx answer is the response, and neither a header nor the body
+ * of the request goes to the place it names. */
+int tf_http(const TfHttpRequest *req, TfHttpResponse *resp);
 void tf_http_response_free(TfHttpResponse *r);
+/* Tests: the system's transport (WinHTTP, libcurl) whatever transport is set, for a test's transport that
+ * answers some requests itself and passes the others on. */
+int tf__http_native(const TfHttpRequest *req, TfHttpResponse *resp);
 /* Tests: replace the transport. */
 typedef int (*TfHttpTransport)(const TfHttpRequest *req, TfHttpResponse *resp, void *user);
 void tf_http_set_transport(TfHttpTransport t, void *user);
@@ -453,6 +483,12 @@ const char *tf__client_api(const TfClient *c);
 const char *tf__client_app(const TfClient *c);
 const char *tf__client_platform(const TfClient *c);
 const char *tf__client_cdn(const TfClient *c);
+/* The flag tf__client_cancel_calls sets: a model download of this Client carries it. */
+volatile int *tf__client_cancel_flag(TfClient *c);
+/* The protocol the last model request of this Client ran on ("h3", "h2", "http/1.1"), for the diagnosis; "" before
+ * the first. In memory only: never written, never sent. */
+void tf__client_set_download_protocol(TfClient *c, const char *protocol);
+void tf__client_download_protocol(TfClient *c, char out[12]);
 const char *tf__client_key(const TfClient *c);
 const char *tf__client_trusted_hex(const TfClient *c);
 /* the key a model's manifest must be signed with: the client's trusted key (tests may name another) */
@@ -529,10 +565,19 @@ typedef struct {
   int check_build;            /* 1: the manifest's SHA-256 must start with `revision` (a 40 hex build id) */
   void (*progress)(void *user, long long done, long long total); /* bytes of the files asked for, as stored */
   long long *fetched;         /* out, may be NULL: += the bytes that came over the network in this call */
-  int *resumed;               /* out, may be NULL: set to 1 when a file was resumed with a Range request */
+  int *resumed;               /* out, may be NULL: set to 1 when a file went on, with a Range request, from a partial
+                                 file that an earlier call left (a resume inside this call does not set it) */
   void *user;
+  volatile int *cancel;       /* may be NULL: tf__http_cancel(cancel) from another thread ends the request in flight
+                                 and the pause before a resume, and the download returns TF_ERR_DOWNLOAD_FAILED */
 } TfDownload;
 TfDownload tf__download_defaults(void);
+/* A model request ends when no byte of its answer arrives for this long (30 s). It is not a limit on the whole
+ * transfer: a slow link that keeps delivering is never cut. Tests set a shorter one. */
+extern int tf__download_stall_ms;
+/* The pause before the first resume of a file inside one call (1 s); it doubles before each further resume
+ * (1, 2, 4, 8, 16 s). Tests set a shorter one. */
+extern int tf__download_pause_ms;
 /* Fetches and verifies the manifest, then every file of the profile (never the expected table, CoreML or NPU
  * files), resuming partial files with HTTP Range and checking each SHA-256. 0, or a TfError. */
 int tf__download_model(const TfDownload *o);
