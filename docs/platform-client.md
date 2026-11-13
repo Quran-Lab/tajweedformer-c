@@ -46,11 +46,13 @@ answers "Share", and a learner who never answers never shares.
 
 ### The default sheet, a themed sheet, or your own
 
-1. **Default.** The SDK shows its own sheet at a good moment (after a finished session with feedback, never
-   at first launch), in the learner's language, right to left for Arabic and Urdu, with a guardian variant
-   for children's apps.
-2. **Themed.** Colours, corner radius and fonts of the SDK's sheets can be set; the words stay the SDK's.
-   This does not change the consent version.
+1. **Default.** On Windows and Linux this library draws nothing, so there is no sheet of the SDK's: the SDK
+   chooses the moment (after a finished session with feedback, never at first launch) and asks the app to
+   show the sheet, through `TfClientOptions.on_consent`. An app that set no callback sees in
+   `tf_sharing_status` that an ask waits (`pending_ask`) and shows its sheet then. Either way it is item 3.
+2. **Themed.** Not in this library: the sheet is the app's own window, so its colours, fonts and layout are
+   the app's. The words are the copy deck's, in the learner's language (right to left for Arabic and Urdu),
+   with the guardian lines for a children's app.
 3. **Your own UI.** The app receives the SDK's request to ask, shows its own UI with the SDK's localized
    strings (the copy deck the SDK exposes), and reports the learner's answer with the SDK's grant and
    decline calls, only from the learner's own tap. The SDK counts each ask against the same three.
