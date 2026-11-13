@@ -71,7 +71,7 @@ Copy the setup prompt from [sdk.quranlab.ai](https://sdk.quranlab.ai) and paste 
   `c24_l72`, `c24_l256`), addressed by version (`4.0.0`). SDK 3.0.0 runs 3.0 builds; 2.x builds stay on the 2.x
   SDKs.
 - **Who it is for:** desktop apps on Windows and Linux, and servers decoding many recitations.
-- **Status:** released, 3.1.0. Through the library's own API on Windows x86-64 (clang on the Microsoft runtime): V4
+- **Status:** released, 3.1.2. Through the library's own API on Windows x86-64 (clang on the Microsoft runtime): V4
   conformance 35/35 through Sessions (all twelve outputs of every chunk, bit for bit), the shared 3.0 vectors
   (manifest, speech events, settled tokens, telemetry, contexts, names), the error catalogue, and the Model,
   Session and reference tests on a 3.0 model folder. Linux: built and tested by the CI workflow (see
@@ -84,10 +84,10 @@ One model, one engine, the same bits on every platform. Each SDK compiles the sa
 
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
-| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+ on arm64-v8a and armeabi-v7a, desktop JVM | Maven Central `ai.quranlab:tajweedformer:3.0.1` |
-| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.1.0"`, product `TajweedFormer` |
+| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+ on arm64-v8a and armeabi-v7a, desktop JVM | Maven Central `ai.quranlab:tajweedformer:3.1.1` |
+| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.1.2"`, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node 20+ | `npm install @quran-lab/tajweedformer` |
-| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 3.1.0 |
+| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 3.1.2 |
 | [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) | The engine: exact C runtime, inference library, conformance suite | everything above | Git submodule |
 
 The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), hosted by Quran Lab and served by
@@ -108,7 +108,7 @@ project(app C CXX)
 include(FetchContent)
 FetchContent_Declare(tajweedformer
   GIT_REPOSITORY https://github.com/Quran-Lab/tajweedformer-c.git
-  GIT_TAG        3.1.0)
+  GIT_TAG        3.1.2)
 FetchContent_MakeAvailable(tajweedformer)
 
 add_executable(quickstart quickstart.c)
@@ -125,7 +125,7 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCM
 cmake --build build
 ```
 
-To build the repository by itself (the library, the `tajweedformer` command-line tool and the tests), clone it with `git clone --recurse-submodules --branch 3.1.0 https://github.com/Quran-Lab/tajweedformer-c`, then `cmake --preset linux` or `cmake --preset windows-clang`, and `cmake --build --preset` with the same name.
+To build the repository by itself (the library, the `tajweedformer` command-line tool and the tests), clone it with `git clone --recurse-submodules --branch 3.1.2 https://github.com/Quran-Lab/tajweedformer-c`, then `cmake --preset linux` or `cmake --preset windows-clang`, and `cmake --build --preset` with the same name.
 
 ## Before you start
 
@@ -517,7 +517,7 @@ same page in every TajweedFormer SDK); the C calls are in [docs/api.md](docs/api
   recorded or sent before the learner answers "share".
 - **The sheet is the app's.** This library has no UI: the SDK asks at a good moment through the `on_consent`
   callback (or `pending_ask` in `tf_sharing_status`), with the copy deck in the learner's language (deck
-  `2026-11-12.1`, consent `share-2026-11-12`, eight languages), and the app reports the learner's tap with
+  `2026-11-13.1`, consent `share-2026-11-09`, eight languages), and the app reports the learner's tap with
   `tf_sharing_answer`. The SDK counts the asks and keeps the re-ask rules.
 - **At most three sheets, and a yes is final.** The sheet is shown at most three times per install, ever. A
   learner who answered "share" is never asked again: the grant keeps the version they agreed to across copy

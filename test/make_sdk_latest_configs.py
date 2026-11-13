@@ -24,19 +24,19 @@ EXPIRES = 4102444800  # 2100-01-01: never expires during a test run
 URL = "https://github.com/Quran-Lab/tajweedformer-c/releases"
 
 CASES = [
-    ("newer", {"version": "3.1.1", "severity": "recommended", "url": URL}),
+    ("newer", {"version": "3.1.3", "severity": "recommended", "url": URL}),
     ("newer major", {"version": "4.0", "severity": "required", "url": URL}),
-    ("equal", {"version": "3.1.0", "severity": "recommended", "url": URL}),
+    ("equal", {"version": "3.1.2", "severity": "recommended", "url": URL}),
     ("older", {"version": "2.0.3", "severity": "recommended", "url": URL}),
     ("absent", None),
     ("junk version", {"version": "3.0.x", "severity": "recommended", "url": URL}),
-    ("prerelease version", {"version": "3.1.1-beta", "severity": "recommended", "url": URL}),
+    ("prerelease version", {"version": "3.1.3-beta", "severity": "recommended", "url": URL}),
     ("empty version", {"version": "", "severity": "recommended", "url": URL}),
     ("version a number", {"version": 4, "severity": "recommended", "url": URL}),
-    ("no severity", {"version": "3.1.1", "url": URL}),
-    ("no url", {"version": "3.1.1", "severity": "recommended"}),
-    ("url not a string", {"version": "3.1.1", "severity": "recommended", "url": ["x"]}),
-    ("not an object", "3.1.1"),
+    ("no severity", {"version": "3.1.3", "url": URL}),
+    ("no url", {"version": "3.1.3", "severity": "recommended"}),
+    ("url not a string", {"version": "3.1.3", "severity": "recommended", "url": ["x"]}),
+    ("not an object", "3.1.3"),
     ("null", "__null__"),
 ]
 
