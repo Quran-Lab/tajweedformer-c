@@ -1012,7 +1012,7 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
   int decks = 0, shown_ok = 0, clean = 0;
   /* SPEC 11.8: the sentence that deck 2026-11-12.1 added is in no string an app is handed.
    * The test data holds its length and SHA-256 per language and string, never its text
-   * (tools/gen_removed_sentence.py, from the contract's archived deck) */
+   * (made by a private tool from Quran Lab's copy deck archive) */
   char *gone_path = tf_path_join(vdir, "removed_2026-11-12.json");
   TfJson *gone_doc = read_json_file(gone_path);
   free(gone_path);
@@ -1427,7 +1427,7 @@ static int sdk_latest_tests(const char *configs, const char *dir) {
   if (!g_sl.fx) return 2;
   tf_mkdirs(dir);
   tf_http_set_transport(sl_stub, NULL);
-  static const char want[] = "Quran Lab SDK 3.1.3 is available (recommended), you have " TF_SDK_VERSION ": https://github.com/Quran-Lab/tajweedformer-c/releases";
+  static const char want[] = "Quran Lab SDK 3.1.4 is available (recommended), you have " TF_SDK_VERSION ": https://github.com/Quran-Lab/tajweedformer-c/releases";
   char d[1100];
   /* newer: one line at launch; a second newer config (a refresh) adds none */
   snprintf(d, sizeof d, "%s/newer", dir);

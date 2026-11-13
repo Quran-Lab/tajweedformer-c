@@ -7,7 +7,9 @@
  * The signed configs are test/data/model_configs.json (test/make_model_configs.py: a throwaway key). */
 
 /* The diagnose() report against the rules of diagnosis.schema.json, written out by hand (the library has no JSON
- * Schema reader): the nine properties in order and nothing else, each with its type, enum or pattern. The same
+ * Schema reader): the eleven properties in order, each with its type, enum or pattern; after them only fields
+ * that names.json lists as optional (diagnosis.optional_fields: downloadProtocol, contract 1.18.0), each null
+ * or one of the values names.json lists for it; any other key is refused. The same
  * function is run over diagnosis_examples.json first, so it is known to accept the valid ones and to refuse each
  * invalid one. */
 static int t30_is_build(const char *s) { return s && strlen(s) == 40 && strspn(s, "0123456789abcdef") == 40; }
@@ -18,12 +20,28 @@ static int t30_keys_are(const TfJson *o, const char *const *keys, int n) {
   return 1;
 }
 static int t30_whole(const TfJson *v) { return v && v->type == TJ_NUM && v->num >= 0 && v->num == floor(v->num); }
+/* names.json's "diagnosis" (set by api_tests): the report's optional fields and the values of each */
+static const TfJson *g_t30_diag_names;
 static int t30_diag_ok(const TfJson *r) {
   static const char *const top[] = {"sdk", "key", "config", "model", "context", "backend", "microphone", "storage", "lastError", "droppedChunks", "connection"};
   static const char *const k_sdk[] = {"version", "latest"}, *const k_key[] = {"accepted", "reason"}, *const k_model[] = {"version", "build", "verified"};
   static const char *const k_backend[] = {"kind", "name", "stage", "reason"}, *const k_storage[] = {"models", "sharingQueueBytes"};
   static const char *const k_entry[] = {"version", "build", "bytes"};
-  if (!t30_keys_are(r, top, 11)) return 0;
+  if (!r || r->type != TJ_OBJ || r->n < 11) return 0;
+  for (int i = 0; i < 11; ++i)
+    if (strcmp(r->kids[i].key, top[i])) return 0;
+  {
+    /* beside the eleven: only a field names.json lists as optional, once, null or one of its listed values */
+    const TfJson *opt = tf_json_get(g_t30_diag_names, "optional_fields");
+    for (int i = 11; i < r->n; ++i) {
+      const TfJson *f = &r->kids[i], *vals = tf_json_get(g_t30_diag_names, f->key);
+      int listed = 0, ok = f->type == TJ_NULL;
+      for (int k = 0; opt && opt->type == TJ_ARR && k < opt->n; ++k) listed |= tf_json_str(&opt->kids[k]) && !strcmp(opt->kids[k].str, f->key);
+      for (int k = 11; k < i; ++k) listed &= strcmp(r->kids[k].key, f->key) != 0;
+      for (int k = 0; tf_json_str(f) && vals && vals->type == TJ_ARR && k < vals->n; ++k) ok |= tf_json_str(&vals->kids[k]) && !strcmp(vals->kids[k].str, f->str);
+      if (!listed || !ok) return 0;
+    }
+  }
   const char *conn = tf_json_str(tf_json_get(r, "connection"));
   if (!t30_whole(tf_json_get(r, "droppedChunks")) || !conn ||
       (strcmp(conn, "unmetered") && strcmp(conn, "metered") && strcmp(conn, "none") && strcmp(conn, "unknown")))
@@ -193,6 +211,9 @@ static TfJson *ap_diagnose(TfClient *c, const char *what) {
   CHECK(j && tf_json_get(j, "droppedChunks") && tf_json_get(j, "droppedChunks")->num == 0 && tf_json_str(tf_json_get(j, "connection")) &&
             !strcmp(tf_json_str(tf_json_get(j, "connection")), "unknown"),
         "%s: droppedChunks is not 0 or connection is not unknown: %s", what, text ? text : "(none)");
+  /* 3.1.3: the key is always there; null here, because a test's transport names no protocol */
+  CHECK(j && tf_json_get(j, "downloadProtocol") && tf_json_get(j, "downloadProtocol")->type == TJ_NULL, "%s: downloadProtocol is not null: %s", what,
+        text ? text : "(none)");
   TfDiagnosis d;
   CHECK(tf_client_diagnose(c, &d) == 0 && d.json && d.sdk_version && !strcmp(d.sdk_version, TF_SDK_VERSION) && !strcmp(d.microphone, "none"), "%s: TfDiagnosis", what);
   return j;
@@ -235,6 +256,14 @@ static int gate_state_has(const char *path, const char *what) {
 static int api_tests(const char *work, const char *data) {
   tf_mkdirs(work);
   char d[1100];
+  /* the report's optional fields and their values come from names.json (kept for the whole run) */
+  {
+    const TfJson *names = t30_json(data, "names.json");
+    g_t30_diag_names = tf_json_get(names, "diagnosis");
+    const TfJson *opt = tf_json_get(g_t30_diag_names, "optional_fields"), *dpv = tf_json_get(g_t30_diag_names, "downloadProtocol");
+    CHECK(opt && opt->type == TJ_ARR && opt->n == 1 && tf_json_str(&opt->kids[0]) && !strcmp(opt->kids[0].str, "downloadProtocol") && dpv && dpv->type == TJ_ARR && dpv->n == 3,
+          "names.json: diagnosis.optional_fields is not [downloadProtocol] with its three values");
+  }
   /* the schema checker itself: every valid example passes, every invalid one fails */
   {
     TfJson *ex = t30_json(data, "diagnosis_examples.json");
@@ -246,7 +275,7 @@ static int api_tests(const char *work, const char *data) {
       CHECK(refused, "the checker accepts the invalid example \"%s\"", tf_json_str(tf_json_get(&invalid->kids[i], "name")));
       iok += refused;
     }
-    CHECK(valid && invalid && vok == valid->n && iok == invalid->n && valid->n >= 5 && invalid->n >= 12, "diagnosis examples: %d valid pass, %d invalid refused", vok, iok);
+    CHECK(valid && invalid && vok == valid->n && iok == invalid->n && valid->n >= 9 && invalid->n >= 18, "diagnosis examples: %d valid pass, %d invalid refused", vok, iok);
     printf("diagnose: the report checker accepts %d/%d valid examples and refuses %d/%d invalid ones\n", vok, valid ? valid->n : 0, iok, invalid ? invalid->n : 0);
     tf_json_free(ex);
   }

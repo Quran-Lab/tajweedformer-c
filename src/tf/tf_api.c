@@ -24,7 +24,7 @@ typedef struct {
   int orphan;          /* a Model outlived this Client (tf_client_destroy with it open): its files are not removed here */
   int refs;
   char *storage_json, *diag_json, *items_json;
-  char d_version[24], d_build[41], d_context[32], d_reason[48], d_latest[24];
+  char d_version[24], d_build[41], d_context[32], d_reason[48], d_latest[24], d_protocol[12];
 } Api;
 
 static TfClient *g_client; /* the process's one Client */
@@ -276,9 +276,11 @@ int tf_client_prefetch(TfClient *c, const TfPrefetchOptions *options) {
   }
   char dir[1024];
   api_lock(a);
-  const int rc = tf__store_fetch(c, &f, dir, sizeof dir, NULL);
+  /* the failure is recorded on the Client before the lock is let go: a tf_client_destroy on another thread ends
+   * a download in flight (3.1.3), waits for this lock and then frees the Client */
+  const int rc = fail(c, tf__store_fetch(c, &f, dir, sizeof dir, NULL));
   api_unlock(a);
-  return fail(c, rc);
+  return rc;
 }
 
 const char *tf_client_storage_json(TfClient *c) {
@@ -437,7 +439,15 @@ int tf_client_diagnose(TfClient *c, TfDiagnosis *out) {
   /* chunks come by callback here, so none waits and none is dropped; the kind of connection is not known */
   out->dropped_chunks = 0;
   out->connection = tf__connection_name(tf__connection());
-  tf_buf_printf(&b, ",\"droppedChunks\":%d,\"connection\":\"%s\"}", out->dropped_chunks, out->connection);
+  tf_buf_printf(&b, ",\"droppedChunks\":%d,\"connection\":\"%s\"", out->dropped_chunks, out->connection);
+  /* 3.1.3: the protocol the last model request ran on. A record of this process, on this device: it is in no
+   * telemetry and is not written to disk. In the JSON only: TfDiagnosis does not grow in a patch release (an
+   * app built against an earlier 3.1 header hands in a struct of that header's size) */
+  tf__client_download_protocol(c, a->d_protocol);
+  tf_buf_puts(&b, ",\"downloadProtocol\":");
+  if (a->d_protocol[0]) tf_buf_json_str(&b, a->d_protocol);
+  else tf_buf_puts(&b, "null");
+  tf_buf_puts(&b, "}");
   free(storage);
   free(a->diag_json);
   a->diag_json = tf_buf_take(&b);

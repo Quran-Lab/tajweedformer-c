@@ -1,5 +1,5 @@
 {
- "about": "The sentence that copy deck 2026-11-12.1 added to sheet.who and what.detail and that the deck in force (2026-11-13.1) does not have: per language and string, its length in UTF-8 bytes and its SHA-256, not its text. Made by tools/gen_removed_sentence.py from the contract's sharing_copy/archive/2026-11-12.1 and sharing_copy. The consent test fails when a window of that length in a string an app is handed has that hash.",
+ "about": "The sentence that copy deck 2026-11-12.1 added to sheet.who and what.detail and that the deck in force (2026-11-13.1) does not have: per language and string, its length in UTF-8 bytes and its SHA-256, not its text. Made by a private tool from Quran Lab's copy deck archive. The consent test fails when a window of that length in a string an app is handed has that hash.",
  "archived_deck": "2026-11-12.1",
  "deck_in_force": "2026-11-13.1",
  "removed": {

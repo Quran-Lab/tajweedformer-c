@@ -222,6 +222,13 @@ if(Python3_FOUND)
   add_test(NAME tf_api_scan COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test/api_scan.py")
   add_test(NAME tf_quickstart COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test/quickstart_check.py")
   set_tests_properties(tf_api_scan tf_quickstart PROPERTIES TIMEOUT 120)
+  # 3.1.3: the model download through the real HTTP code (WinHTTP, libcurl), which every test above replaces.
+  # The script starts a stand-in model host on 127.0.0.1 (plain HTTP/1.1), runs `tf_tests net` against it and
+  # stops it: the stall limit, the resume inside the call and its bound, a 200 to a range request, refusals, a
+  # slow link, one connection for a download, the cancel, the protocol in the diagnosis.
+  add_test(NAME tf_net COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test/net_stand_in.py" $<TARGET_FILE:tf_tests>
+           "${TF_WORK}/net")
+  set_tests_properties(tf_net PROPERTIES FIXTURES_REQUIRED tf_work LABELS library TIMEOUT 300)
 endif()
 target_link_libraries(vnni_check PRIVATE zf_gemm_vnni)
 target_link_libraries(cpu_detect PRIVATE zf_gemm_vnni)
