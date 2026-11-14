@@ -30,12 +30,12 @@ Everything an assistant needs to integrate this SDK correctly: use only the name
 </td>
 <td valign="top">
 
-**Nothing to host**<br>The SDK downloads the model (56.5 MB for the default context) from our CDN in six regions and verifies it.
+**Nothing to host**<br>The SDK downloads the model (56.2 MB for the default context) from our CDN in six regions and verifies it.
 
 </td>
 <td valign="top">
 
-**Data for your own judge**<br>The SDK scores nothing. The model's thresholds and the expected units of each ayah come with it as read-only data, so your app can judge a recitation its own way.
+**Data for your own judge**<br>The SDK scores nothing. The model's thresholds come with it as read-only data, so your app can judge a recitation its own way. The expected units of each ayah do not: with this release and the model build served now, `tf_model_reference` returns NULL.
 
 </td>
 </tr>
@@ -84,8 +84,8 @@ One model, one engine, the same bits on every platform. Each SDK compiles the sa
 
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
-| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+ on arm64-v8a and armeabi-v7a, desktop JVM | Maven Central `ai.quranlab:tajweedformer:3.1.2` |
-| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.1.3"`, product `TajweedFormer` |
+| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+ on arm64-v8a and armeabi-v7a, desktop JVM | Maven Central `ai.quranlab:tajweedformer:3.1.5` |
+| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.1.4"`, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node 20+ | `npm install @quran-lab/tajweedformer` |
 | [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 3.1.3 |
 | [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) | The engine: exact C runtime, inference library, conformance suite | everything above | Git submodule |
@@ -136,7 +136,7 @@ To build the repository by itself (the library, the `tajweedformer` command-line
 | **Compilers** | Linux: gcc or clang. Windows: LLVM clang on the Microsoft runtime, or MinGW-w64 GCC. Microsoft's `cl.exe` cannot build the engine. CMake 3.24 or later, and Ninja. |
 | **Libraries** | Linux: the development files of libcurl and OpenSSL 3 (`libcurl4-openssl-dev libssl-dev` on Debian and Ubuntu). Windows: none. The build downloads libopus 1.6.1 once and checks its hash. |
 | **Microphone** | The library takes samples; capturing them is your program's part. The quick start pipes the system's recorder in. |
-| **Download** | The model is 56.5 MB for the default context (73.5 MB on disk), downloaded once by `tf_client_model` into the SDK's folder; every context together is 58.9 MB. |
+| **Download** | The model is 56.2 MB for the default context (68.8 MB on disk), downloaded once by `tf_client_model` into the SDK's folder; every context together is 58.5 MB. |
 | **Takes** | One Client per process, and one take at a time. A server runs one worker process per take. |
 
 ## Quick start
@@ -621,10 +621,10 @@ Next:
 
 `tf_client_model` (or `tf_client_prefetch` ahead of use) fetches the CPU files of the model folder (`sdk/v4.0`,
 manifest format 3) and the sample clips, gzip on the wire, resumable, every file checked against the signed
-manifest. Model revision v4.0-2026-11-10: **56.5 MB** for the default context `c16_l64`
-(73.5 MB on disk); another context's files come on first use, 58.9 MB for every context
-(77.2 MB on disk). The reference data is downloaded only when the app asks
-(`tf_reference_fetch`). The optional ONNX Runtime graphs are not downloaded.
+manifest. Model revision v4.0-2026-11-10: **56.2 MB** for the default context `c16_l64`
+(68.8 MB on disk); another context's files come on first use, 58.5 MB for every context
+(72.5 MB on disk). The reference data is downloaded only when the app asks
+(`tf_reference_fetch`); with this release and the model build served now `tf_model_reference` returns NULL. The optional ONNX Runtime graphs are not downloaded.
 
 ## Problems and wishes
 

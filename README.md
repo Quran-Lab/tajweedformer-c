@@ -45,12 +45,12 @@
 </td>
 <td valign="top">
 
-**Nothing to host**<br>The SDK downloads the model (56.5 MB for the default context) from our CDN in six regions and verifies it.
+**Nothing to host**<br>The SDK downloads the model (56.2 MB for the default context) from our CDN in six regions and verifies it.
 
 </td>
 <td valign="top">
 
-**Data for your own judge**<br>The SDK scores nothing. The model's thresholds and the expected units of each ayah come with it as read-only data, so your app can judge a recitation its own way.
+**Data for your own judge**<br>The SDK scores nothing. The model's thresholds come with it as read-only data, so your app can judge a recitation its own way. The expected units of each ayah do not: with this release and the model build served now, `tf_model_reference` returns NULL.
 
 </td>
 </tr>
@@ -106,7 +106,7 @@ To build the repository by itself (the library, the `tajweedformer` command-line
 | **Compilers** | Linux: gcc or clang. Windows: LLVM clang on the Microsoft runtime, or MinGW-w64 GCC. Microsoft's `cl.exe` cannot build the engine. CMake 3.24 or later, and Ninja. |
 | **Libraries** | Linux: the development files of libcurl and OpenSSL 3 (`libcurl4-openssl-dev libssl-dev` on Debian and Ubuntu). Windows: none. The build downloads libopus 1.6.1 once and checks its hash. |
 | **Microphone** | The library takes samples; capturing them is your program's part. The quick start pipes the system's recorder in. |
-| **Download** | The model is 56.5 MB for the default context (73.5 MB on disk), downloaded once by `tf_client_model` into the SDK's folder; every context together is 58.9 MB. |
+| **Download** | The model is 56.2 MB for the default context (68.8 MB on disk), downloaded once by `tf_client_model` into the SDK's folder; every context together is 58.5 MB. |
 | **Takes** | One Client per process, and one take at a time. A server runs one worker process per take. |
 
 ## Quick start
