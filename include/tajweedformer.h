@@ -1,4 +1,4 @@
-/* tajweedformer.h: the TajweedFormer SDK for Windows and Linux (C API, SDK 3.1.3).
+/* tajweedformer.h: the TajweedFormer SDK for Windows and Linux (C API, SDK 3.1.4).
  *
  * A pure inference engine: audio in, the model's own output out. Five things, with the same names and the same
  * order of calls as the Android, Apple and web SDKs:
@@ -58,9 +58,9 @@ extern "C" {
 #define TF_API
 #endif
 
-#define TF_SDK_VERSION "3.1.3"
+#define TF_SDK_VERSION "3.1.4"
 
-TF_API const char *tf_version(void); /* "3.1.3" */
+TF_API const char *tf_version(void); /* "3.1.4" */
 
 /* ============================================================================ errors */
 
@@ -317,7 +317,7 @@ TF_API int tf_client_remove_models(TfClient *c);
 
 /* One structured report, safe to paste into an issue: no audio, text or identifiers. */
 typedef struct {
-  const char *sdk_version;     /* "3.1.3" */
+  const char *sdk_version;     /* "3.1.4" */
   const char *sdk_latest;      /* the SDK release the signed config in force names, or NULL when it names none */
   int key_accepted;            /* 1 accepted, 0 refused, -1 not known yet (no answer from the server) */
   const char *key_reason;      /* why not: the server's code, or NULL */

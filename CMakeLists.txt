@@ -142,6 +142,19 @@ if(WIN32)
   target_compile_definitions(tajweedformer_cli PRIVATE TF_USE_DLL=1 _CRT_SECURE_NO_WARNINGS)
 endif()
 
+# tajweedformer-eval: the model on a developer's own recordings, through the public API only (cli/tajweedformer_eval.c;
+# README, "Evaluate the model on your own data")
+add_executable(tajweedformer_eval cli/tajweedformer_eval.c)
+set_target_properties(tajweedformer_eval PROPERTIES OUTPUT_NAME tajweedformer-eval)
+target_compile_options(tajweedformer_eval PRIVATE -O2 -Wall -Wextra)
+target_link_libraries(tajweedformer_eval PRIVATE tajweedformer)
+if(WIN32)
+  target_compile_definitions(tajweedformer_eval PRIVATE TF_USE_DLL=1 _CRT_SECURE_NO_WARNINGS)
+  target_link_libraries(tajweedformer_eval PRIVATE shell32)
+else()
+  target_link_libraries(tajweedformer_eval PRIVATE m)
+endif()
+
 # the example app, whose marked region is the README's quick start: built with everything else so the code in the
 # README always compiles (test/quickstart_check.py keeps the two texts equal). Only in a build of this repository
 # itself: an app that takes it as a subproject has its own program, which may well be called quickstart too
@@ -193,6 +206,8 @@ set(TF_VEC "${TF_DATA}/sharing_vectors")
 find_package(Python3 COMPONENTS Interpreter)
 add_test(NAME tf_work_clean COMMAND ${CMAKE_COMMAND} -E rm -rf "${TF_WORK}")
 set_tests_properties(tf_work_clean PROPERTIES FIXTURES_SETUP tf_work TIMEOUT 120)
+# 3.1.4: tajweedformer-eval's own parts without a model (test/data/eval: test/make_eval_flac.py)
+add_test(NAME tf_eval_units COMMAND tf_tests eval_units "${TF_DATA}/eval" "${TF_WORK}/eval_units")
 add_test(NAME tf_ogg COMMAND tf_tests ogg "${TF_VEC}/ogg" "${TF_WORK}/ogg")
 add_test(NAME tf_codec COMMAND tf_tests codec "${TF_VEC}" "${TF_WORK}/codec")
 add_test(NAME tf_sharing COMMAND tf_tests sharing "${TF_VEC}" "${TF_DATA}/client-fixtures.json" "${TF_WORK}/sharing")

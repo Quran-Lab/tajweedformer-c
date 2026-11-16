@@ -1427,7 +1427,7 @@ static int sdk_latest_tests(const char *configs, const char *dir) {
   if (!g_sl.fx) return 2;
   tf_mkdirs(dir);
   tf_http_set_transport(sl_stub, NULL);
-  static const char want[] = "Quran Lab SDK 3.1.4 is available (recommended), you have " TF_SDK_VERSION ": https://github.com/Quran-Lab/tajweedformer-c/releases";
+  static const char want[] = "Quran Lab SDK 3.1.5 is available (recommended), you have " TF_SDK_VERSION ": https://github.com/Quran-Lab/tajweedformer-c/releases";
   char d[1100];
   /* newer: one line at launch; a second newer config (a refresh) adds none */
   snprintf(d, sizeof d, "%s/newer", dir);
