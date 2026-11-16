@@ -18,7 +18,10 @@
  *   tf_tests ogg | codec | sharing | upload | session_share | client | download   (tf_client_tests.inc, tf_share_tests.inc)
  *   tf_tests bitrate | consent | telemetry | sdk_latest                           (tf_201_tests.inc)
  *   tf_tests manifest <data dir> <work dir>     the real signed V4 manifests (tf_manifest_tests.inc)
- *   tf_tests takes <vectors dir> <work dir>     takes in a row share one recording (tf_203_tests.inc) */
+ *   tf_tests takes <vectors dir> <work dir>     takes in a row share one recording (tf_203_tests.inc)
+ *   tf_tests eval_units <data/eval> <work dir>  tajweedformer-eval's own parts, no model (3.1.4: tf_eval_tests.inc)
+ *   tf_tests eval30 <local30 dir> <key_hex> <clips dir> <expected.jsonl> <work dir> <configs.json> [full|prod]
+ *                                               tajweedformer-eval on the 35 clips with references, then offline */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -649,6 +652,7 @@ static int layers(const char *fx, const char *dir16, const char *dir24, const ch
 #include "tf_30_model_tests.inc"
 #include "tf_30_share_tests.inc"
 #include "tf_313_net_tests.inc"
+#include "tf_eval_tests.inc"
 
 static int folder(const char *dir, const char *key) {
   TfModel *m = open_folder(dir, key, 1, NULL);
@@ -841,6 +845,8 @@ int main(int argc, char **argv) {
   if (argc >= 4 && !strcmp(argv[1], "takes")) return takes_tests(argv[2], argv[3]);
   if (argc >= 3 && !strcmp(argv[1], "sharing_off")) return sharing_off_tests(argv[2], argc > 3 ? atoi(argv[3]) : 20, argc > 4 ? atoi(argv[4]) : 1);
   if (argc >= 3 && !strcmp(argv[1], "telemetry")) return telemetry_tests(argv[2]);
+  if (argc >= 4 && !strcmp(argv[1], "eval_units")) return eval_units_tests(argv[2], argv[3]);
+  if (argc >= 8 && !strcmp(argv[1], "eval30")) return eval30_tests(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argc > 8 ? argv[8] : NULL);
   fprintf(stderr, "usage: see the comment at the top of test/tf_tests.c\n");
   return 2;
 }

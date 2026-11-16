@@ -1,5 +1,26 @@
 # Changelog
 
+## 3.1.4
+
+A tool to evaluate the model on your own recordings. No call of the library changes.
+
+- **Added: `tajweedformer-eval`**, a command-line tool built with the library (README, "Evaluate the model on your
+  own data"). It runs a folder or a list of WAV, FLAC or raw float32 files, at any rate the SDK takes, through the
+  public API with the app's desktop key, and writes one JSON line per file: the transcript with each unit's time and
+  confidence, a summary of every head computed, the processing time and, with references (CSV or JSONL: an ayah
+  range, whose units come from the model's reference data, or the units themselves), the unit error rate and the word
+  error rate over the reference's words; then a line with the totals. The model is the SDK's own download, so no
+  raw weights are needed to evaluate it, and once downloaded the tool runs without a network. The Windows x64
+  release has it ready to run (`tajweedformer-3.1.4-windows-x64.zip`).
+- Tests: `tf_eval_units` in ctest (the edit distance and its split, the reference's words, ayah ranges, CSV and
+  JSONL references, JSON escapes, every WAV form, FLAC from ffmpeg's encoder: four synthetic files that
+  `test/make_eval_flac.py` makes); `tf_tests eval30` on the local 3.0 model folders: the 35 conformance clips with
+  the ayah of each as its reference through the tool and the Client against the model tests' stub (every line's
+  fields, the units equal to the engine's expected tokens, the error counts equal to a plain edit distance of the
+  reference data's units, the totals: 0 errors over 827 units and 144 words), then again with no network at all and
+  JSONL references (one as units text, one clip held against the next ayah: 18 edits over its 14 units, 2 of 2
+  words wrong, as a plain edit distance counts them).
+
 ## 3.1.3
 
 The model download holds up on a poor connection. No call changes; the diagnose report's JSON has one key more.

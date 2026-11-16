@@ -1,10 +1,14 @@
-# The C API: `tajweedformer.h` (SDK 3.1.3)
+# The C API: `tajweedformer.h` (SDK 3.1.4)
 
 One library for Windows and Linux apps and for servers: `tajweedformer.dll` / `libtajweedformer.so` (or the static
 library) and one header, `include/tajweedformer.h`. It includes nothing but `<stddef.h>` and names no engine type.
 SDK 3.0.0 is a pure inference engine: audio in, the model's own output out. It never compares a recitation with an
 expected ayah and never says "mistake"; an app that judges builds its judge on the output (see
 [migrating-to-3.md](migrating-to-3.md)).
+
+To evaluate the model on your own recordings without writing code, `tajweedformer-eval` (3.1.4, built with the
+library) runs a folder of WAV or FLAC files through this API and writes the transcripts, a summary of the heads and,
+with references, the unit and word error rates: README, "Evaluate the model on your own data".
 
 Five things, with the same names and the same order of calls as the Android, Apple and web SDKs:
 
@@ -18,7 +22,7 @@ Five things, with the same names and the same order of calls as the Android, App
 
 Every options struct (`TfClientOptions`, `TfModelOptions`, `TfPrefetchOptions`, `TfSessionOptions`) may be NULL or
 zeroed: zero is the default of every field. Strings and arrays returned as `const` belong to the object they came
-from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"3.1.3"`.
+from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"3.1.4"`.
 
 ## Errors
 
