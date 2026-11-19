@@ -5,8 +5,8 @@
 #define TF_ERRORS_SDK "3.0.0"
 #define TF_ERRORS_DOCS_BASE "https://sdk.quranlab.ai/docs/errors#"
 #define TF_ERRORS_COUNT 26
-#define TF_ERRORS_JSON_SIZE 9088
-#define TF_ERRORS_JSON_SHA256 "04b264b9d820f865a0bfd4d695e17a07b2ae6b1be318324c91f3177d322cd510"
+#define TF_ERRORS_JSON_SIZE 9135
+#define TF_ERRORS_JSON_SHA256 "923da8f3d66e765a34574c4e12cbce5ae963688f407a07106f46dcd865fad3bd"
 
 typedef struct {
   const char *code, *message, *fix;
@@ -91,7 +91,7 @@ static const TfErrorEntry kTfErrors[TF_ERRORS_COUNT] = {
      "Start a new session when the app has the audio again; what was heard so far is in the last chunk."},
     {"sharing_unavailable",
      "Sharing is not available for this app.",
-     "Nothing to call: Quran Lab switches sharing on per app; check client.sharing.isAvailable before showing sharing settings."},
+     "Nothing to call: sharing is not offered on this platform yet, or Quran Lab has paused it for everyone; check client.sharing.isAvailable before showing sharing settings."},
 };
 
 #define TF_REASONS_COUNT 10
@@ -505,12 +505,14 @@ static const unsigned char kTfErrorsJson[TF_ERRORS_JSON_SIZE] = {
     110,103,95,117,110,97,118,97,105,108,97,98,108,101,34,44,32,34,109,101,115,115,97,103,
     101,34,58,32,34,83,104,97,114,105,110,103,32,105,115,32,110,111,116,32,97,118,97,105,
     108,97,98,108,101,32,102,111,114,32,116,104,105,115,32,97,112,112,46,34,44,32,34,102,
-    105,120,34,58,32,34,78,111,116,104,105,110,103,32,116,111,32,99,97,108,108,58,32,81,
-    117,114,97,110,32,76,97,98,32,115,119,105,116,99,104,101,115,32,115,104,97,114,105,110,
-    103,32,111,110,32,112,101,114,32,97,112,112,59,32,99,104,101,99,107,32,99,108,105,101,
-    110,116,46,115,104,97,114,105,110,103,46,105,115,65,118,97,105,108,97,98,108,101,32,98,
-    101,102,111,114,101,32,115,104,111,119,105,110,103,32,115,104,97,114,105,110,103,32,115,101,
-    116,116,105,110,103,115,46,34,125,10,32,32,93,10,125,10,
+    105,120,34,58,32,34,78,111,116,104,105,110,103,32,116,111,32,99,97,108,108,58,32,115,
+    104,97,114,105,110,103,32,105,115,32,110,111,116,32,111,102,102,101,114,101,100,32,111,110,
+    32,116,104,105,115,32,112,108,97,116,102,111,114,109,32,121,101,116,44,32,111,114,32,81,
+    117,114,97,110,32,76,97,98,32,104,97,115,32,112,97,117,115,101,100,32,105,116,32,102,
+    111,114,32,101,118,101,114,121,111,110,101,59,32,99,104,101,99,107,32,99,108,105,101,110,
+    116,46,115,104,97,114,105,110,103,46,105,115,65,118,97,105,108,97,98,108,101,32,98,101,
+    102,111,114,101,32,115,104,111,119,105,110,103,32,115,104,97,114,105,110,103,32,115,101,116,
+    116,105,110,103,115,46,34,125,10,32,32,93,10,125,10,
 };
 
 #endif

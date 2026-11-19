@@ -1,4 +1,7 @@
-"""The public surface of the C SDK is the naming table's and nothing else (SDK 3.0.0).
+"""The public surface of the C SDK is the naming table's and nothing else (SDK 3.0.0; SDK 4.0.0 adds 17.9's
+report of the recited range with the app's outcome: TfRecitedOutcome, TfRecitedAyah,
+tf_session_report_recited_outcome, a function of its own since C has no optional arguments; and section 20's ask:
+TfAskKind, tf_sharing_shown, tf_sharing_open).
 
   python test/api_scan.py        exit 1 with what differs
 
@@ -10,6 +13,9 @@ What it checks, from the files themselves:
   this struct). A type added or removed fails here, so the surface cannot grow back unnoticed.
 - Its functions are exactly the list below, and the shared library exports exactly them: the Windows .def file
   and the Linux version script name the same functions.
+- One sheet for every app: no member, parameter, enum or constant of
+  the header is named audience, children, guardian or guardian_confirmed (in any case, or as part of a name), and
+  its comments do not mention them either. tf_sharing_answer takes the client and the answer, nothing else.
 - The command-line tool and the example use the public header only.
 - docs/api.md names every public function and type.
 """
@@ -22,8 +28,8 @@ header = (root / "include" / "tajweedformer.h").read_text(encoding="utf-8")
 bad = []
 
 TYPES = """TfClient TfModel TfSession TfHeads TfBackend TfClientOptions TfSessionOptions TfChunk TfDecoded TfToken TfWord
-TfFrame TfHead TfEvent TfTokens TfCalibration TfReference TfClip TfSharing TfAnalytics TfDiagnosis TfError
-TfModelOptions TfPrefetchOptions TfUnits TfConsentRequest""".split()
+TfFrame TfHead TfEvent TfTokens TfCalibration TfReference TfClip TfSharing TfDiagnosis TfError
+TfModelOptions TfPrefetchOptions TfUnits TfConsentRequest TfRecitedOutcome TfRecitedAyah TfAskKind""".split()
 
 FUNCTIONS = """tf_version tf_last_error_code tf_last_error tf_last_error_fix tf_error_name tf_error_fix tf_error_docs
 tf_decoded_json tf_heads_count tf_heads_name tf_heads_get tf_heads_greedy tf_heads_decoded
@@ -35,10 +41,10 @@ tf_model_calibration_json tf_model_calibration tf_model_calibration_number
 tf_model_reference tf_reference_is_downloaded tf_reference_fetch tf_reference_units
 tf_model_sample_clip_count tf_model_sample_clip tf_model_backend
 tf_session_create tf_session_listen tf_session_push tf_session_finish tf_session_heads tf_session_cancel
-tf_session_backend tf_session_report_recited tf_session_destroy
+tf_session_backend tf_session_report_recited tf_session_report_recited_outcome tf_session_destroy
 tf_sharing_status tf_sharing_is_available tf_sharing_is_on tf_sharing_set_on tf_sharing_ask tf_sharing_answer
 tf_sharing_copy_json tf_sharing_feed tf_sharing_items_json tf_sharing_summary_json tf_sharing_delete
-tf_sharing_recovery_code tf_sharing_set_wording""".split()
+tf_sharing_recovery_code tf_sharing_set_wording tf_sharing_shown tf_sharing_open""".split()
 
 # names of what 3.0 removed (SPEC sections 3 and 8, NAMING section 1): none may be left in the public header
 REMOVED = ["tf_score", "tf_stream", "TfStream", "TfResult", "TfWordScore", "tf_result", "tf_settings", "_default_options",
@@ -79,6 +85,23 @@ exported = re.findall(r"^\s+(\w+);", mapf.split("local:", 1)[0], re.M)
 if sorted(exported) != sorted(functions) or "*" in mapf.split("local:", 1)[0]:
     bad.append(f"tajweedformer.map differs from the header: extra {sorted(set(exported) - set(functions))}, missing {sorted(set(functions) - set(exported))}")
 
+# SDK 4.0: no audience option and no guardian variant of the sheet.
+# The 3.x names (TfClientOptions.audience, TfConsentRequest.guardian, TfSharing.guardian, the guardian_confirmed
+# argument and the guardian_not_confirmed reason of the other SDKs) stay gone: no name of the header holds one of
+# these words, and no comment speaks of them.
+ONE_SHEET_GONE = re.compile(r"audience|children|guardian", re.I)
+code = re.sub(r"/\*.*?\*/", " ", header, flags=re.S)
+code = re.sub(r"//[^\n]*", " ", code)
+for name in sorted(set(re.findall(r"\b[A-Za-z_]\w*\b", code))):
+    if ONE_SHEET_GONE.search(name):
+        bad.append(f"include/tajweedformer.h names {name}: 4.0 has no audience option and no guardian variant (section 26)")
+for m in ONE_SHEET_GONE.finditer(header):
+    line = header.count("\n", 0, m.start()) + 1
+    bad.append(f"include/tajweedformer.h line {line} mentions {m.group(0)}: 4.0 has one sheet for every app (section 26)")
+answer = re.search(r"^TF_API\s+int\s+tf_sharing_answer\s*\(([^)]*)\)", header, re.M)
+if not answer or [p.split()[-1].lstrip("*") for p in answer.group(1).split(",")] != ["c", "share"]:
+    bad.append(f"tf_sharing_answer takes {answer.group(1) if answer else '(not found)'}: want (TfClient *c, int share), nothing else")
+
 # SDK 3.1.0 (SPEC section 15): no public way to hand the SDK a model. The call that opened a folder and the
 # option that named another signing key are gone from the header and from the exports, and stay gone.
 for gone in ("tf_model_open", "trusted_key_hex"):
@@ -109,4 +132,5 @@ else:
 if bad:
     print("\n".join(bad))
     sys.exit(1)
-print(f"public surface: {len(functions)} functions, {len(types)} types; header, .def and .map agree; no engine or removed name; docs/api.md covers it")
+print(f"public surface: {len(functions)} functions, {len(types)} types; header, .def and .map agree; no engine or removed name; no audience, "
+      "children or guardian name (section 26); docs/api.md covers it")

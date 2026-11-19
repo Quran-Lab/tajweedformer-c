@@ -7,7 +7,18 @@
  * SPEC 2a: the server picks the build for this SDK (the config's "recommended": repo, folder, revision = the
  * build, version); the SDK downloads by the build and reports the version. A pin is a version sent with the config
  * request. SPEC 13.4: a first run without a network is TF_ERR_NEEDS_CONNECTION, not a timeout; with a model on
- * disk the SDK starts offline on it. */
+ * disk the SDK starts offline on it, while the Core holds a valid lease for it (18.4.7).
+ *
+ * SDK 4.0: between the manifest and the files, the lease (tf_lease.c); each container goes from its CDN form to its
+ * device form through the Core (qlc_install). The 4.0 config (qlab-api sdk4-server, PROTECTED_MODEL.md 18.4.5)
+ * names each build's key id (recommended.key_id: the build's encryption.key_id) and no base URL: a recommended
+ * build without a key id is not one for 4.0, the signed manifest must name the config's key id before a lease is
+ * asked for it, and the files come from the model folder the lease answer names (a `base` in the config, which only
+ * a config for SDK 2.x and 3.x carries, is never read). The recited index (17.5) is fetched with the model while the
+ * analytics are on and flags.recited is not false: the Core refuses to install, beside an open model, a file of that
+ * model's own build that it reads (qlcore.h qlc_install), so it cannot come later, after a session, as 17.1
+ * describes. Another build installs beside an open model: every Core call that reads a build's files sets the
+ * platform's folder to that build first. */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -18,7 +29,7 @@
 #include "tf_internal.h"
 
 typedef struct {
-  char build[41], version[24], repo[128], folder[64], id[40], base[256];
+  char build[41], version[24], repo[128], folder[64], id[40], key_id[33];
 } Pick;
 
 static char *models_dir(TfClient *c) { return tf_path_join(tf__client_dir(c), "models"); }
@@ -37,8 +48,12 @@ static int url_part(const char *s, size_t max) {
   return 1;
 }
 
-/* the config's choice: "recommended": {"model": repo, "model_id", "folder", "revision": build, "version"}, and the
- * download base ("base", else the client's). 0, or -1 when the config in force names no usable build. */
+/* a key id as the config and the manifest name it: 32 lowercase hex */
+static int is_key_id(const char *s) { return s && strlen(s) == 32 && strspn(s, "0123456789abcdef") == 32; }
+
+/* the config's choice: "recommended": {"model": repo, "model_id", "folder", "revision": build, "version", "key_id"}.
+ * 0, or -1 when the config in force names no build this SDK can run (none, or one without a key id: SDK 4.0 runs
+ * encrypted builds only, and the server offers it no other). */
 static int pick_from_config(TfClient *c, Pick *p) {
   memset(p, 0, sizeof *p);
   const char *cfg = tf__client_config_json(c);
@@ -46,15 +61,16 @@ static int pick_from_config(TfClient *c, Pick *p) {
   const TfJson *r = tf_json_get(j, "recommended");
   const char *repo = tf_json_str(tf_json_get(r, "model")), *folder = tf_json_str(tf_json_get(r, "folder"));
   const char *build = tf_json_str(tf_json_get(r, "revision")), *version = tf_json_str(tf_json_get(r, "version"));
-  const char *id = tf_json_str(tf_json_get(r, "model_id")), *base = tf_json_str(tf_json_get(j, "base"));
-  int ok = r && is_build(build) && tf__is_model_version(version) && url_part(repo, sizeof p->repo) && url_part(folder, sizeof p->folder);
+  const char *id = tf_json_str(tf_json_get(r, "model_id")), *kid = tf_json_str(tf_json_get(r, "key_id"));
+  int ok = r && is_build(build) && tf__is_model_version(version) && url_part(repo, sizeof p->repo) && url_part(folder, sizeof p->folder) &&
+           is_key_id(kid);
   if (ok) {
     snprintf(p->build, sizeof p->build, "%s", build);
     snprintf(p->version, sizeof p->version, "%s", version);
     snprintf(p->repo, sizeof p->repo, "%s", repo);
     snprintf(p->folder, sizeof p->folder, "%s", folder);
     snprintf(p->id, sizeof p->id, "%s", id ? id : "");
-    if (base && !strncmp(base, "https://", 8) && strlen(base) < sizeof p->base) snprintf(p->base, sizeof p->base, "%s", base);
+    snprintf(p->key_id, sizeof p->key_id, "%s", kid);
   }
   tf_json_free(j);
   return ok ? 0 : -1;
@@ -85,6 +101,36 @@ static int pick_from_disk(TfClient *c, Pick *p) {
   tf_json_free(j);
   free(dir);
   return ok ? 0 : -1;
+}
+
+/* 24.1 storage evicted: current.json names an installed build whose folder lost its manifest (the system or a cleaner
+ * removed the files); it is downloaded again. Reported as a silent failure. */
+static void check_evicted(TfClient *c) {
+  char *dir = models_dir(c), *cur = dir ? tf_path_join(dir, "current.json") : NULL, *text = NULL;
+  size_t n = 0;
+  TfJson *j = cur && !tf_read_file(cur, &text, &n) ? tf_json_parse(text, n, NULL) : NULL;
+  const char *build = tf_json_str(tf_json_get(j, "build"));
+  if (is_build(build)) {
+    char *bd = tf_path_join(dir, build), *mf = bd ? tf_path_join(bd, "manifest.json") : NULL;
+    if (mf && !tf_file_exists(mf)) tf__rep_silent("storage", "evicted", 0, NULL, NULL);
+    free(mf);
+    free(bd);
+  }
+  tf_json_free(j);
+  free(text);
+  free(cur);
+  free(dir);
+}
+/* 24.4: part of a build is in its folder (bytes an earlier download left), beside the folder's version marker */
+static int partly_here(const char *build_dir) {
+  char *mk = tf_path_join(build_dir, "version");
+  long long marker = 0;
+  char *text = NULL;
+  size_t n = 0;
+  if (mk && !tf_read_file(mk, &text, &n)) marker = (long long)n;
+  free(text);
+  free(mk);
+  return tf__dir_bytes(build_dir) > marker;
 }
 
 static void write_current(TfClient *c, const Pick *p) {
@@ -217,6 +263,33 @@ static void fill_open(TfClient *c, const Pick *p, char *out_dir, size_t n, TfMod
 
 static _Thread_local char g_keep[4][256]; /* the strings a TfModelOpen filled here points at, until the next call */
 
+/* SDK 4.0: the hooks of a download (tf_download.c): the lease after the manifest, the Core's install per container */
+typedef struct {
+  TfClient *c;
+  const char *dest, *build;
+  const char *key_id; /* the config's key id for the build (NULL: a build already on the device, checked then) */
+} Hook;
+static int hook_lease(void *user, const char *manifest, size_t n, const TfJson *m, char *base, size_t base_cap) {
+  Hook *h = (Hook *)user;
+  /* the build's key id is the one the signed config names beside it (18.4.5): the manifest's hash proves the build,
+   * and this keeps a config and a manifest of different key ids from reaching the lease route */
+  const char *kid = tf_json_str(tf_json_get(tf_json_get(m, "encryption"), "key_id"));
+  if (h->key_id && (!kid || strcmp(kid, h->key_id)))
+    return tf__fail(TF_ERR_MODEL_INVALID, "the manifest names key id %s, the signed config named %s", kid ? kid : "none", h->key_id);
+  TfPm *p = tf__pm(h->c);
+  if (!p) return tf__error_code();
+  tf__plat_set_build(tf__pm_plat(p), h->dest);
+  const int rc = tf__pm_lease(h->c, p, manifest, n, m, h->build);
+  if (!rc) tf__pm_base(p, h->build, base, base_cap); /* where the files are; none: no file is downloaded */
+  return rc;
+}
+static int hook_install(void *user, const char *decoded_path, const char *manifest, size_t n) {
+  Hook *h = (Hook *)user;
+  TfPm *p = tf__pm(h->c);
+  return p ? tf__pm_install(p, h->dest, manifest, n, decoded_path) : tf__error_code();
+}
+static int want_recited(TfClient *c) { return tf__client_telemetry_on(c) && tf__client_flag(c, "recited", 1); }
+
 int tf__store_fetch(TfClient *c, const TfFetch *f, char *out_dir, size_t n, TfModelOpen *open) {
   tf__clear_error();
   TfFetch none;
@@ -233,10 +306,14 @@ int tf__store_fetch(TfClient *c, const TfFetch *f, char *out_dir, size_t n, TfMo
   /* a refusal removes the models: here for a refusal an earlier launch remembered, and for a
    * removal that is still owed after the key was accepted again (a Model was open, or the removal failed) */
   tf__client_purge_models(c);
-  if (*tf__client_gate(c)) return tf__fail_gate(c);
+  if (*tf__client_gate(c)) {
+    tf__cause("config", "refused", 0, NULL, tf__client_gate(c)); /* the refusal remembered on the device */
+    return tf__fail_gate(c);
+  }
   Pick p, disk;
   const int have_cfg = pick_from_config(c, &p) == 0;
   int have_disk = pick_from_disk(c, &disk) == 0;
+  if (!have_disk) check_evicted(c);
   /* SPEC 15.2: the build current.json names counts only with this Client's own record that it was installed */
   if (have_disk) {
     const int st = rec_state(c, disk.build);
@@ -256,6 +333,7 @@ int tf__store_fetch(TfClient *c, const TfFetch *f, char *out_dir, size_t n, TfMo
     if (have_disk) {
       tf__clear_error();
       fill_open(c, &disk, out_dir, n, open, g_keep);
+      tf__rep_model(disk.version, disk.build);
       return 0;
     }
     if (refused) return refused;
@@ -267,6 +345,7 @@ int tf__store_fetch(TfClient *c, const TfFetch *f, char *out_dir, size_t n, TfMo
   }
   tf__clear_error();
   fill_open(c, &p, out_dir, n, open, g_keep);
+  tf__rep_model(p.version, p.build); /* the model a report names (24.2 revision and build) */
   /* the build the config names: a folder of it without a record of this Client is deleted before anything is
    * asked of the server, so no file of it is reused or resumed */
   const int pst = rec_state(c, p.build);
@@ -284,8 +363,13 @@ int tf__store_fetch(TfClient *c, const TfFetch *f, char *out_dir, size_t n, TfMo
     if (complete) return 0;
     if (have_disk) {
       fill_open(c, &disk, out_dir, n, open, g_keep);
+      tf__rep_model(disk.version, disk.build);
       return 0;
     }
+    /* 24.4: needs_connection only when nothing of the build is here; part of it is a download that stopped. The
+     * cause is the config's request that got no answer (the last request of this thread) */
+    tf__cause_transport("config", 0);
+    if (partly_here(out_dir)) return tf__fail(TF_ERR_DOWNLOAD_FAILED, "no connection, and the download of this build is not complete");
     return tf__fail(TF_ERR_NEEDS_CONNECTION, NULL);
   }
   /* an unmetered-only prefetch downloads on an unmetered connection and on one of unknown kind, and waits on a
@@ -300,7 +384,7 @@ int tf__store_fetch(TfClient *c, const TfFetch *f, char *out_dir, size_t n, TfMo
   char cfg_ctx[32] = "";
   const char *ctx = f->context ? f->context : tf__client_inference_context(c, cfg_ctx, sizeof cfg_ctx);
   TfDownload d = tf__download_defaults();
-  d.cdn_url = p.base[0] ? p.base : tf__client_cdn(c);
+  d.cdn_url = tf__client_cdn(c); /* the manifest's host; the files come from the lease answer's base */
   d.key = tf__client_key(c);
   d.repo = p.repo;
   d.revision = p.build;
@@ -324,6 +408,11 @@ int tf__store_fetch(TfClient *c, const TfFetch *f, char *out_dir, size_t n, TfMo
   d.resumed = &resumed;
   d.client = c;
   d.cancel = tf__client_cancel_flag(c); /* destroying the Client ends the download */
+  Hook hk = {c, out_dir, p.build, p.key_id};
+  d.after_manifest = hook_lease;
+  d.install = hook_install;
+  d.hook_user = &hk;
+  d.want_recited = want_recited(c);
   /* the record is written before the first byte of the build is asked for */
   if (pst == REC_NONE && rec_write(c, p.build, "downloading")) return rec_failed();
   const int rc = tf__download_model(&d);
@@ -382,7 +471,7 @@ int tf__store_fetch_role(TfClient *c, const TfModel *m, const char *context, con
                       context ? context : role ? role : "the model");
   }
   TfDownload d = tf__download_defaults();
-  d.cdn_url = p.base[0] ? p.base : tf__client_cdn(c);
+  d.cdn_url = tf__client_cdn(c);
   d.key = tf__client_key(c);
   d.repo = p.repo;
   d.revision = p.build;
@@ -395,7 +484,27 @@ int tf__store_fetch_role(TfClient *c, const TfModel *m, const char *context, con
   d.cancel = tf__client_cancel_flag(c);
   d.want_version = p.version;
   d.check_build = 1;
+  Hook hk = {c, tf__model_dir(m), p.build, p.key_id[0] ? p.key_id : NULL};
+  d.after_manifest = hook_lease;
+  d.install = hook_install;
+  d.hook_user = &hk;
+  d.want_recited = !role && want_recited(c);
   return tf__download_model(&d);
+}
+
+/* On the Client's timer: the Core's tick and the lease's refresh, for the build last fetched completely */
+void tf__store_tick(TfClient *c) {
+  Pick p;
+  if (pick_from_disk(c, &p) || rec_state(c, p.build) != REC_INSTALLED) {
+    tf__pm_tick(c, NULL, NULL);
+    tf__clear_error();
+    return;
+  }
+  char *dir = models_dir(c), *bd = dir ? tf_path_join(dir, p.build) : NULL;
+  tf__pm_tick(c, bd, p.build);
+  free(bd);
+  free(dir);
+  tf__clear_error();
 }
 
 typedef struct {

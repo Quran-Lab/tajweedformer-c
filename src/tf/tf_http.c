@@ -33,6 +33,38 @@ void tf_http_response_free(TfHttpResponse *r) {
   memset(r, 0, sizeof *r);
 }
 
+/* Why the last request of this thread got no answer it could take, for the error reports (24.2: the transport's
+ * error name and its code as text, never its message): no connection, a timeout or stall, a cancel, or an answer
+ * that was not the one asked for. A test's transport leaves it at "no connection". */
+static _Thread_local int t_fail_kind;
+static _Thread_local char t_fail_name[48], t_fail_code[16];
+void tf__http_note(int kind, const char *name, long code) {
+  t_fail_kind = kind;
+  snprintf(t_fail_name, sizeof t_fail_name, "%s", name ? name : "");
+  if (code) snprintf(t_fail_code, sizeof t_fail_code, "%ld", code);
+  else t_fail_code[0] = 0;
+}
+int tf__http_failure(const char **name, const char **code) {
+  if (name) *name = t_fail_name[0] ? t_fail_name : NULL;
+  if (code) *code = t_fail_code[0] ? t_fail_code : NULL;
+  return t_fail_kind;
+}
+#ifndef _WIN32
+#include <curl/curl.h>
+/* libcurl's name of a failure (the enum's own name; curl_easy_strerror is a message and is never reported) */
+static const char *curl_name(CURLcode cc) {
+#define CN(x) \
+  case x: return #x;
+  switch (cc) {
+    CN(CURLE_COULDNT_RESOLVE_PROXY) CN(CURLE_COULDNT_RESOLVE_HOST) CN(CURLE_COULDNT_CONNECT) CN(CURLE_OPERATION_TIMEDOUT)
+    CN(CURLE_SSL_CONNECT_ERROR) CN(CURLE_GOT_NOTHING) CN(CURLE_SEND_ERROR) CN(CURLE_RECV_ERROR) CN(CURLE_PEER_FAILED_VERIFICATION)
+    CN(CURLE_PARTIAL_FILE) CN(CURLE_WRITE_ERROR) CN(CURLE_ABORTED_BY_CALLBACK) CN(CURLE_HTTP2) CN(CURLE_HTTP2_STREAM)
+  default: return "CURLcode";
+  }
+#undef CN
+}
+#endif
+
 /* header lines we keep */
 static void keep_header(TfHttpResponse *r, const char *line, size_t n) {
   const char *c = memchr(line, ':', n);
@@ -54,6 +86,11 @@ static void keep_header(TfHttpResponse *r, const char *line, size_t n) {
     r->etag[vn] = 0;
   } else if (HN("content-length")) {
     r->content_length = atoll(v);
+  } else if (HN("retry-after") && vn && vn < 8 && v[0] >= '0' && v[0] <= '9') {
+    /* the delay form only (the lease route's 503 lease_unavailable sends 30), read as 1 to 21600 s (18.4.7); an
+     * HTTP date is not read */
+    const long s = atol(v);
+    r->retry_after = s < 1 ? 1 : s > 21600 ? 21600 : (int)s;
   } else if (HN("content-range") && vn > 6 && !_tf_strnicmp(v, "bytes ", 6)) {
     /* bytes S-E/T (a 416 has a star in the place of S-E): the first byte of the body in the file, and the
      * file's size */
@@ -202,10 +239,27 @@ void tf__http_cancel(volatile int *flag) {
   ReleaseSRWLockExclusive(&g_slot_lock);
 }
 
+/* the system's name of a WinHTTP error (24.2 error_name: a token, never its message) */
+static const char *winhttp_name(DWORD e) {
+  switch (e) {
+  case ERROR_WINHTTP_TIMEOUT: return "ERROR_WINHTTP_TIMEOUT";
+  case ERROR_WINHTTP_NAME_NOT_RESOLVED: return "ERROR_WINHTTP_NAME_NOT_RESOLVED";
+  case ERROR_WINHTTP_OPERATION_CANCELLED: return "ERROR_WINHTTP_OPERATION_CANCELLED";
+  case ERROR_WINHTTP_CANNOT_CONNECT: return "ERROR_WINHTTP_CANNOT_CONNECT";
+  case ERROR_WINHTTP_CONNECTION_ERROR: return "ERROR_WINHTTP_CONNECTION_ERROR";
+  case ERROR_WINHTTP_INVALID_SERVER_RESPONSE: return "ERROR_WINHTTP_INVALID_SERVER_RESPONSE";
+  case ERROR_WINHTTP_SECURE_FAILURE: return "ERROR_WINHTTP_SECURE_FAILURE";
+  default: return "WinHTTP";
+  }
+}
 /* why a WinHTTP call failed, as the thread's error: a cancel, a stall, or the system's code */
 static int fail_winhttp(const TfHttpRequest *q, const char *what) {
   const DWORD e = GetLastError();
-  if (q->cancel && *q->cancel) return tf__fail(TF__ERR_NETWORK, "cancelled");
+  if (q->cancel && *q->cancel) {
+    tf__http_note(TF__FAIL_CANCELLED, "ERROR_WINHTTP_OPERATION_CANCELLED", 0);
+    return tf__fail(TF__ERR_NETWORK, "cancelled");
+  }
+  tf__http_note(e == ERROR_WINHTTP_TIMEOUT ? TF__FAIL_TIMEOUT : TF__FAIL_NETWORK, winhttp_name(e), (long)e);
   if (e == ERROR_WINHTTP_TIMEOUT && q->stall_ms > 0) return tf__fail(TF__ERR_NETWORK, "%s: no byte for %d ms", what, q->stall_ms);
   return tf__fail(TF__ERR_NETWORK, "%s (%lu)", what, e);
 }
@@ -363,6 +417,7 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
   }
   /* not the answer that was asked for: nothing of it is written, and the request has failed */
   if (q->accept && !q->accept(q->bytes_user, r)) {
+    tf__http_note(TF__FAIL_ANSWER, NULL, 0);
     tf__fail(TF__ERR_NETWORK, "the answer (HTTP %d) is not the one that was asked for", r->status);
     goto done;
   }
@@ -407,6 +462,7 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
       if (take && q->on_bytes) q->on_bytes(q->bytes_user, (long long)take);
       if (past) {
         tf_buf_free(&b);
+        tf__http_note(TF__FAIL_ANSWER, NULL, 0);
         tf__fail(TF__ERR_NETWORK, "the answer is longer than the file (cut off after %lld bytes)", in_file);
         goto done;
       }
@@ -656,17 +712,19 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
     tf_buf_free(&c.body);
     return tf__fail(TF__ERR_IO, "cannot write the download");
   }
-  if (c.refused) {
+  if (c.refused || c.too_long) {
     tf_buf_free(&c.body);
-    return tf__fail(TF__ERR_NETWORK, "the answer (HTTP %d) is not the one that was asked for", r->status);
-  }
-  if (c.too_long) {
-    tf_buf_free(&c.body);
+    tf__http_note(TF__FAIL_ANSWER, NULL, 0);
+    if (c.refused) return tf__fail(TF__ERR_NETWORK, "the answer (HTTP %d) is not the one that was asked for", r->status);
     return tf__fail(TF__ERR_NETWORK, "the answer is longer than the file (cut off after %lld bytes)", c.in_file);
   }
   if (cc != CURLE_OK) {
     tf_buf_free(&c.body);
-    if (q->cancel && __atomic_load_n(q->cancel, __ATOMIC_SEQ_CST)) return tf__fail(TF__ERR_NETWORK, "cancelled");
+    if (q->cancel && __atomic_load_n(q->cancel, __ATOMIC_SEQ_CST)) {
+      tf__http_note(TF__FAIL_CANCELLED, "CURLE_ABORTED_BY_CALLBACK", (long)cc);
+      return tf__fail(TF__ERR_NETWORK, "cancelled");
+    }
+    tf__http_note(c.stalled || cc == CURLE_OPERATION_TIMEDOUT ? TF__FAIL_TIMEOUT : TF__FAIL_NETWORK, curl_name(cc), (long)cc);
     if (c.stalled) return tf__fail(TF__ERR_NETWORK, "the request failed: no byte for %d ms", q->stall_ms);
     return tf__fail(TF__ERR_NETWORK, "%s", curl_easy_strerror(cc));
   }
@@ -681,11 +739,42 @@ int tf__http_native(const TfHttpRequest *q, TfHttpResponse *r) {
   r->content_length = r->range_start = r->range_total = -1;
   return http_native(q, r);
 }
+/* 18.4.7.1: the answer the last request of this thread got (tf_lease.c reads how a lease attempt ended): its status,
+ * 0 for none at all, and whether it is the API's refusal (a JSON body with an `error` string); a count per thread
+ * tells whether an attempt made any request */
+static _Thread_local int t_ans_status, t_ans_api_error;
+static _Thread_local unsigned t_ans_seq;
+static void note_answer(int rc, const TfHttpResponse *r) {
+  t_ans_seq++;
+  t_ans_status = rc ? 0 : r->status;
+  t_ans_api_error = 0;
+  if (!rc && r->status >= 400 && r->status < 500 && r->body && r->body_n && r->body_n < 65536) {
+    TfJson *j = tf_json_parse(r->body, r->body_n, NULL);
+    t_ans_api_error = j && j->type == TJ_OBJ && tf_json_str(tf_json_get(j, "error")) != NULL;
+    tf_json_free(j);
+  }
+}
+unsigned tf__http_answer(int *status, int *api_error) {
+  if (status) *status = t_ans_status;
+  if (api_error) *api_error = t_ans_api_error;
+  return t_ans_seq;
+}
+void tf__http_answer_none(void) {
+  t_ans_seq++;
+  t_ans_status = t_ans_api_error = 0;
+}
 int tf_http(const TfHttpRequest *q, TfHttpResponse *r) {
-  if (!g_transport) return tf__http_native(q, r);
-  memset(r, 0, sizeof *r);
-  r->content_length = r->range_start = r->range_total = -1;
-  return g_transport(q, r, g_transport_user);
+  tf__http_note(TF__FAIL_NETWORK, NULL, 0);
+  int rc;
+  if (!g_transport) {
+    rc = tf__http_native(q, r);
+  } else {
+    memset(r, 0, sizeof *r);
+    r->content_length = r->range_start = r->range_total = -1;
+    rc = g_transport(q, r, g_transport_user);
+  }
+  note_answer(rc, r);
+  return rc;
 }
 
 /* ------------------------------------------------------------------ the kind of connection */

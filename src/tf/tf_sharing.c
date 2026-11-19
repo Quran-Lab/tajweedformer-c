@@ -3,11 +3,25 @@
  * flags.contributions and flags.upload_trust[windows|linux]). State: sharing.json in the client's storage
  * directory.
  *
- * Asking (Quran Lab, 11-10): the sheet is shown at most three times per install, ever (asks, persisted, carried
- * over from 2.0.0's sharing.json). The first ask follows a finished session with feedback; "Not now" (or a sheet
- * left unanswered) may lead to a re-ask at least 7 sessions later, until the third showing. A yes ends asking for
- * good, across copy decks, wording and SDK upgrades; so does turning sharing off. After that only the settings
- * switch (tf__client_sharing_set) turns sharing on or off.
+ * Asking, SDK 4.0 (SHARE_ASK_40.md section 20; the decision is tf_share_ask.c, a port of the contract's
+ * tools/share_ask.py): the first ask is the full sheet, never within 24 hours of the install (or of the upgrade to
+ * 4.0) or before the 3rd completed session, only at the end of a good session (a take that ended normally with speech,
+ * and at least 60 s of speech in this app session); after "Not now" the next ask needs both 14 days and 7 completed
+ * sessions, the one after it 30 days and 10; one ask per app session and per calendar day; a re-ask is a card (its
+ * "See how it helps" opens the full sheet: tf_sharing_open); at most three asks per install, ever (a card counts once
+ * it is on screen, whatever the learner does with it). A yes ends asking for good, across copy decks, wording and SDK
+ * upgrades; so does turning sharing off. The signed config's `share_ask` can only make it rarer.
+ * Events and their hooks (20.10): launch at the Client's start and at tf_client_foreground after 30 minutes or more
+ * since tf_client_background; take_start when a Session opens; take_end when it ends (how it ended, and its speech);
+ * ask_now from tf_sharing_ask; shown from tf_sharing_shown (or the first answer); the answers; withdrawn at
+ * tf_client_background; the settings switch. This library draws nothing: an ask due at the end of a take is handed to
+ * the app after a 3 s settle with no new take (on_consent with its kind, or pending_ask for an app without the
+ * callback); the app's screen goes on screen and the app reports it with tf_sharing_shown, which counts it. A card
+ * whose copy deck has no card strings (the decks before 2026-11-15.1; every bundled deck has them since) is handed
+ * over as the 3.x re-ask sheet in its place: the same ask, opened into the sheet as soon as it is shown.
+ * sharing.json keeps 3.x's fields and gains installedAt and lastAskAt (unix ms) and lastAskDay (the calendar day);
+ * this app session's part (takes, speech, an ask in hand) is in memory only. A 3.x state keeps its count, answer and
+ * "never again", and its clocks start at the upgrade.
  *
  * Consent versions (SDK 2.0.1): the grant records what the learner agreed to at that moment: the copy deck's
  * consent_version, or with the app's own wording (tf_sharing_set_wording) "custom-" + the first 24 hex digits of
@@ -21,7 +35,11 @@
  * "decidedAt","consentVersion","guardian","sharedSessions","pendingAsk"}) and recorded consentVersion with every
  * grant. A granted state without one gets the version 2.0.0 bundled (kVersion200). A state that said yes and was
  * then put back to "unknown" by a deck or wording change (2.0.0 did that at start-up, the recording-fix builds
- * with their update flag) is a grant again. */
+ * with their update flag) is a grant again.
+ *
+ * One sheet for every app (section 26, ONE_SHEET_40.md): 4.0 has no children's variant and no guardian sheet. A
+ * state written before 4.0 may carry "guardian"; 4.0 never reads it and writes it back as it was (20.4), so a grant
+ * given on a 3.x guardian sheet stays a grant and is never asked again. A state 4.0 begins has no such field. */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -93,14 +111,15 @@ static void deck_consent_version(const char *lang, char *out, size_t n) {
 }
 
 /* ------------------------------------------------------------------ state */
-#define MAX_ASKS 3           /* sheets shown per install, ever */
-#define REASK_SESSIONS 7     /* sessions between a "Not now" and the next ask */
+#define MAX_ASKS 3           /* asks shown per install, ever */
+#define SETTLE_MS 3000       /* 20.6: an ask is handed over 3 s after the take, with no new take meanwhile */
+#define RELAUNCH_MS (30LL * 60000) /* 20.2: back in the foreground after this long is a new app session */
 /* the consent_version of the decks 2.0.0 bundled (every language: 2026-11-07.1) */
 static const char kVersion200[] = "share-2026-11-07";
 
 typedef struct {
   char consent[12]; /* unknown, granted, declined, final */
-  int asks, last_ask_session, sessions, thanked, guardian, shared_sessions, pending_ask;
+  int asks, last_ask_session, sessions, thanked, shared_sessions, pending_ask;
   long long decided_at;
   char consent_version[40];   /* the version the learner agreed to */
   char consent_hash[65];      /* with the app's own wording: the SHA-256 of the text agreed to */
@@ -110,12 +129,27 @@ typedef struct {
    * before a stop: it is never uploaded and is deleted at the next upload pass or launch, also when the process
    * died between the stop and its deletion, or the stop could not delete it. Under `lock`. */
   int stamp;
+  /* section 26: the "guardian" of a state from before 4.0, its JSON text as read (never interpreted), written back
+   * unchanged in every save; NULL when the file had none */
+  char *kept_guardian;
   /* A deletion is asking the server (under `lock`). While it is set the settings file is written as it will be
    * when the server has taken the deletion: consent off and the count one higher. So the off is on disk before
    * the server is asked, and a process that dies while it is asked, or between the server's answer and the
    * device's deletes, starts with sharing off and deletes what is left. In memory nothing changes meanwhile:
    * a deletion the server does not take changes nothing, and the file is then written back as it was. */
   int deleting;
+  /* SDK 4.0's ask (section 20): the stored clocks, this app session's part, the hand-over */
+  long long installed_at, last_ask_at, last_ask_day;
+  int has_installed_at, has_last_ask_at, has_last_ask_day;
+  TfAskApp app;
+  long long settle_due;       /* wall ms when an ask in hand is handed to the app; 0: none waits */
+  int handed;                 /* the ask in hand was handed to the app (on_consent called, or pending_ask set) */
+  int handed_kind;            /* as handed: TF_ASK_SHEET or TF_ASK_CARD (a card without card strings: a sheet) */
+  int card_as_sheet;          /* the card in hand was handed as the 3.x re-ask sheet (no card strings in the deck) */
+  long long background_at;    /* wall ms of tf_client_background; 0: in the foreground */
+  TfCond scv;
+  TfThread sth;
+  int st_on, st_quit;
   /* the app's wording (tf_sharing_set_wording) and what follows from it */
   TfMutex lock;
   char **keys, **texts;
@@ -141,8 +175,23 @@ static void share_save(const TfClient *c, const Share *s) {
   tf_buf_puts(&b, ",\"consentTextSha256\":");
   if (s->consent_hash[0]) tf_buf_json_str(&b, s->consent_hash);
   else tf_buf_puts(&b, "null");
-  tf_buf_printf(&b, ",\"guardian\":%s,\"sharedSessions\":%d,\"pendingAsk\":%d,\"stamp\":%d}", s->guardian ? "true" : "false",
-                s->shared_sessions, s->pending_ask, s->stamp + (s->deleting ? 1 : 0));
+  if (s->kept_guardian) {
+    tf_buf_puts(&b, ",\"guardian\":");
+    tf_buf_puts(&b, s->kept_guardian);
+  }
+  tf_buf_printf(&b, ",\"sharedSessions\":%d,\"pendingAsk\":%d,\"stamp\":%d", s->shared_sessions, s->pending_ask,
+                s->stamp + (s->deleting ? 1 : 0));
+  /* 4.0 (20.4): the install's first launch with 4.0, the last ask's time and its calendar day (null before) */
+  tf_buf_puts(&b, ",\"installedAt\":");
+  if (s->has_installed_at) tf_buf_printf(&b, "%lld", s->installed_at);
+  else tf_buf_puts(&b, "null");
+  tf_buf_puts(&b, ",\"lastAskAt\":");
+  if (s->has_last_ask_at) tf_buf_printf(&b, "%lld", s->last_ask_at);
+  else tf_buf_puts(&b, "null");
+  tf_buf_puts(&b, ",\"lastAskDay\":");
+  if (s->has_last_ask_day) tf_buf_printf(&b, "%lld", s->last_ask_day);
+  else tf_buf_puts(&b, "null");
+  tf_buf_puts(&b, "}");
   char *p = state_path(c);
   if (p && b.p) tf_write_file(p, b.p, b.n);
   free(p);
@@ -171,13 +220,30 @@ void tf__sharing_init(TfClient *c) {
     GETI("lastAskSession", last_ask_session);
     GETI("sessions", sessions);
     GETI("thanked", thanked);
-    GETI("guardian", guardian);
     GETI("sharedSessions", shared_sessions);
     GETI("pendingAsk", pending_ask);
     GETI("stamp", stamp); /* absent in a file of 3.0.0: 0, the stamp of a recording that has none */
 #undef GETI
+    /* section 26: passed through as it is, never read */
+    const TfJson *g = tf_json_get(j, "guardian");
+    if (g) {
+      TfBuf gb;
+      tf_buf_init(&gb);
+      tf_json_write(&gb, g);
+      s->kept_guardian = tf_buf_take(&gb);
+    }
     const TfJson *d = tf_json_get(j, "decidedAt");
     if (d && d->type == TJ_NUM) s->decided_at = (long long)d->num;
+    /* 4.0 (20.4): read as the reference reads them (an integral number, else absent) */
+    TfAskState st;
+    memset(&st, 0, sizeof st);
+    tf__ask_read_field(&st, "installedAt", tf_json_get(j, "installedAt"));
+    tf__ask_read_field(&st, "lastAskAt", tf_json_get(j, "lastAskAt"));
+    tf__ask_read_field(&st, "lastAskDay", tf_json_get(j, "lastAskDay"));
+    s->installed_at = st.installed_at, s->has_installed_at = st.has_installed_at;
+    s->last_ask_at = st.last_ask_at, s->has_last_ask_at = st.has_last_ask_at;
+    s->last_ask_day = st.last_ask_day, s->has_last_ask_day = st.has_last_ask_day;
+    s->pending_ask = 0; /* an ask in hand belongs to its app session: a launch drops it */
     const char *cv = tf_json_str(tf_json_get(j, "consentVersion"));
     if (cv) snprintf(s->consent_version, sizeof s->consent_version, "%s", cv);
     const char *ch = tf_json_str(tf_json_get(j, "consentTextSha256"));
@@ -201,7 +267,13 @@ void tf__sharing_init(TfClient *c) {
   free(text);
   free(p);
   deck_consent_version(tf__client_options(c)->language, s->effective, sizeof s->effective);
+  tf_cond_init(&s->scv);
   *tf__client_sharing_slot(c) = s;
+  /* 20.10: the Client's start is a launch (a new app session; the clocks of a state from before 4.0 start now) */
+  TfAskEvent ev;
+  memset(&ev, 0, sizeof ev);
+  ev.type = TF_ASK_EV_LAUNCH;
+  tf__sharing_event(c, &ev, NULL);
 }
 static void words_clear(Share *s) {
   for (int i = 0; i < s->n_words; ++i) {
@@ -220,7 +292,14 @@ static void words_clear(Share *s) {
 void tf__sharing_free(TfClient *c) {
   Share *s = (Share *)*tf__client_sharing_slot(c);
   if (s) {
+    tf_mutex_lock(&s->lock);
+    s->st_quit = 1;
+    tf_cond_signal(&s->scv);
+    tf_mutex_unlock(&s->lock);
+    if (s->st_on) tf_thread_join(s->sth);
     words_clear(s);
+    free(s->kept_guardian);
+    tf_cond_destroy(&s->scv);
     tf_mutex_destroy(&s->lock);
   }
   free(s);
@@ -235,15 +314,6 @@ static int granted(Share *s) {
   tf_mutex_unlock(&s->lock);
   return ok;
 }
-/* asking is over: a yes (granted, or a version recorded by a yes, whatever came after it), sharing turned off
- * ("final", also after the third "Not now"), or three sheets shown */
-static int asking_ended(Share *s) {
-  tf_mutex_lock(&s->lock);
-  const int ended = !strcmp(s->consent, "granted") || !strcmp(s->consent, "final") || s->consent_version[0] || s->asks >= MAX_ASKS;
-  tf_mutex_unlock(&s->lock);
-  return ended;
-}
-
 /* ------------------------------------------------------------------ the app's own wording */
 /* the deck's string keys (impact.minutes by plural category) */
 static const char *const kPlural[] = {"zero", "one", "two", "few", "many", "other"};
@@ -464,9 +534,10 @@ const char *tf__client_sharing_copy_json(TfClient *c) {
   return share(c)->copy ? share(c)->copy : tf__sharing_deck_json(tf__client_options(c)->language);
 }
 
-/* enabled = the signed config in force offers sharing to this app: flags.contributions literally true. Quran Lab
- * decides this per app (11-09); since 2.0.1 the app's contributions option is ignored, and without a config in
- * force nothing is offered (2.0.0 defaulted to on when the config was missing). Enabled is never consent:
+/* enabled = the signed config in force has sharing on: flags.contributions literally true. It is Quran Lab's incident
+ * switch, never a decision about one app: every learner in every app is asked, and the choice is theirs (owner,
+ * 11-19); since 2.0.1 the app's contributions option is ignored, and without a config in force nothing is asked
+ * (2.0.0 defaulted to on when the config was missing). Enabled is never consent:
  * tf__client_sharing_state and every capture and upload also need the learner's "granted". */
 static int sharing_enabled(const TfClient *c) { return tf__client_flag(c, "contributions", 0); }
 
@@ -499,50 +570,287 @@ void tf__sharing_uploaded(TfClient *c) {
 void tf__share_wipe(TfClient *c);
 void tf__share_forget_seq(TfClient *c);
 
-/* the SDK asks: the app's callback (its own UI or a sheet it shows) or, without one, a pending ask the app reads
- * from the status. Either way it is one of the three showings (asks, telemetry share_asked). */
-static void ask(TfClient *c, int reask) {
+/* ------------------------------------------------------------------ SDK 4.0's ask (section 20) */
+static void grant(Share *s);
+long long tf__ask_now_ms;      /* tests: the wall clock (0: the system's) */
+int tf__ask_tz_min = -100000;  /* tests: the UTC offset in minutes (-100000: the device's) */
+static long long ask_now(int *tz) {
+  long long ms = tf__ask_now_ms;
+  if (!ms) {
+#ifdef _WIN32
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ms = (long long)((((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime) / 10000ULL) - 11644473600000LL;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+  }
+  if (tf__ask_tz_min != -100000) {
+    *tz = tf__ask_tz_min;
+  } else {
+    /* the device's offset at that moment: local time minus UTC, in minutes */
+    const time_t t = (time_t)(ms / 1000);
+    struct tm l, g;
+#ifdef _WIN32
+    localtime_s(&l, &t);
+    gmtime_s(&g, &t);
+#else
+    localtime_r(&t, &l);
+    gmtime_r(&t, &g);
+#endif
+    int d = l.tm_yday - g.tm_yday;
+    if (l.tm_year != g.tm_year) d = l.tm_year > g.tm_year ? 1 : -1;
+    *tz = d * 1440 + (l.tm_hour - g.tm_hour) * 60 + (l.tm_min - g.tm_min);
+  }
+  return ms;
+}
+
+/* the stored fields and this app session's part as tf__ask_decide reads them, and back (under s->lock) */
+static void ask_state(const Share *s, TfAskState *st) {
+  memset(st, 0, sizeof *st);
+  st->consent = tf__ask_consent_of(s->consent);
+  st->asks = s->asks;
+  st->sessions = s->sessions;
+  st->last_ask_session = s->last_ask_session;
+  st->installed_at = s->installed_at, st->has_installed_at = s->has_installed_at;
+  st->last_ask_at = s->last_ask_at, st->has_last_ask_at = s->has_last_ask_at;
+  st->last_ask_day = s->last_ask_day, st->has_last_ask_day = s->has_last_ask_day;
+  st->app = s->app;
+}
+static int ask_apply(Share *s, const TfAskState *st) {
+  const int changed = strcmp(s->consent, tf__ask_consent_name(st->consent)) || s->asks != st->asks || s->sessions != st->sessions ||
+                      s->last_ask_session != st->last_ask_session || s->installed_at != st->installed_at ||
+                      s->has_installed_at != st->has_installed_at || s->last_ask_at != st->last_ask_at ||
+                      s->has_last_ask_at != st->has_last_ask_at || s->last_ask_day != st->last_ask_day ||
+                      s->has_last_ask_day != st->has_last_ask_day;
+  snprintf(s->consent, sizeof s->consent, "%s", tf__ask_consent_name(st->consent));
+  s->asks = (int)st->asks;
+  s->sessions = (int)st->sessions;
+  s->last_ask_session = (int)st->last_ask_session;
+  s->installed_at = st->installed_at, s->has_installed_at = st->has_installed_at;
+  s->last_ask_at = st->last_ask_at, s->has_last_ask_at = st->has_last_ask_at;
+  s->last_ask_day = st->last_ask_day, s->has_last_ask_day = st->has_last_ask_day;
+  s->app = st->app;
+  return changed;
+}
+
+/* the deck's card strings (20.7), when this client's copy deck has all three */
+/* tests: the three strings in place of the deck's; a first entry NULL stands for a deck without them (a deck before
+ * 2026-11-15.1) */
+const char *const *tf__sharing_test_card;
+static int card_strings(TfClient *c, char *line, size_t line_n, char *open, size_t open_n, char *not_now, size_t not_now_n) {
+  if (tf__sharing_test_card) {
+    if (!tf__sharing_test_card[0]) return 0;
+    snprintf(line, line_n, "%s", tf__sharing_test_card[0]);
+    snprintf(open, open_n, "%s", tf__sharing_test_card[1]);
+    snprintf(not_now, not_now_n, "%s", tf__sharing_test_card[2]);
+    return 1;
+  }
+  const char *copy = tf__client_sharing_copy_json(c);
+  TfJson *j = copy ? tf_json_parse(copy, strlen(copy), NULL) : NULL;
+  const TfJson *strs = tf_json_get(j, "strings");
+  const char *a = tf_json_str(tf_json_get(strs, "card.line")), *b = tf_json_str(tf_json_get(strs, "card.open")),
+             *d = tf_json_str(tf_json_get(strs, "card.not_now"));
+  const int ok = a && b && d;
+  if (ok) {
+    snprintf(line, line_n, "%s", a);
+    snprintf(open, open_n, "%s", b);
+    snprintf(not_now, not_now_n, "%s", d);
+  }
+  tf_json_free(j);
+  return ok;
+}
+
+/* The ask in hand goes to the app: its on_consent with the kind (or, without the callback, pending_ask for the app to
+ * read from the status). A card whose deck has no card strings goes as the 3.x re-ask sheet. `reask_line`: the sheet
+ * of a first ask, or a re-ask sheet (the full sheet a card opened into has none). Outside s->lock. */
+static void hand_over(TfClient *c, int kind, int number, int reask_line) {
   Share *s = share(c);
   const TfClientConfig *o = tf__client_options(c);
-  s->asks++;
-  s->last_ask_session = s->sessions;
+  char line[512] = "", open[256] = "", not_now[256] = "";
+  /* each buffer its own size: open and not_now are half of line's (glibc's fortified snprintf aborts otherwise) */
+  const int card = kind == TF_ASK_CARD && card_strings(c, line, sizeof line, open, sizeof open, not_now, sizeof not_now);
+  tf_mutex_lock(&s->lock);
+  s->handed = 1;
+  s->handed_kind = card ? TF_ASK_CARD : TF_ASK_SHEET;
+  s->card_as_sheet = kind == TF_ASK_CARD && !card;
   s->pending_ask = o->on_consent ? 0 : 1;
-  share_save(c, s);
-  tf__telemetry_add(c, "share_asked", 1);
+  tf_mutex_unlock(&s->lock);
   if (o->on_consent) {
     TfConsentRequest r;
     memset(&r, 0, sizeof r);
-    r.reask = reask ? s->asks - 1 : 0;
-    r.guardian = o->children;
+    r.reask = reask_line && number > 1 ? number - 1 : 0;
     r.copy_json = tf__client_sharing_copy_json(c);
     r.consent_version = s->effective;
+    r.kind = card ? TF_ASK_CARD : TF_ASK_SHEET;
+    if (card) {
+      r.card_line = line;
+      r.card_open = open;
+      r.card_not_now = not_now;
+    }
     o->on_consent(o->user, &r);
   }
 }
 
-void tf__sharing_session(TfClient *c, int feedback, double audio_s) {
-  Share *s = share(c);
-  if (!s) return;
-  (void)audio_s;
-  s->sessions++;
-  share_save(c, s);
-  if (!sharing_enabled(c) || !feedback || asking_ended(s)) return;
-  /* the first ask; after a "Not now" (or a sheet left unanswered) a re-ask, 7 sessions later at the earliest */
-  if (s->asks == 0 && !strcmp(s->consent, "unknown")) ask(c, 0);
-  else if (s->sessions - s->last_ask_session >= REASK_SESSIONS) ask(c, 1);
+static void settle_thread(void *arg);
+/* an ask due at the end of a take waits SETTLE_MS for the learner's pause (20.6); the settle thread hands it over */
+static void settle_arm(TfClient *c, Share *s, long long now) {
+  s->settle_due = now + SETTLE_MS;
+  if (tf__client_no_timer) return; /* the tests' one-thread mode: they call tf__sharing_settle_check */
+  if (!s->st_on && !s->st_quit && !tf_thread_start(&s->sth, settle_thread, c)) s->st_on = 1;
+  tf_cond_signal(&s->scv);
 }
 
+/* One event through the decision, the state stored when a stored field changed, and the telemetry of 20.8 (an ask on
+ * screen counts share_asked; a yes share_yes; a Not now, a dismissed card or a card gone with a take, share_no).
+ * Returns the action; *why the reason the decision gave. */
+int tf__sharing_event(TfClient *c, const TfAskEvent *ev, const char **why) {
+  Share *s = share(c);
+  if (!s) return TF_ASK_NONE;
+  int tz = 0;
+  const long long now = ask_now(&tz);
+  const char *cj = tf__client_config_json(c);
+  TfJson *cfg = cj ? tf_json_parse(cj, strlen(cj), NULL) : NULL;
+  tf_mutex_lock(&s->lock);
+  TfAskState st;
+  ask_state(s, &st);
+  const long long asks0 = st.asks;
+  const int consent0 = st.consent;
+  const int card_shown0 = st.app.ask.kind == TF_ASK_CARD && st.app.ask.shown;
+  const int had_ask = st.app.ask.kind != 0;
+  const char *w = NULL;
+  const int action = tf__ask_decide(&st, ev, tf_json_get(cfg, "share_ask"), now, tz, &w);
+  const int changed = ask_apply(s, &st);
+  if (!s->app.ask.kind) {
+    /* no ask in hand any more: nothing waits for the settle, nothing is pending for the app */
+    s->settle_due = 0;
+    s->handed = 0;
+    s->pending_ask = 0;
+    s->card_as_sheet = 0;
+  }
+  if ((ev->type == TF_ASK_EV_TAKE_END || ev->type == TF_ASK_EV_ASK_NOW) && action) {
+    s->handed = 0;
+    if (ev->type == TF_ASK_EV_TAKE_END) settle_arm(c, s, now);
+  }
+  const int newly_granted = consent0 != TF_ASK_GRANTED && st.consent == TF_ASK_GRANTED && ev->type == TF_ASK_EV_ANSWER;
+  tf_mutex_unlock(&s->lock);
+  tf_json_free(cfg);
+  if (st.asks > asks0) tf__telemetry_add(c, "share_asked", 1);
+  if (ev->type == TF_ASK_EV_ANSWER && !w && ev->answer == TF_ASK_NOT_NOW) tf__telemetry_add(c, "share_no", 1);
+  if ((ev->type == TF_ASK_EV_TAKE_START || ev->type == TF_ASK_EV_WITHDRAWN) && card_shown0 && had_ask && !st.app.ask.kind)
+    tf__telemetry_add(c, "share_no", 1);
+  if (newly_granted) {
+    grant(s); /* the version in force now, kept for good */
+    tf__telemetry_add(c, "share_yes", 1);
+  }
+  if (changed || newly_granted) share_save(c, s);
+  if (why) *why = w;
+  return action;
+}
+
+/* the settle has passed with no new take: the ask in hand is handed to the app (tests call it with their clock) */
+void tf__sharing_settle_check(TfClient *c) {
+  Share *s = share(c);
+  if (!s) return;
+  int tz = 0;
+  const long long now = ask_now(&tz);
+  tf_mutex_lock(&s->lock);
+  const int due = s->settle_due && now >= s->settle_due && s->app.ask.kind && !s->app.ask.shown && !s->app.take_open && !s->handed;
+  const int kind = s->app.ask.kind, number = s->app.ask.number;
+  if (due) s->settle_due = 0;
+  tf_mutex_unlock(&s->lock);
+  if (due) hand_over(c, kind, number, 1);
+}
+static void settle_thread(void *arg) {
+  TfClient *c = (TfClient *)arg;
+  Share *s = share(c);
+  tf_mutex_lock(&s->lock);
+  while (!s->st_quit) {
+    if (!s->settle_due) {
+      tf_cond_wait_ms(&s->scv, &s->lock, 600000);
+      continue;
+    }
+    int tz = 0;
+    const long long left = s->settle_due - ask_now(&tz);
+    if (left > 0) {
+      tf_cond_wait_ms(&s->scv, &s->lock, (long)left + 1);
+      continue;
+    }
+    tf_mutex_unlock(&s->lock);
+    tf__sharing_settle_check(c);
+    tf_mutex_lock(&s->lock);
+  }
+  tf_mutex_unlock(&s->lock);
+}
+
+/* 20.10's hooks */
+static void simple_event(TfClient *c, int type) {
+  TfAskEvent ev;
+  memset(&ev, 0, sizeof ev);
+  ev.type = type;
+  tf__sharing_event(c, &ev, NULL);
+}
+void tf__sharing_take_start(TfClient *c) { simple_event(c, TF_ASK_EV_TAKE_START); }
+/* the app goes to the background: an ask in hand goes (a card on screen is Not now), and the time is kept */
+void tf__sharing_background(TfClient *c) {
+  Share *s = share(c);
+  if (!s) return;
+  int tz = 0;
+  const long long now = ask_now(&tz);
+  tf_mutex_lock(&s->lock);
+  s->background_at = now;
+  tf_mutex_unlock(&s->lock);
+  simple_event(c, TF_ASK_EV_WITHDRAWN);
+}
+/* back in the foreground: after 30 minutes or more in the background, a new app session (a launch) */
+void tf__sharing_foreground(TfClient *c) {
+  Share *s = share(c);
+  if (!s) return;
+  int tz = 0;
+  const long long now = ask_now(&tz);
+  tf_mutex_lock(&s->lock);
+  const int relaunch = s->background_at && now - s->background_at >= RELAUNCH_MS;
+  s->background_at = 0;
+  tf_mutex_unlock(&s->lock);
+  if (relaunch) simple_event(c, TF_ASK_EV_LAUNCH);
+}
+
+/* A take ended (20.2): `end` 0 normal (the app's finish, silence, the limit, the clip's end), 1 interrupted, 2 an
+ * error, 3 cancelled; its speech is 40 ms times its speech frames. At a good moment an ask due goes into hand and is
+ * handed over after the settle. */
+void tf__sharing_session(TfClient *c, int end, long long speech_frames) {
+  if (!share(c)) return;
+  TfAskEvent ev;
+  memset(&ev, 0, sizeof ev);
+  ev.type = TF_ASK_EV_TAKE_END;
+  ev.end = end == 0 ? TF_ASK_END_NORMAL : TF_ASK_END_OTHER;
+  ev.speech_ms = speech_frames > 0 ? 40 * speech_frames : 0;
+  ev.offered = tf__sharing_may_upload(c);
+  tf__sharing_event(c, &ev, NULL);
+}
+
+/* the app's ask() (20.5 ask_now): handed over at once when an ask is due; 1 when one was, 0 when none is due */
 int tf__client_sharing_ask_now(TfClient *c) {
   if (!c || !share(c)) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
+  if (!sharing_enabled(c)) return tf__fail(TF__ERR_NOT_AVAILABLE, "sharing is off by Quran Lab's incident switch (the signed config's flags.contributions)");
+  TfAskEvent ev;
+  memset(&ev, 0, sizeof ev);
+  ev.type = TF_ASK_EV_ASK_NOW;
+  ev.offered = tf__sharing_may_upload(c);
+  const int kind = tf__sharing_event(c, &ev, NULL);
+  if (!kind) return 0;
   Share *s = share(c);
-  if (!sharing_enabled(c)) return tf__fail(TF__ERR_NOT_AVAILABLE, "sharing is not offered to this app (the signed config's flags.contributions)");
-  if (asking_ended(s)) return 0; /* a yes, sharing turned off, or three sheets shown: nothing to ask */
-  ask(c, s->asks > 0);
-  return 0;
+  tf_mutex_lock(&s->lock);
+  const int number = s->app.ask.number;
+  tf_mutex_unlock(&s->lock);
+  hand_over(c, kind, number, 1);
+  return 1;
 }
 
 /* the learner agreed (a sheet's answer, or the settings switch): records the version in force now, kept for good */
-static void grant(TfClient *c, Share *s) {
+static void grant(Share *s) {
   tf_mutex_lock(&s->lock);
   if (strcmp(s->consent, "granted")) s->stamp++; /* sharing comes on: whatever is on disk is from before */
   snprintf(s->consent, sizeof s->consent, "granted");
@@ -550,17 +858,93 @@ static void grant(TfClient *c, Share *s) {
   snprintf(s->consent_hash, sizeof s->consent_hash, "%s", s->effective_hash);
   tf_mutex_unlock(&s->lock);
   s->decided_at = (long long)time(NULL);
-  s->guardian = tf__client_options(c)->children;
 }
 
-/* the learner's answer to a sheet: the SDK's ask through the app's callback or its own UI, only from the learner's
- * own tap (counted: share_yes, share_no) */
+/* The learner's answer to the ask in hand, from the learner's own tap (20.5 answer): 1 share (a sheet only), 0 not
+ * now. A card handed as the re-ask sheet (no card strings) is opened into the sheet when it went on screen, so its
+ * answers are the sheet's. */
+int tf__sharing_answer_ask(TfClient *c, int yes) {
+  Share *s = c ? share(c) : NULL;
+  if (!s) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
+  tf_mutex_lock(&s->lock);
+  const int as_sheet = s->card_as_sheet && s->app.ask.kind == TF_ASK_CARD;
+  tf_mutex_unlock(&s->lock);
+  if (as_sheet && yes) {
+    /* the app's re-ask sheet stood for the card: shown, then opened into the full sheet, then this answer */
+    TfAskEvent o;
+    memset(&o, 0, sizeof o);
+    o.type = TF_ASK_EV_ANSWER;
+    o.answer = TF_ASK_OPEN;
+    tf__sharing_event(c, &o, NULL);
+  }
+  TfAskEvent ev;
+  memset(&ev, 0, sizeof ev);
+  ev.type = TF_ASK_EV_ANSWER;
+  ev.answer = yes ? TF_ASK_YES : TF_ASK_NOT_NOW;
+  const char *why = NULL;
+  tf__sharing_event(c, &ev, &why);
+  if (why && !strcmp(why, "card_has_no_yes"))
+    return tf__fail(TF_ERR_INVALID_ARGUMENT, "a card has no yes: tf_sharing_open shows the full sheet, where consent is given");
+  if (why && (!strcmp(why, "no_ask") || !strcmp(why, "stale") || !strcmp(why, "answered")))
+    return tf__fail(TF_ERR_INVALID_ARGUMENT, "no ask is open (%s): nothing was recorded", why);
+  return 0;
+}
+/* the card's "See how it helps" (20.6): the full sheet for the same ask, handed to the app */
+int tf__sharing_open(TfClient *c) {
+  Share *s = c ? share(c) : NULL;
+  if (!s) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
+  TfAskEvent ev;
+  memset(&ev, 0, sizeof ev);
+  ev.type = TF_ASK_EV_ANSWER;
+  ev.answer = TF_ASK_OPEN;
+  const char *why = NULL;
+  const int action = tf__sharing_event(c, &ev, &why);
+  if (action != TF_ASK_SHEET) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no card is open (%s)", why ? why : "none");
+  tf_mutex_lock(&s->lock);
+  const int number = s->app.ask.number;
+  s->card_as_sheet = 0;
+  tf_mutex_unlock(&s->lock);
+  hand_over(c, TF_ASK_SHEET, number, 0);
+  return 0;
+}
+/* the app's screen of the ask in hand is on screen now (20.6 shown): 1 counted (it stays), 0 the app takes its screen
+ * back (no ask in hand, or another process answered or asked meanwhile) */
+int tf__sharing_shown(TfClient *c) {
+  Share *s = c ? share(c) : NULL;
+  if (!s) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
+  TfAskEvent ev;
+  memset(&ev, 0, sizeof ev);
+  ev.type = TF_ASK_EV_SHOWN;
+  const char *why = NULL;
+  const int action = tf__sharing_event(c, &ev, &why);
+  if (why && !strcmp(why, "already_shown")) return 1;
+  if (!action) return 0;
+  tf_mutex_lock(&s->lock);
+  const int as_sheet = s->card_as_sheet;
+  tf_mutex_unlock(&s->lock);
+  if (as_sheet) {
+    /* the 3.x re-ask sheet in the card's place: the card is opened into the sheet at once (20.6) */
+    TfAskEvent o;
+    memset(&o, 0, sizeof o);
+    o.type = TF_ASK_EV_ANSWER;
+    o.answer = TF_ASK_OPEN;
+    tf__sharing_event(c, &o, NULL);
+  }
+  return 1;
+}
+
+/* Tests and the 3.x vectors: the answer recorded as 3.x recorded it, without an ask in hand (one in hand goes). */
 int tf__client_sharing_answer(TfClient *c, int yes) {
   Share *s = c ? share(c) : NULL;
   if (!s) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
+  tf_mutex_lock(&s->lock);
+  memset(&s->app.ask, 0, sizeof s->app.ask);
+  s->settle_due = 0;
+  s->handed = 0;
+  tf_mutex_unlock(&s->lock);
   s->pending_ask = 0;
   if (yes) {
-    grant(c, s);
+    grant(s);
   } else {
     tf_mutex_lock(&s->lock);
     snprintf(s->consent, sizeof s->consent, "%s", s->asks >= MAX_ASKS ? "final" : "declined");
@@ -575,9 +959,15 @@ int tf__client_sharing_answer(TfClient *c, int yes) {
 int tf__client_sharing_set(TfClient *c, int on) {
   Share *s = c ? share(c) : NULL;
   if (!s) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
+  /* 20.5 setting: any ask in hand goes */
+  tf_mutex_lock(&s->lock);
+  memset(&s->app.ask, 0, sizeof s->app.ask);
+  s->settle_due = 0;
+  s->handed = 0;
+  tf_mutex_unlock(&s->lock);
   s->pending_ask = 0;
   if (on) {
-    grant(c, s);
+    grant(s);
     share_save(c, s);
     return 0;
   }
@@ -615,11 +1005,11 @@ const char *tf__client_sharing_status_json(TfClient *c) {
   tf__client_upload_trust(c, trust, sizeof trust);
   tf_mutex_lock(&s->lock);
   snprintf(buf, sizeof buf,
-           "{\"consent\":\"%s\",\"enabled\":%s,\"asks\":%d,\"sessions\":%d,\"pendingAsk\":%s,\"thanked\":%s,\"guardian\":%s,"
+           "{\"consent\":\"%s\",\"enabled\":%s,\"asks\":%d,\"sessions\":%d,\"pendingAsk\":%s,\"thanked\":%s,"
            "\"sharedSessions\":%d,\"uploadTrust\":\"%s\",\"mayUpload\":%s,\"consentVersion\":\"%s\",\"consentTextSha256\":%s%s%s,"
            "\"effectiveConsentVersion\":\"%s\",\"updateNeeded\":false}",
            s->consent, sharing_enabled(c) ? "true" : "false", s->asks, s->sessions, s->pending_ask ? "true" : "false",
-           s->thanked ? "true" : "false", s->guardian ? "true" : "false", s->shared_sessions, trust[0] ? trust : "capped",
+           s->thanked ? "true" : "false", s->shared_sessions, trust[0] ? trust : "capped",
            tf__sharing_may_upload(c) ? "true" : "false", s->consent_version, s->consent_hash[0] ? "\"" : "null", s->consent_hash,
            s->consent_hash[0] ? "\"" : "", s->effective);
   tf_mutex_unlock(&s->lock);
@@ -668,6 +1058,11 @@ static int post_plain(TfClient *c, const char *path, const char *body, TfHttpRes
 void tf__sharing_deleted(TfClient *c) {
   Share *s = share(c);
   s->pending_ask = 0;
+  tf_mutex_lock(&s->lock);
+  memset(&s->app.ask, 0, sizeof s->app.ask);
+  s->settle_due = 0;
+  s->handed = 0;
+  tf_mutex_unlock(&s->lock);
   tf_mutex_lock(&s->lock);
   snprintf(s->consent, sizeof s->consent, "final");
   s->stamp++;
@@ -786,7 +1181,7 @@ int tf_sharing_status(TfClient *c, TfSharing *out) {
   tf_mutex_lock(&s->lock);
   out->asks = s->asks;
   out->pending_ask = s->pending_ask;
-  out->guardian = s->guardian;
+  out->pending_kind = s->pending_ask ? s->handed_kind : 0;
   out->shared = s->shared_sessions;
   out->consent_version = s->effective;
   out->consent_text = s->canonical;
@@ -797,22 +1192,32 @@ int tf_sharing_status(TfClient *c, TfSharing *out) {
 int tf_sharing_is_available(TfClient *c) { return c && share(c) && sharing_enabled(c); }
 int tf_sharing_is_on(TfClient *c) { return tf__client_sharing_state(c); }
 
+/* The sharing calls hand their failures to the app through tf__raise, where the error report is made (24.1); the
+ * app's own misuse is never reported. */
 int tf_sharing_set_on(TfClient *c, int on) {
   tf__clear_error();
   if (!c || !share(c)) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
   /* off always works (it stops uploads and deletes the unsent queue); on needs Quran Lab's config to offer sharing */
-  if (on && !sharing_enabled(c)) return tf__fail(TF_ERR_SHARING_UNAVAILABLE, NULL);
-  return tf__client_sharing_set(c, on);
+  if (on && !sharing_enabled(c)) return tf__raise(tf__fail(TF_ERR_SHARING_UNAVAILABLE, NULL));
+  return tf__raise(tf__client_sharing_set(c, on));
 }
 int tf_sharing_ask(TfClient *c) {
   tf__clear_error();
   if (!c || !share(c)) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
-  if (!sharing_enabled(c)) return tf__fail(TF_ERR_SHARING_UNAVAILABLE, NULL);
-  return tf__client_sharing_ask_now(c);
+  if (!sharing_enabled(c)) return tf__raise(tf__fail(TF_ERR_SHARING_UNAVAILABLE, NULL));
+  return tf__raise(tf__client_sharing_ask_now(c));
 }
 int tf_sharing_answer(TfClient *c, int share_it) {
   tf__clear_error();
-  return tf__client_sharing_answer(c, share_it);
+  return tf__raise(tf__sharing_answer_ask(c, share_it));
+}
+int tf_sharing_open(TfClient *c) {
+  tf__clear_error();
+  return tf__raise(tf__sharing_open(c));
+}
+int tf_sharing_shown(TfClient *c) {
+  tf__clear_error();
+  return tf__raise(tf__sharing_shown(c));
 }
 const char *tf_sharing_copy_json(TfClient *c) { return tf__client_sharing_copy_json(c); }
 const char *tf_sharing_summary_json(TfClient *c) {
@@ -826,10 +1231,13 @@ int tf_sharing_delete(TfClient *c) {
   const int rc = tf__client_sharing_delete(c);
   if (!rc) return 0;
   /* the learner must hear that nothing was deleted. The catalogue has no code for a request other than a download
-   * that got no answer: the nearest is the server's refusal, with what happened as its detail. */
-  if (tf__error_code() == TF__ERR_NOT_AVAILABLE) return tf__error_as(TF_ERR_STORAGE_FAILED);
-  if (tf__error_code() == TF__ERR_NETWORK) return tf__fail(TF_ERR_SERVER_REJECTED, "the deletion request got no answer (no connection); nothing was deleted");
-  return tf__error_as(TF_ERR_SERVER_REJECTED);
+   * that got no answer: the nearest is the server's refusal, with what happened as its detail. The deletion route's
+   * failure is the cause (24.3 sharing), whatever code it is handed over as. */
+  tf__cause_force();
+  if (tf__error_code() == TF__ERR_NOT_AVAILABLE) return tf__raise(tf__error_as(TF_ERR_STORAGE_FAILED));
+  if (tf__error_code() == TF__ERR_NETWORK)
+    return tf__raise(tf__fail(TF_ERR_SERVER_REJECTED, "the deletion request got no answer (no connection); nothing was deleted"));
+  return tf__raise(tf__error_as(TF_ERR_SERVER_REJECTED));
 }
 int tf_sharing_recovery_code(TfClient *c, char out[33]) {
   tf__clear_error();

@@ -1,5 +1,40 @@
 # Changelog
 
+## 4.0.0
+
+The model is protected. The engine, the model's formats and its keys move into the Quran Lab Core, a closed binary
+beside this library, and the model opens only inside it, under a lease for each install. The calls of a take stay as
+they were. Moving from 3.x: [docs/migrating-to-4.md](docs/migrating-to-4.md).
+
+- **Changed: the build.** The library links the Core's binary, published with each release in
+  `https://cdn.quranlab.ai/sdk/native/4.0.0/` (`qlcore.dll` for Windows x64, `qlcore.so` for Linux x86-64). Configure
+  with `-DQLCORE_DIR=<the Core's folder>`, and ship the Core beside your program. On Windows the library builds with
+  MinGW-w64 GCC.
+- **Removed: `TfClientOptions.analytics` and `TfAnalytics`.** The anonymous analytics (daily counts and durations,
+  never audio, text, names or device identifiers) are always on. Code that sets them no longer compiles: delete the
+  line.
+- **Removed: `TfClientOptions.audience` and the `guardian` members of `TfConsentRequest` and `TfSharing`;** code that
+  sets or reads them no longer compiles. Every app is offered sharing the same way. Complying with children's privacy
+  law is the app's and the app store's. A learner who said yes before keeps that yes and is never asked again.
+- **Removed: the int8 kernel headers, the CUDA tier and the server runner.** The engine is the Core's; desktops run
+  its CPU engine.
+- **The lease.** The model opens under a 24-hour lease for the install, renewed in the background. Offline within it,
+  the model opens. When it has ended and Quran Lab cannot be reached, the model keeps opening for 24 hours more; a
+  refusal ends that at once. `tf_client_diagnose_json` says the lease's state.
+- **The first start after the upgrade downloads the model once more**, encrypted, so it needs a connection once.
+- **Linux:** one library for Debian 10, Ubuntu 20.04 and later (glibc 2.25 and `libcurl.so.4`).
+- **Error reports.** Every error your app gets (except misuse of the API) and every failure the SDK goes on from
+  reaches Quran Lab as a small anonymous report. You see them on your app's Problems page at sdk.quranlab.ai.
+- **More exact error codes.** `TF_ERR_NEEDS_CONNECTION` only when no request got an answer; an answer from a server
+  that failed is `TF_ERR_DOWNLOAD_FAILED`, with what answered in the message.
+- **Recited ayahs.** The SDK counts the ayahs of each take itself; `tf_session_report_recited` is the fallback, and
+  `tf_session_report_recited_outcome` carries your app's own judgement.
+- **Sharing.** Asked later and less often (never in the first 24 hours, at most three times), with a small card for the
+  re-ask, and a recording stays open up to 60 seconds between takes. There is still no developer switch.
+- **Every learner is asked** and the choice is theirs: Not now, stop, or delete at any time. No app is exempt.
+- **Model versions.** From V4.1 on, new model versions are published only encrypted, for SDK 4.0. SDK 3.x stops
+  receiving the V4 model on 15 January 2027, 00:00 UTC.
+
 ## 3.1.4
 
 A tool to evaluate the model on your own recordings. No call of the library changes.

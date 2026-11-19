@@ -11,7 +11,18 @@
  *
  * SPEC 2a: files come from the build URL ({base}/{repo}/{build}/{folder}/{path}, immutable); the manifest must name
  * its version in the signed text, the version must be the one the signed config named, and the manifest's SHA-256
- * must start with the build the config named. */
+ * must start with the build the config named. SDK 4.0 (18.4.5): the config names no base; the manifest comes from the
+ * model host's URL for the build, and every file after the lease only from the model folder the lease answer named
+ * (<base><path>). An answer without one (every answer carries it) downloads nothing: an invalid response, never the
+ * host's URLs (as the Apple SDK, 018935d).
+ *
+ * SDK 4.0 (PROTECTED_MODEL.md 18.2): every model file of an encrypted build is a qle1 container. Its CDN form is
+ * downloaded as it is served (<dest>/cdn/<decoded path>.qle), checked against the container's signed size and
+ * SHA-256 (16.1), and handed to the Core (o->install), which turns it into the device form (<dest>/dev/<decoded
+ * path>.qld) and checks the plaintext's SHA-256 inside; the CDN form is deleted after. No plaintext of a model file
+ * is ever written. The manifest's acceptance is followed by o->after_manifest (the lease, which the install needs).
+ * The build's layout file is installed before the files whose install mark it keys. Plain entries (the calibration,
+ * the sample clips) are public data and stored as in 3.x. */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -22,6 +33,12 @@
 #include "tf_internal.h"
 
 int tf_gunzip_file(const char *in_path, const char *out_path);
+
+/* 24.3: a model file that cannot be written or moved into place is the download's storage failure */
+static int on_storage(int rc) {
+  tf__cause_now(rc, "download", "storage", 0, NULL, NULL);
+  return rc;
+}
 
 int tf__download_stall_ms = 30000;
 int tf__download_pause_ms = 1000;
@@ -37,8 +54,11 @@ TfDownload tf__download_defaults(void) {
 
 typedef struct {
   const TfDownload *o;
+  const char *mbytes;    /* the accepted manifest's bytes (the Core's install takes them) */
+  size_t mn;
   long long done, total; /* bytes as stored, over the files asked for */
   TfHttpConn *conn;      /* 3.1.3: the one connection to the model host, kept from the manifest to the last file */
+  char base[512];        /* SDK 4.0: the lease answer's model folder (ends in '/'), once the lease is in hand */
 } Run;
 /* one request for a file: what the transport's callbacks need */
 typedef struct {
@@ -93,7 +113,7 @@ static int in_profile2(const char *path, const char *contexts, const char *only_
  * list of platform names (a list may also hold "*"). The profile: platform native or *, soc *, need required,
  * context * or one asked for; plus the sample clips (role selftest, optional in the manifest); minus the roles
  * expected (2.x builds: the scorer's table, never read by 3.0) and reference (fetched only by its role). */
-static int in_profile3(const TfJson *f, const char *contexts, const char *only_role) {
+static int in_profile3(const TfJson *f, const char *contexts, const char *only_role, int want_recited) {
   const char *need = tf_json_str(tf_json_get(f, "need")), *cx = tf_json_str(tf_json_get(f, "context"));
   const char *soc = tf_json_str(tf_json_get(f, "soc")), *role = tf_json_str(tf_json_get(f, "role"));
   const TfJson *pl = tf_json_get(f, "platforms");
@@ -114,6 +134,7 @@ static int in_profile3(const TfJson *f, const char *contexts, const char *only_r
   if (only_role) return role && !strcmp(role, only_role) && ctx_ok;
   if (role && (!strcmp(role, "expected") || !strcmp(role, "reference"))) return 0;
   if (role && !strcmp(role, "selftest")) return ctx_ok;
+  if (role && !strcmp(role, "recited")) return want_recited && ctx_ok; /* 17.1, 17.5: optional in the manifest */
   if (!need || strcmp(need, "required")) return 0;
   return ctx_ok;
 }
@@ -219,7 +240,8 @@ static int get(Run *run, const char *rel, Xfer *x, const char *if_range, TfHttpR
   const TfDownload *o = run->o;
   char url[4096], key[512];
   *net = 0;
-  if (tf__model_url(url, sizeof url, o->cdn_url ? o->cdn_url : "https://cdn.quranlab.ai/models", o->repo, o->revision, o->folder, rel))
+  if (run->base[0] ? snprintf(url, sizeof url, "%s%s", run->base, rel) >= (int)sizeof url
+                   : tf__model_url(url, sizeof url, o->cdn_url ? o->cdn_url : "https://cdn.quranlab.ai/models", o->repo, o->revision, o->folder, rel))
     return tf__fail(TF_ERR_INVALID_ARGUMENT, "the model URL of %s is too long", rel);
   /* SPEC 15.4: every model request (the manifest, a file, a Range request) carries the install's app token, and
    * in 3.1.0 the key too. Both headers are made here and nowhere else. */
@@ -251,8 +273,13 @@ static int get(Run *run, const char *rel, Xfer *x, const char *if_range, TfHttpR
     q.bytes_user = x;
     if (x->part) q.on_bytes = net_bytes;
     if (tf_http(&q, r)) {
+      const char *stage = strcmp(rel, "manifest.json") ? "download" : "manifest";
       /* a failed write is the device's, not the network's; the .part stays either way */
-      if (tf__error_code() == TF__ERR_IO) return tf__error_as(TF_ERR_STORAGE_FAILED);
+      if (tf__error_code() == TF__ERR_IO) {
+        tf__cause(stage, "storage", 0, NULL, NULL);
+        return tf__error_as(TF_ERR_STORAGE_FAILED);
+      }
+      tf__cause_transport(stage, r->status); /* no answer, a stall, a cancel, or not the answer asked for */
       *net = !(o->cancel && *o->cancel);
       return tf__error_as(TF_ERR_DOWNLOAD_FAILED);
     }
@@ -274,6 +301,9 @@ static int get(Run *run, const char *rel, Xfer *x, const char *if_range, TfHttpR
  * download */
 static int http_error(const Run *run, const char *rel, const TfHttpResponse *r) {
   const char *b = r->body ? r->body : "";
+  /* 24.3: the answer is the cause (redirect, rate_limited, refused with its error, http) */
+  const char *stage = strcmp(rel, "manifest.json") ? "download" : "manifest";
+  tf__cause_answer(stage, r->status, r->body, r->body_n);
   /* SPEC 15.4: a redirect is not followed (tf_http.c). It is a failed download and never a stop: whatever its
    * body says, no refusal is remembered and nothing is removed */
   if (r->status >= 300 && r->status < 400)
@@ -300,11 +330,20 @@ static int http_error(const Run *run, const char *rel, const TfHttpResponse *r) 
     return tf__fail(TF_ERR_DOWNLOAD_FAILED, "Quran Lab's daily limit for model downloads is reached; try again later");
   if (r->status == 503 && !strcmp(code, "network_blocked"))
     return tf__fail(TF_ERR_DOWNLOAD_FAILED, "Quran Lab does not serve this network at the moment; try again later or from another network");
-  if (r->status == 401 && !strcmp(code, "invalid_token")) return tf__fail(TF_ERR_DOWNLOAD_FAILED, "Quran Lab did not take this install's token for %s", rel);
+  if (r->status == 401 && !strcmp(code, "invalid_token")) {
+    /* the token renewed once and still not taken: a failed download, as 15.4 says; the token's own answer, never a
+       refusal (ERRORS_40.md 24.3, model_gate.json: no error of its own), so the report's reason is http */
+    const int rc = tf__fail(TF_ERR_DOWNLOAD_FAILED, "Quran Lab did not take this install's token for %s", rel);
+    tf__cause_now(rc, stage, "http", 401, NULL, "invalid_token");
+    return rc;
+  }
   if (r->status == 403 && strstr(b, "sdk_too_old")) return tf__fail_sdk_too_old(NULL);
-  /* a 401 without a reason: a key the CDN does not know */
-  if (r->status == 401) return tf__fail(TF_ERR_INVALID_KEY, NULL);
-  if (r->status == 403) return tf__fail(TF_ERR_SERVER_REJECTED, "HTTP %d for %s", r->status, rel);
+  /* a 401 or 403 without a reason: a key the CDN does not know, a refusal (the answer named nothing: http) */
+  if (r->status == 401 || r->status == 403) {
+    const int rc = r->status == 401 ? tf__fail(TF_ERR_INVALID_KEY, NULL) : tf__fail(TF_ERR_SERVER_REJECTED, "HTTP %d for %s", r->status, rel);
+    tf__cause_now(rc, stage, code[0] ? "refused" : "http", r->status, NULL, code);
+    return rc;
+  }
   return tf__fail(TF_ERR_DOWNLOAD_FAILED, "HTTP %d for %s", r->status, rel);
 }
 
@@ -390,10 +429,11 @@ static int fetch_raw(Run *run, const char *rel, long long size, const char *sha,
            * file's place with its own validator; less, and the partial file stays as it was */
           if (file_size(whole) == size) {
             remove(part);
-            if (rename(whole, part)) rc = tf__fail(TF_ERR_STORAGE_FAILED, "cannot put %s in the place of its partial file", rel);
+            if (rename(whole, part)) rc = on_storage(tf__fail(TF_ERR_STORAGE_FAILED, "cannot put %s in the place of its partial file", rel));
             else etag_write(part, x.etag);
           } else {
             again = 1;
+            tf__cause("download", "network", 0, NULL, NULL); /* a connection that ended */
             rc = tf__fail(TF_ERR_DOWNLOAD_FAILED, "the answer for %s ended early", rel);
           }
         } else if (st == 200 || st == 206) {
@@ -401,11 +441,13 @@ static int fetch_raw(Run *run, const char *rel, long long size, const char *sha,
            * transport, is a connection that ended */
           if (file_size(part) < size) {
             again = 1;
+            tf__cause("download", "network", 0, NULL, NULL);
             rc = tf__fail(TF_ERR_DOWNLOAD_FAILED, "the answer for %s ended early", rel);
           }
         } else if (st >= 200 && st < 300) {
           /* a 204 or any other 2xx is not an answer to a file request */
           again = 1;
+          tf__cause("download", "invalid_answer", st, NULL, NULL);
           rc = tf__fail(TF_ERR_DOWNLOAD_FAILED, "HTTP %d is not an answer to the request for %s", st, rel);
         } else {
           again = st >= 500 && !tf__body_stop_reason(r.body, r.body_n, why) && !(r.body && strstr(r.body, "network_blocked"));
@@ -429,16 +471,18 @@ static int fetch_raw(Run *run, const char *rel, long long size, const char *sha,
     }
     if (file_ok(part, size, sha)) {
       remove(to);
-      rc = rename(part, to) ? tf__fail(TF_ERR_STORAGE_FAILED, "cannot move %s into place", rel) : 0;
+      rc = rename(part, to) ? on_storage(tf__fail(TF_ERR_STORAGE_FAILED, "cannot move %s into place", rel)) : 0;
       etag_write(part, NULL);
       run->done = before + size;
       break;
     }
     remove(part); /* the full size and not the file: it goes with its validator, and the file is fetched once more */
     etag_write(part, NULL);
+    tf__cause("download", "hash", 0, NULL, NULL);
     rc = tf__fail(TF_ERR_CHECKSUM_MISMATCH, "%s", rel);
     if (++mismatches == 2) break;
   }
+  if (rc) tf__cause_retries(resumes + (mismatches > 1 ? 1 : 0)); /* 24.2 retries: the resumes of 16.2 */
   free(part);
   free(whole);
   return rc;
@@ -458,6 +502,12 @@ static void mkparent(const char *full) {
 
 static int fetch_entry(Run *run, const TfJson *f) {
   const TfDownload *o = run->o;
+  /* SDK 4.0: a file only from the lease answer's model folder (a build already here needs none) */
+  if (o->after_manifest && !run->base[0]) {
+    const int rc = tf__fail(TF_ERR_SERVER_REJECTED, "invalid_response: the lease answer names no model folder on Quran Lab's hosts; nothing was downloaded");
+    tf__cause_now(rc, "lease", "invalid_answer", 200, NULL, "invalid_response"); /* a 200 that is not what was asked for */
+    return rc;
+  }
   const char *p = tf_json_str(tf_json_get(f, "path"));
   const long long size = (long long)tf_json_get(f, "size")->num;
   const char *sha = tf_json_str(tf_json_get(f, "sha256"));
@@ -468,6 +518,23 @@ static int fetch_entry(Run *run, const TfJson *f) {
     mkparent(full);
     const int rc = fetch_raw(run, p, size, sha, full);
     free(full);
+    return rc;
+  }
+  if (!strcmp(enc, "qle1")) {
+    const TfJson *d = tf_json_get(f, "decoded");
+    const char *dp = tf_json_str(tf_json_get(d, "path"));
+    char rel[1100];
+    snprintf(rel, sizeof rel, "cdn/%s.qle", dp);
+    char *cdn = tf_path_join(o->dest, rel);
+    if (!cdn) return tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
+    mkparent(cdn);
+    int rc = fetch_raw(run, p, size, sha, cdn);
+    if (!rc && o->install) {
+      rc = o->install(o->hook_user, dp, run->mbytes, run->mn);
+      /* a container the Core refused is fetched again next time; one that waits for a lease stays */
+      if (!rc || rc == TF_ERR_CHECKSUM_MISMATCH || rc == TF_ERR_MODEL_INVALID) remove(cdn);
+    }
+    free(cdn);
     return rc;
   }
   if (strcmp(enc, "gzip")) return tf__fail(TF_ERR_MODEL_INVALID, "%s has the unknown encoding %s", p, enc);
@@ -496,10 +563,11 @@ static int fetch_entry(Run *run, const TfJson *f) {
       if (tf_gunzip_file(gz, tmp) || !file_ok(tmp, dsize, dsha)) {
         remove(tmp);
         remove(gz); /* any mismatch deletes both */
+        tf__cause("download", "hash", 0, NULL, NULL);
         rc = tf__fail(TF_ERR_CHECKSUM_MISMATCH, "%s", dp);
       } else {
         remove(dfull);
-        rc = rename(tmp, dfull) ? tf__fail(TF_ERR_STORAGE_FAILED, "cannot move %s into place", dp) : 0;
+        rc = rename(tmp, dfull) ? on_storage(tf__fail(TF_ERR_STORAGE_FAILED, "cannot move %s into place", dp)) : 0;
         remove(gz);
       }
       free(tmp);
@@ -510,9 +578,18 @@ static int fetch_entry(Run *run, const TfJson *f) {
   return rc;
 }
 
-/* 1 when the entry's file is already in place and verified */
+/* 1 when the entry's file is already in place and verified (a qle1 entry: its device form, which only the Core
+ * writes, is there; the Core checks its tags at open) */
 static int entry_done(const TfDownload *o, const TfJson *f) {
   const char *enc = tf_json_str(tf_json_get(f, "encoding"));
+  if (enc && !strcmp(enc, "qle1")) {
+    char rel[1100];
+    snprintf(rel, sizeof rel, "dev/%s.qld", tf_json_str(tf_json_get(tf_json_get(f, "decoded"), "path")));
+    char *dev = tf_path_join(o->dest, rel);
+    const int here = dev && tf_file_exists(dev);
+    free(dev);
+    return here;
+  }
   const TfJson *loc = enc && !strcmp(enc, "gzip") ? tf_json_get(f, "decoded") : f;
   char *full = tf_path_join(o->dest, tf_json_str(tf_json_get(loc, "path")));
   const int ok = full && file_ok(full, (long long)tf_json_get(loc, "size")->num, tf_json_str(tf_json_get(loc, "sha256")));
@@ -527,7 +604,7 @@ int tf__download_model(const TfDownload *opt) {
   if (!o.repo) o.repo = "Quran-Lab/tajweedformer-v4";
   if (!o.folder) o.folder = "sdk/v4.0";
   if (!o.revision || !o.dest || !o.key) return tf__fail(TF_ERR_INVALID_ARGUMENT, "a key, a build and a destination folder are required");
-  if (tf_mkdirs(o.dest)) return tf__fail(TF_ERR_STORAGE_FAILED, "cannot create %s", o.dest);
+  if (tf_mkdirs(o.dest)) return on_storage(tf__fail(TF_ERR_STORAGE_FAILED, "cannot create %s", o.dest));
   Run run;
   memset(&run, 0, sizeof run);
   run.o = &o;
@@ -554,6 +631,9 @@ int tf__download_model(const TfDownload *opt) {
   TfJson *m = NULL;
   rc = tf__manifest_accept(r.body, r.body_n, o.check_build ? o.revision : NULL, o.want_version,
                            o.trusted_key_hex ? o.trusted_key_hex : TF_QURANLAB_KEY_HEX, 0, &m, NULL, NULL, NULL);
+  if (rc) /* 24.3 manifest: its signature, its form, a build this SDK cannot run, not the build the config named */
+    tf__cause_now(rc, "manifest", rc == TF_ERR_SIGNATURE_INVALID ? "signature" : rc == TF_ERR_MODEL_INCOMPATIBLE ? "incompatible" : rc == TF_ERR_CHECKSUM_MISMATCH ? "hash" : "parse",
+                  200, NULL, NULL);
   const int format = rc ? 0 : (int)tf_json_get(m, "format")->num;
   const TfJson *files = rc ? NULL : tf_json_get(m, "files");
   if (!rc && (!files || files->type != TJ_ARR)) rc = tf__fail(TF_ERR_MODEL_INVALID, "manifest.json lists no files");
@@ -565,7 +645,7 @@ int tf__download_model(const TfDownload *opt) {
     const char *enc = tf_json_str(tf_json_get(f, "encoding"));
     if (!p || strstr(p, "..") || p[0] == '/' || strchr(p, '\\') || (dp && (strstr(dp, "..") || dp[0] == '/' || strchr(dp, '\\'))) ||
         !tf_json_is_int(tf_json_get(f, "size")) || !tf_json_str(tf_json_get(f, "sha256")) ||
-        (enc && !strcmp(enc, "gzip") && (!dp || !tf_json_is_int(tf_json_get(d, "size")) || !tf_json_str(tf_json_get(d, "sha256")))))
+        (enc && (!strcmp(enc, "gzip") || !strcmp(enc, "qle1")) && (!dp || !tf_json_is_int(tf_json_get(d, "size")) || !tf_json_str(tf_json_get(d, "sha256")))))
       rc = tf__fail(TF_ERR_MODEL_INVALID, "manifest.json lists a path that is not inside the folder");
   }
   /* a context this build does not have (the config's inference.context is written for every build): the build's
@@ -591,7 +671,7 @@ int tf__download_model(const TfDownload *opt) {
   long long missing = 0, room = 0;
   for (int i = 0; !rc && i < files->n; ++i) {
     const TfJson *f = &files->kids[i];
-    const int w = format == 3 ? in_profile3(f, o.contexts, o.only_role) : in_profile2(tf_json_str(tf_json_get(f, "path")), o.contexts, o.only_role);
+    const int w = format == 3 ? in_profile3(f, o.contexts, o.only_role, o.want_recited) : in_profile2(tf_json_str(tf_json_get(f, "path")), o.contexts, o.only_role);
     if (w < 0) {
       rc = tf__fail(TF_ERR_MODEL_INVALID, "manifest.json: files[%d].platforms is neither \"*\" nor a list of platform names", i);
       break;
@@ -604,22 +684,39 @@ int tf__download_model(const TfDownload *opt) {
       const TfJson *d = tf_json_get(f, "decoded");
       const long long dsize = d ? (long long)tf_json_get(d, "size")->num : 0;
       missing += size;
-      if (dsize > room) room = dsize; /* a gzip file and its decoded copy are on disk together for a moment */
+      if (dsize > room) room = dsize; /* a gzip file and its decoded copy (a CDN form and its device form) are on disk together for a moment */
     }
   }
   if (!rc && o.only_role && run.total == 0) rc = tf__fail(TF_ERR_MODEL_MISSING, "this build has no %s data", o.only_role);
   if (!rc && missing > 0) {
     /* SPEC 13.4: not enough space is its own error, before any byte is fetched */
     const long long avail = tf__free_bytes(o.dest);
-    if (avail >= 0 && avail < missing + room) rc = tf__fail_storage_full(missing + room, avail);
+    if (avail >= 0 && avail < missing + room) {
+      rc = tf__fail_storage_full(missing + room, avail);
+      tf__cause_now(rc, "download", "quota", 0, NULL, NULL);
+    }
+  }
+  /* SDK 4.0: the lease before any container is installed (the Core needs it), with the manifest just accepted */
+  run.mbytes = r.body;
+  run.mn = r.body_n;
+  if (!rc && o.after_manifest) {
+    rc = o.after_manifest(o.hook_user, r.body, r.body_n, m, run.base, sizeof run.base);
+    const size_t bl = strlen(run.base);
+    if (bl && run.base[bl - 1] != '/') run.base[0] = 0; /* a folder, or the host's URLs */
   }
   if (!rc && o.progress) o.progress(o.user, 0, run.total);
-  for (int i = 0; !rc && i < files->n; ++i)
-    if (want[i]) rc = fetch_entry(&run, &files->kids[i]);
+  /* the build's layout first: the Core keys the install mark of the weights with it (18.7.4) */
+  for (int pass = 0; pass < 2; ++pass)
+    for (int i = 0; !rc && i < files->n; ++i) {
+      const char *role = tf_json_str(tf_json_get(&files->kids[i], "role"));
+      const int layout = role && !strcmp(role, "layout");
+      if (want[i] && layout == (pass == 0)) rc = entry_done(&o, &files->kids[i]) ? (add_done(&run, (long long)tf_json_get(&files->kids[i], "size")->num), 0)
+                                                                                  : fetch_entry(&run, &files->kids[i]);
+    }
   free(want);
   if (!rc) {
     char *mp = tf_path_join(o.dest, "manifest.json");
-    if (!mp || tf_write_file(mp, r.body, r.body_n)) rc = tf__fail(TF_ERR_STORAGE_FAILED, "cannot write manifest.json in %s", o.dest);
+    if (!mp || tf_write_file(mp, r.body, r.body_n)) rc = on_storage(tf__fail(TF_ERR_STORAGE_FAILED, "cannot write manifest.json in %s", o.dest));
     free(mp);
     if (!rc && o.progress) o.progress(o.user, run.total, run.total);
   }

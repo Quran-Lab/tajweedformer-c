@@ -1,5 +1,5 @@
-/* Top-K: per frame the k best entries of any token or class head, bound to the engine's
- * zf_tajweed_topk (heads from anywhere) and zf_tajweed_stream_topk (a stream's take). The engine ranks a
+/* Top-K: per frame the k best entries of any token or class head, by tf__topk_rows (tf_rank.c, the
+ * 3.x engine's ranking), on heads from anywhere or on a stream's take (qlc_stream_heads). The ranking is a
  * stable argsort of the negated row (equal values by the lower id). Margins are recomputed here as double
  * differences of the float values (API_LAYERS.md, layers_ref.py topk): the engine is asked for k + 1 ranks
  * when k < cols so the k-th margin has its partner, and the last rank of a row has margin 0. */
@@ -53,7 +53,7 @@ oom:
   return NULL;
 }
 
-TfTopK *tf__topk(const ZfTajweedHeads *h, int head, int k) {
+TfTopK *tf__topk(const TfRawHeads *h, int head, int k) {
   tf__clear_error();
   if (!h || !rankable(head)) {
     tf__fail(TF_ERR_INVALID_ARGUMENT, "top-K needs a token or class head");
@@ -75,7 +75,7 @@ TfTopK *tf__topk(const ZfTajweedHeads *h, int head, int k) {
   float *vals2 = (float *)malloc(((size_t)frames * k2 + 1) * sizeof(float));
   TfTopK *t = NULL;
   if (!ids2 || !vals2) tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
-  else if (frames > 0 && zf_tajweed_topk(v, frames, cols, k2, ids2, vals2, NULL) != frames) tf__fail(TF_ERR_ENGINE_FAILED, "zf_tajweed_topk failed");
+  else if (frames > 0 && tf__topk_rows(v, frames, cols, k2, ids2, vals2, NULL) != frames) tf__fail(TF_ERR_ENGINE_FAILED, "the top-K ranking failed");
   else t = finish(head, frames, cols, k, k2, ids2, vals2);
   free(ids2);
   free(vals2);
@@ -94,11 +94,11 @@ TfTopK *tf__session_topk(const TfSession *s, int head, int k) {
     return NULL;
   }
   const int k2 = k < cols ? k + 1 : k;
-  const ZfTajweedStream *zs = tf__session_engine(s);
-  /* the frame count first: the engine wants an ids buffer even for max_frames 0 */
-  int probe[40];
-  const int frames = zf_tajweed_stream_topk(zs, TF_HEAD_BIT(head), k2, probe, NULL, NULL, 0);
-  if (frames < 0) {
+  /* the take so far as the Core keeps it (a head the stream does not compute is absent) */
+  TfRawHeads all;
+  int frames = 0;
+  const float *v = tf__session_take_heads(s, &all) ? NULL : tf__heads_array(&all, head, &frames);
+  if (!v) {
     tf__fail(TF_ERR_INVALID_ARGUMENT, "%s is not computed by this stream (see TfSessionOptions.heads)", tf_head_info(head)->name);
     return NULL;
   }
@@ -106,7 +106,7 @@ TfTopK *tf__session_topk(const TfSession *s, int head, int k) {
   float *vals2 = (float *)malloc(((size_t)frames * k2 + 1) * sizeof(float));
   TfTopK *t = NULL;
   if (!ids2 || !vals2) tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
-  else if (zf_tajweed_stream_topk(zs, TF_HEAD_BIT(head), k2, ids2, vals2, NULL, frames) != frames) tf__fail(TF_ERR_ENGINE_FAILED, "zf_tajweed_stream_topk failed");
+  else if (frames > 0 && tf__topk_rows(v, frames, cols, k2, ids2, vals2, NULL) != frames) tf__fail(TF_ERR_ENGINE_FAILED, "the top-K ranking failed");
   else t = finish(head, frames, cols, k, k2, ids2, vals2);
   free(ids2);
   free(vals2);

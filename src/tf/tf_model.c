@@ -1,7 +1,14 @@
-/* The Model: one verified model build on this device. The signed manifest (format 3; format 2 for folders with one
- * engine folder per context), its version and build, the tokens, the calibration and reference data as read-only
- * data, the sample clips, and the engine, opened for one context and input rate at a time. Nothing here scores:
- * the calibration is handed over as shipped and never applied. */
+/* The Model: one verified model build on this device. The signed manifest (format 3 with its `encryption` line,
+ * PROTECTED_MODEL.md 18.2.5), its version and build, the tokens, the calibration as read-only data, the sample clips,
+ * and the engine, opened for one context and input rate at a time.
+ *
+ * SDK 4.0: the engine, the formats and the keys are inside the closed Core. The Model hands the Core the signed
+ * manifest and the context; the Core reads the device forms it installed, checks the lease, and keeps the plaintext
+ * in its own memory. Nothing in this file opens a model file other than the public ones (the manifest, the
+ * calibration, the sample clips). The vocabulary is encrypted with the weights, so the names of the tokens come from
+ * the table below, chosen by the signed manifest's tokens_sha256 (a build with another vocabulary needs a newer SDK).
+ * The expected units of each ayah (the reference data, role `reference`, encrypted) are read by the Core
+ * (qlc_reference_expected, R3) from the open engine; tf_reference.c asks it. Nothing here scores. */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -34,8 +41,8 @@ struct TfModel {
   int format;              /* manifest format: 2 (a folder per context) or 3 (shared weights) */
   int is_signed;
   char key_id[17];
-  char *tokens[ZF_TAJWEED_VOCAB];
-  const char *names[ZF_TAJWEED_VOCAB];
+  char *tokens[TF_VOCAB];
+  const char *names[TF_VOCAB];
   TfTokens vocab;
   char *calib;             /* calibration.json as shipped, NUL-terminated; NULL when the folder has none */
   size_t calib_n;
@@ -51,9 +58,12 @@ struct TfModel {
   int threads, batch, pin, skip_checks;
   TfClient *client;
   char *repo, *folder_path;
-  /* the engine: one context and one input rate at a time */
-  ZfTajweedModel *zm;
-  ZfTajweedStream *zs;
+  /* the engine (in the Core): one context and one input rate at a time */
+  TfPm *pm;                /* the Client's Core host (a reference: it outlives the Client while this Model is open) */
+  char *mbytes;            /* manifest.json's bytes, as the Core takes them */
+  size_t mn;
+  qlc_model *zm;
+  qlc_stream *zs;
   char eng_context[32];
   int eng_rate;
   double load_ms;
@@ -67,7 +77,7 @@ const char *tf__model_dir(const TfModel *m) { return m->dir; }
 TfClient *tf__model_client(const TfModel *m) { return m ? m->client : NULL; }
 const TfJson *tf__model_manifest(const TfModel *m) { return m->manifest; }
 const char *tf__model_default_context(const TfModel *m) { return m->default_context; }
-ZfTajweedModel *tf__model_engine(TfModel *m) { return m ? m->zm : NULL; }
+qlc_model *tf__model_engine(TfModel *m) { return m ? m->zm : NULL; }
 /* Which context a Session runs on (SPEC section 3; the vectors' inference_context.json): the app's choice, else
  * the config's inference.context when `inference` is an object, its `context` a string and one of the model's
  * contexts (anything else there is ignored; 3.0 never reads tajweed.context), else the manifest's default. Names
@@ -247,6 +257,15 @@ char *tf__manifest_text(const TfJson *m, int with_tolerance, int with_raw) {
     const TfJson *cx = tf_json_get(m, "contexts");
     for (int i = 0; cx && cx->type == TJ_ARR && i < cx->n; ++i) tf_buf_printf(&b, "%s%s", i ? "," : "", tf_json_str(&cx->kids[i]) ? cx->kids[i].str : "");
     tf_buf_puts(&b, "\n");
+    /* 18.2.5: an encrypted build signs one more header line, right after contexts */
+    const TfJson *ec = tf_json_get(m, "encryption");
+    if (ec && ec->type == TJ_OBJ) {
+      TfBuf rn;
+      tf_buf_init(&rn);
+      tf_buf_printf(&b, "encryption %s %s ", field_str(ec, "scheme", &rn), field_str(ec, "key_id", &rn));
+      tf_buf_printf(&b, "%s\n", field_str(ec, "root", &rn));
+      tf_buf_free(&rn);
+    }
     if (with_tolerance) {
       int nk = 0;
       const TfJson **keys = sorted_entries(tf_json_get(m, "golden_tolerance"), tolerance_ok, &nk);
@@ -470,7 +489,7 @@ static int check_shape(const TfJson *m) {
     if (enc && strcmp(enc, "identity")) {
       const TfJson *d = tf_json_get(f, "decoded");
       uint8_t dh[32];
-      if (strcmp(enc, "gzip") || !d || !safe_path(tf_json_str(tf_json_get(d, "path"))) || !tf_json_is_int(tf_json_get(d, "size")) ||
+      if ((strcmp(enc, "gzip") && strcmp(enc, "qle1")) || !d || !safe_path(tf_json_str(tf_json_get(d, "path"))) || !tf_json_is_int(tf_json_get(d, "size")) ||
           tf_hex_decode(tf_json_str(tf_json_get(d, "sha256")), dh, 32))
         return tf__fail(TF_ERR_MODEL_INVALID, "manifest.json: the encoding of %s", p);
     }
@@ -515,6 +534,16 @@ int tf__manifest_accept(const char *bytes, size_t n, const char *want_build, con
     }
   }
   if (!rc && !tf_json_get(m, "version")) rc = tf__fail(TF_ERR_MODEL_INCOMPATIBLE, "the manifest names no model version (a build for SDK 2)");
+  /* SDK 4.0 runs encrypted builds only (18.2.5): {"scheme":"qle1","key_id":<32 hex>,"root":1..9} */
+  if (!rc) {
+    const TfJson *ec = tf_json_get(m, "encryption");
+    const char *sc = tf_json_str(tf_json_get(ec, "scheme")), *kid = tf_json_str(tf_json_get(ec, "key_id"));
+    const TfJson *root = tf_json_get(ec, "root");
+    uint8_t k16[16];
+    if (!ec || ec->type != TJ_OBJ || !sc || strcmp(sc, "qle1") || !kid || strlen(kid) != 32 || tf_hex_decode(kid, k16, 16) ||
+        !tf_json_is_int(root) || root->num < 1 || root->num > 9)
+      rc = tf__fail(TF_ERR_MODEL_INCOMPATIBLE, "the build is not encrypted: SDK 4 runs encrypted builds only");
+  }
   if (!rc && tf__version_cmp(tf_json_str(tf_json_get(m, "min_sdk_version")), TF_SDK_VERSION) > 0)
     rc = tf__fail(TF_ERR_MODEL_INCOMPATIBLE, "%s needs SDK %s or later (this is %s)", tf_json_str(tf_json_get(m, "model_id")),
                   tf_json_str(tf_json_get(m, "min_sdk_version")), TF_SDK_VERSION);
@@ -530,10 +559,15 @@ int tf__manifest_accept(const char *bytes, size_t n, const char *want_build, con
   return rc;
 }
 
-/* a file as it is kept on disk: the decoded file of a gzip entry (layout 3), else the entry itself */
+/* a file as the manifest names it on this device: the decoded entry of a gzip or qle1 entry (layout 3), else the
+ * entry itself. A qle1 file is never on disk as plaintext: its decoded path names it to the Core. */
 static const TfJson *local_of(const TfJson *f) {
   const char *enc = tf_json_str(tf_json_get(f, "encoding"));
-  return enc && !strcmp(enc, "gzip") ? tf_json_get(f, "decoded") : f;
+  return enc && (!strcmp(enc, "gzip") || !strcmp(enc, "qle1")) ? tf_json_get(f, "decoded") : f;
+}
+static int is_qle1(const TfJson *f) {
+  const char *enc = tf_json_str(tf_json_get(f, "encoding"));
+  return enc && !strcmp(enc, "qle1");
 }
 static const TfJson *listed(const TfJson *m, const char *path) {
   const TfJson *files = tf_json_get(m, "files");
@@ -542,6 +576,11 @@ static const TfJson *listed(const TfJson *m, const char *path) {
   return NULL;
 }
 const TfJson *tf__model_listed(const TfModel *m, const char *path) { return listed(m->manifest, path); }
+const char *tf__model_manifest_bytes(const TfModel *m, size_t *n) {
+  if (n) *n = m ? m->mn : 0;
+  return m ? m->mbytes : NULL;
+}
+TfPm *tf__model_pm(const TfModel *m) { return m ? m->pm : NULL; }
 
 const char *tf__model_role_path(const TfModel *m, const char *role, const char *context) {
   const TfJson *files = tf_json_get(m->manifest, "files");
@@ -576,36 +615,31 @@ static int verify_file(const char *dir, const TfJson *f) {
 
 /* ------------------------------------------------------------------ open */
 
-static int parse_tokens(TfModel *m, const char *text) {
-  int n = 0;
-  const char *s = text;
-  while (*s) {
-    const char *e = strchr(s, '\n');
-    size_t len = e ? (size_t)(e - s) : strlen(s);
-    while (len && (s[len - 1] == '\r' || s[len - 1] == ' ')) len--;
-    if (len) {
-      size_t sp = len;
-      while (sp && s[sp - 1] != ' ') sp--;
-      int id = n;
-      size_t symlen = len;
-      if (sp && sp < len) {
-        id = atoi(s + sp);
-        symlen = sp - 1;
-      }
-      if (id < 0 || id >= ZF_TAJWEED_VOCAB) return -1;
-      free(m->tokens[id]);
-      m->tokens[id] = (char *)malloc(symlen + 1);
-      if (!m->tokens[id]) return -1;
-      memcpy(m->tokens[id], s, symlen);
-      m->tokens[id][symlen] = 0;
-      n++;
+/* The vocabularies this SDK knows, by the SHA-256 of their tokens.txt (the signed manifest's tokens_sha256): the
+ * names in id order. TajweedFormer V4's tj3 vocabulary (tokens.txt of every V4 build, 224 bytes): blank, the word
+ * bar, the 29 consonant letters as UTF-8, the six vowels, and <foreign>. */
+static const struct {
+  const char *sha256;
+  const char *names[TF_VOCAB];
+} kVocabs[] = {
+    {"66fe6eb81b15506270f9e3c6efb0724cda757cd54326f26ca4bcd6be4f3b2aa4",
+     {"<blk>", "|", "\xd8\xa1", "\xd8\xa8", "\xd8\xaa", "\xd8\xab", "\xd8\xac", "\xd8\xad", "\xd8\xae", "\xd8\xaf",
+      "\xd8\xb0", "\xd8\xb1", "\xd8\xb2", "\xd8\xb3", "\xd8\xb4", "\xd8\xb5", "\xd8\xb6", "\xd8\xb7", "\xd8\xb8",
+      "\xd8\xb9", "\xd8\xba", "\xd9\x81", "\xd9\x82", "\xd9\x83", "\xd9\x84", "\xd9\x85", "\xd9\x86", "\xd9\x87",
+      "\xd9\x88", "\xd9\x8a", "\xda\xba", "a", "i", "u", "aa", "ii", "uu", "<foreign>"}},
+};
+
+static int vocab_for(TfModel *m, const char *sha) {
+  for (size_t v = 0; sha && v < sizeof kVocabs / sizeof kVocabs[0]; ++v) {
+    if (_tf_strnicmp(sha, kVocabs[v].sha256, 65)) continue;
+    for (int i = 0; i < TF_VOCAB; ++i) {
+      m->tokens[i] = (char *)malloc(strlen(kVocabs[v].names[i]) + 1);
+      if (!m->tokens[i]) return -1;
+      strcpy(m->tokens[i], kVocabs[v].names[i]);
     }
-    if (!e) break;
-    s = e + 1;
+    return 0;
   }
-  for (int i = 0; i < ZF_TAJWEED_VOCAB; ++i)
-    if (!m->tokens[i]) return -1;
-  return n == ZF_TAJWEED_VOCAB ? 0 : -1;
+  return -1;
 }
 
 /* the contexts and the default one: the manifest's header (format 3); for a format 2 folder (one engine folder per
@@ -673,11 +707,14 @@ void tf_model_close(TfModel *m) {
   /* a Model the Client gave out more than once stays open until its last holder closes it */
   if (m->client && tf__client_model_release(m->client, m)) return;
   TfClient *const client = m->client;
+  if (client) tf__client_session_close(client); /* 17.8: the Model's close ends the analytics session */
   engine_close(m);
   tf__reference_release(&m->ref);
+  if (m->pm) tf__pm_release(m->pm);
+  free(m->mbytes);
   tf_json_free(m->manifest);
   tf_json_free(m->calib_json);
-  for (int i = 0; i < ZF_TAJWEED_VOCAB; ++i) free(m->tokens[i]);
+  for (int i = 0; i < TF_VOCAB; ++i) free(m->tokens[i]);
   free(m->calib);
   free(m->dir);
   free(m->repo);
@@ -739,8 +776,12 @@ TfModel *tf__model_open(const char *folder, const TfModelOpen *opt) {
     }
     free(full);
     const int rc = tf__manifest_accept(text, n, o.want_build, o.want_version, key, o.allow_unsigned, &m->manifest, m->sha, NULL, NULL);
-    free(text);
-    if (rc) goto fail;
+    if (rc) {
+      free(text);
+      goto fail;
+    }
+    m->mbytes = text; /* the Core verifies the same bytes again with its own pinned keys */
+    m->mn = n;
     m->is_signed = tf_json_get(m->manifest, "signature") != NULL;
     snprintf(m->build, sizeof m->build, "%.40s", m->sha);
   }
@@ -748,37 +789,28 @@ TfModel *tf__model_open(const char *folder, const TfModelOpen *opt) {
   snprintf(m->version, sizeof m->version, "%s", tf_json_str(tf_json_get(m->manifest, "version")));
   snprintf(m->id, sizeof m->id, "%s", tf_json_str(tf_json_get(m->manifest, "model_id")));
   if (read_contexts(m)) goto fail;
-  /* the tokens: listed, verified, 38 of them */
+  /* the tokens: the build's vocabulary, by its signed hash (its file is encrypted and read by the Core only) */
   {
-    const char *tok_path = tf_json_str(tf_json_get(m->manifest, "tokens"));
-    const TfJson *tok = listed(m->manifest, tok_path);
-    if (!tok) {
-      tf__fail(TF_ERR_MODEL_INVALID, "manifest.json does not list its tokens file %s", tok_path);
+    if (vocab_for(m, tf_json_str(tf_json_get(m->manifest, "tokens_sha256")))) {
+      tf__fail(TF_ERR_MODEL_INCOMPATIBLE, "the build's vocabulary is not one this SDK knows: a newer SDK is needed");
       goto fail;
     }
-    if (strcmp(tf_json_str(tf_json_get(tok, "sha256")), tf_json_str(tf_json_get(m->manifest, "tokens_sha256")))) {
-      tf__fail(TF_ERR_MODEL_INVALID, "manifest.json: tokens_sha256 is not the hash of %s", tok_path);
-      goto fail;
-    }
-    if (verify_file(folder, tok)) goto fail;
-    char *full = tf_path_join(folder, tok_path), *text = NULL;
-    if (!full || tf_read_file(full, &text, NULL) || parse_tokens(m, text)) {
-      free(full);
-      free(text);
-      tf__fail(TF_ERR_MODEL_INVALID, "%s does not hold the 38 TajweedFormer tokens", tok_path);
-      goto fail;
-    }
-    free(full);
-    free(text);
-    m->vocab.count = ZF_TAJWEED_VOCAB;
-    m->vocab.blank = ZF_TAJWEED_BLANK;
+    m->vocab.count = TF_VOCAB;
+    m->vocab.blank = TF_BLANK;
     m->vocab.word_bar = -1;
-    for (int i = 0; i < ZF_TAJWEED_VOCAB; ++i) {
+    for (int i = 0; i < TF_VOCAB; ++i) {
       m->names[i] = m->tokens[i];
       if (!strcmp(m->tokens[i], "|")) m->vocab.word_bar = i;
     }
     m->vocab.names = m->names;
   }
+  /* the Core: the Client's host, held while this Model lives */
+  m->pm = o.client ? tf__pm(o.client) : NULL;
+  if (!m->pm) {
+    if (!tf__error_code()) tf__fail(TF_ERR_STORAGE_FAILED, "no install key store");
+    goto fail;
+  }
+  tf__pm_retain(m->pm);
   /* the calibration: data. Read when the manifest lists it and it is in the folder (then it must be the listed
    * bytes); a folder without it opens and the accessor gives NULL (SPEC section 4). */
   {
@@ -804,13 +836,9 @@ TfModel *tf__model_open(const char *folder, const TfModelOpen *opt) {
     free(full);
   }
   read_clips(m);
-  {
-    const char *rp = tf__model_role_path(m, "reference", NULL);
-    if (rp && strlen(rp) < sizeof m->ref.path) {
-      snprintf(m->ref.path, sizeof m->ref.path, "%s", rp);
-      m->has_ref = 1;
-    }
-  }
+  /* the reference data: an encrypted entry of role `reference` (downloaded only when the app asks, read by the Core) */
+  m->ref.m = m;
+  m->has_ref = tf__model_role_entry(m, "reference") != NULL;
   /* the context to warm: the caller's, else the one the next Session uses with no choice by the app */
   if (o.context) {
     if (!tf__model_has_context(m, o.context)) {
@@ -849,7 +877,7 @@ TfModel *tf__model_open_folder(const char *folder, const TfModelOptions *options
 
 /* ------------------------------------------------------------------ the engine */
 
-/* The engine allows one live stream per process (its operators keep process-wide state). A Model keeps its
+/* The engine allows one live stream per process (qlcore.h: "one stream may be live per process"). A Model keeps its
  * stream between takes so the next Session starts at once; when another Model needs a stream, the idle one gives
  * its own up. */
 static TfModel *g_stream_owner;
@@ -862,55 +890,50 @@ static void owner_unlock(void) { __atomic_clear(&g_stream_lock, __ATOMIC_RELEASE
 
 static void stream_close(TfModel *m) {
   owner_lock();
-  if (m->zs) zf_tajweed_stream_destroy(m->zs);
+  if (m->zs) qlc_stream_destroy(m->zs);
   m->zs = NULL;
   if (g_stream_owner == m) g_stream_owner = NULL;
   owner_unlock();
 }
 static void engine_close(TfModel *m) {
   stream_close(m);
-  if (m->zm) zf_tajweed_model_close(m->zm);
+  if (m->zm) tf__pm_close(m->pm, m->zm);
   m->zm = NULL;
   m->eng_context[0] = 0;
   m->eng_rate = 0;
 }
 
-/* the context's engine files: listed and verified; nothing else under the folder is opened. Layout 3: the shared
- * weights and the context's graph, graph data and geometry overlay (the ONNX file is the ONNX Runtime tier's,
- * never opened by the engine). A file that is not on disk yet is fetched when the Model came from a Client (another
- * context's files are downloaded on first use). */
+/* the context's files: every encrypted entry of the context (and the shared ones) installed as a device form. A
+ * file that is not here yet is fetched and installed when the Model came from a Client (another context's files are
+ * downloaded on first use; the Core installs only while none of its models is open). */
 static int engine_files(TfModel *m, const char *context) {
-  static const char *const k2[] = {"model_engine2.onnx", "model_engine2.onnx.zfg", "model_engine2.onnx.zfg.bin", "frontend.zfw", "layers.zfw"};
-  static const char *const k3[] = {"../layers.zfw", "../frontend.zfw", "model_engine2.onnx.zfg", "model_engine2.onnx.zfg.bin", "frames.zfw"};
-  const char *const *names = m->format == 3 ? k3 : k2;
+  const TfJson *files = tf_json_get(m->manifest, "files");
   for (int pass = 0; pass < 2; ++pass) {
     int missing = 0;
-    for (size_t i = 0; i < 5; ++i) {
-      char p[96];
-      if (!strncmp(names[i], "../", 3)) snprintf(p, sizeof p, "%s", names[i] + 3);
-      else snprintf(p, sizeof p, "%s/%s", context, names[i]);
-      const TfJson *f = listed(m->manifest, p);
-      if (!f) return tf__fail(TF_ERR_MODEL_INVALID, "manifest.json does not list %s", p);
-      if (m->skip_checks) {
-        /* hashed when it was downloaded, a moment ago; a file of another context may not be here yet */
-        char *full = tf_path_join(m->dir, tf_json_str(tf_json_get(local_of(f), "path")));
-        const int here = full && tf_file_exists(full);
-        free(full);
-        if (here) continue;
-      }
-      const int rc = verify_file(m->dir, f);
-      if (rc == TF_ERR_MODEL_MISSING && pass == 0 && m->client) missing = 1;
-      else if (rc) return rc;
+    for (int i = 0; i < files->n; ++i) {
+      const TfJson *f = &files->kids[i];
+      const char *cx = tf_json_str(tf_json_get(f, "context")), *need = tf_json_str(tf_json_get(f, "need"));
+      if (!is_qle1(f) || !need || strcmp(need, "required") || (cx && strcmp(cx, "*") && strcmp(cx, context))) continue;
+      const char *soc = tf_json_str(tf_json_get(f, "soc"));
+      if (soc && strcmp(soc, "*")) continue;
+      char *dev = tf__plat_path(tf__pm_plat(m->pm), QLC_FORM_DEVICE, tf_json_str(tf_json_get(local_of(f), "path")));
+      /* the device form's place belongs to the build in use */
+      tf__plat_set_build(tf__pm_plat(m->pm), m->dir);
+      free(dev);
+      dev = tf__plat_path(tf__pm_plat(m->pm), QLC_FORM_DEVICE, tf_json_str(tf_json_get(local_of(f), "path")));
+      const int here = dev && tf_file_exists(dev);
+      free(dev);
+      if (!here) missing = 1;
     }
     if (!missing) return 0;
-    tf__clear_error();
+    if (pass || !m->client) return tf__fail(TF_ERR_MODEL_MISSING, "the files of %s are not on this device", context);
     const int rc = tf__store_fetch_role(m->client, m, context, NULL);
     if (rc) return rc;
   }
   return 0;
 }
 
-ZfTajweedStream *tf__model_stream(TfModel *m, const char *context, int rate) {
+qlc_stream *tf__model_stream(TfModel *m, const char *context, int rate) {
   if (!m || !context) return NULL;
   if (rate <= 0) rate = 16000;
   if (rate != 16000 && (rate < 8000 || rate > 48000)) {
@@ -928,23 +951,17 @@ ZfTajweedStream *tf__model_stream(TfModel *m, const char *context, int rate) {
   if (!m->zm || strcmp(m->eng_context, context) || m->eng_rate != rate) {
     engine_close(m);
     if (engine_files(m, context)) return NULL;
+    /* 18.4.7.1: past the lease's exp the open makes a lease attempt first (with no network too: unreachable), and
+     * opens in the lease's grace when the Core allows it; a valid lease returns at once */
+    if (m->client && tf__pm_lease(m->client, m->pm, m->mbytes, m->mn, m->manifest, m->build)) return NULL;
     const double t0 = tf__now_s();
-    ZfTajweedOpenOptions zo = zf_tajweed_open_default_options();
-    zo.context = context;
-    zo.load_engine = 1;
-    zo.threads = m->threads;
-    zo.sample_rate = rate == 16000 ? 0 : rate;
-    zo.batch = m->batch;
-    if (m->pin) zo.no_pin = m->pin < 0 ? 1 : 0;
-    const char *err = NULL;
-    m->zm = zf_tajweed_model_open(m->dir, &zo, &err);
-    if (!m->zm) {
-      tf__fail(TF_ERR_ENGINE_FAILED, "%s", err ? err : "the engine cannot open the model");
-      return NULL;
-    }
+    m->zm = tf__pm_open(m->pm, m->dir, m->mbytes, m->mn, context, m->threads, rate, m->pin);
+    if (!m->zm) return NULL;
     snprintf(m->eng_context, sizeof m->eng_context, "%s", context);
     m->eng_rate = rate;
     m->load_ms = (tf__now_s() - t0) * 1000.0;
+    /* the recited index (17.1) goes with the model: read by the Core from its device form when it is installed */
+    if (m->client) tf__recited_index(m->client, m->pm, m->dir, m->mbytes, m->mn);
   }
   if (!m->zs) {
     owner_lock();
@@ -955,16 +972,16 @@ ZfTajweedStream *tf__model_stream(TfModel *m, const char *context, int rate) {
         tf__fail(TF_ERR_SESSION_OPEN, NULL);
         return NULL;
       }
-      zf_tajweed_stream_destroy(other->zs);
+      qlc_stream_destroy(other->zs);
       other->zs = NULL;
       g_stream_owner = NULL;
     }
-    const char *err = NULL;
-    m->zs = zf_tajweed_stream_create(m->zm, &err);
+    int st = 0;
+    m->zs = qlc_stream_create(m->zm, &st);
     if (m->zs) g_stream_owner = m;
     owner_unlock();
     if (!m->zs) {
-      tf__fail(TF_ERR_ENGINE_FAILED, "%s", err ? err : "the engine cannot start a stream");
+      tf__pm_error(st, 0);
       return NULL;
     }
   }
@@ -976,8 +993,8 @@ void tf__model_detach(TfModel *m) {
   if (m->open) tf__session_detach(m->open);
   m->client = NULL;
 }
-/* the context's engine files against the manifest, now, without fetching anything: 0 when they are all here
- * and match */
+/* the context's files, now, without fetching anything: 0 when every one is installed (the Core checks their tags
+ * when it opens them) */
 int tf__model_verify(TfModel *m, const char *context) {
   TfClient *c = m->client;
   const int skip = m->skip_checks;
@@ -1025,10 +1042,10 @@ int tf_model_chunk_ms(const TfModel *m, const char *context) {
 }
 
 const TfTokens *tf_model_tokens(const TfModel *m) { return m ? &m->vocab : NULL; }
-int tf_model_token_count(const TfModel *m) { return m ? ZF_TAJWEED_VOCAB : 0; }
-const char *tf_model_token_name(const TfModel *m, int id) { return m && id >= 0 && id < ZF_TAJWEED_VOCAB ? m->tokens[id] : NULL; }
+int tf_model_token_count(const TfModel *m) { return m ? TF_VOCAB : 0; }
+const char *tf_model_token_name(const TfModel *m, int id) { return m && id >= 0 && id < TF_VOCAB ? m->tokens[id] : NULL; }
 int tf_model_token_id(const TfModel *m, const char *name) {
-  for (int i = 0; m && name && i < ZF_TAJWEED_VOCAB; ++i)
+  for (int i = 0; m && name && i < TF_VOCAB; ++i)
     if (!strcmp(m->tokens[i], name)) return i;
   return -1;
 }
@@ -1115,6 +1132,53 @@ int tf_model_backend(const TfModel *m, TfBackend *out) {
 
 TfReference *tf_model_reference(TfModel *m) { return m && m->has_ref ? &m->ref : NULL; }
 
+/* the manifest's encrypted entry of a role (the first), or NULL */
+const TfJson *tf__model_role_entry(TfModel *m, const char *role) {
+  const TfJson *files = m ? tf_json_get(m->manifest, "files") : NULL;
+  for (int i = 0; files && i < files->n; ++i) {
+    const char *r = tf_json_str(tf_json_get(&files->kids[i], "role"));
+    if (r && !strcmp(r, role) && is_qle1(&files->kids[i])) return &files->kids[i];
+  }
+  return NULL;
+}
+/* 1 when the entry's device form (what the Core installed) is in the build's folder */
+int tf__model_entry_installed(TfModel *m, const TfJson *f) {
+  if (!m || !f || !m->pm) return 0;
+  tf__plat_set_build(tf__pm_plat(m->pm), m->dir);
+  char *dev = tf__plat_path(tf__pm_plat(m->pm), QLC_FORM_DEVICE, tf_json_str(tf_json_get(local_of(f), "path")));
+  const int here = dev && tf_file_exists(dev);
+  free(dev);
+  return here;
+}
+/* The engine, open for a read of the reference data: the one in use, else the Model's context at 16 kHz. NULL and the
+ * error when it cannot be opened (the Core needs a valid lease, as for a take). */
+qlc_model *tf__model_engine_for_reference(TfModel *m) {
+  if (!m) return NULL;
+  if (m->zm) return m->zm;
+  if (!m->pm) {
+    tf__fail(TF_ERR_REFERENCE_MISSING, NULL);
+    return NULL;
+  }
+  const char *ctx = m->warm_context[0] ? m->warm_context : m->default_context;
+  if (engine_files(m, ctx)) return NULL;
+  if (m->client && tf__pm_lease(m->client, m->pm, m->mbytes, m->mn, m->manifest, m->build)) return NULL;
+  m->zm = tf__pm_open(m->pm, m->dir, m->mbytes, m->mn, ctx, m->threads, 16000, m->pin);
+  if (!m->zm) return NULL;
+  snprintf(m->eng_context, sizeof m->eng_context, "%s", ctx);
+  m->eng_rate = 16000;
+  if (m->client) tf__recited_index(m->client, m->pm, m->dir, m->mbytes, m->mn);
+  return m->zm;
+}
+/* The engine closed, so the Core can install a file of this build that the open model would read (the reference
+ * data; qlc_install refuses it beside an open model of the same build). The next Session or reference read opens it
+ * again, and only then does the Core see the new file. TF_ERR_SESSION_OPEN while a take runs. */
+int tf__model_engine_release(TfModel *m) {
+  if (!m) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no model");
+  if (m->open) return tf__fail(TF_ERR_SESSION_OPEN, NULL);
+  engine_close(m);
+  return 0;
+}
+
 /* ------------------------------------------------------------------ info */
 
 const char *tf_model_info_json(TfModel *m) {
@@ -1165,7 +1229,7 @@ const char *tf_model_info_json(TfModel *m) {
       first = 0;
     }
   tf_buf_puts(&b, "],\"tokens\":[");
-  for (int i = 0; i < ZF_TAJWEED_VOCAB; ++i) {
+  for (int i = 0; i < TF_VOCAB; ++i) {
     if (i) tf_buf_puts(&b, ",");
     tf_buf_json_str(&b, m->tokens[i]);
   }

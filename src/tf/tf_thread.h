@@ -10,6 +10,7 @@ typedef HANDLE TfThread;
 static inline void tf_mutex_init(TfMutex *m) { InitializeCriticalSection(m); }
 static inline void tf_mutex_destroy(TfMutex *m) { DeleteCriticalSection(m); }
 static inline void tf_mutex_lock(TfMutex *m) { EnterCriticalSection(m); }
+static inline int tf_mutex_trylock(TfMutex *m) { return TryEnterCriticalSection(m) ? 1 : 0; } /* 1: taken */
 static inline void tf_mutex_unlock(TfMutex *m) { LeaveCriticalSection(m); }
 static inline void tf_cond_init(TfCond *c) { InitializeConditionVariable(c); }
 static inline void tf_cond_destroy(TfCond *c) { (void)c; }
@@ -56,6 +57,7 @@ static inline void tf_mutex_init(TfMutex *m) {
 }
 static inline void tf_mutex_destroy(TfMutex *m) { pthread_mutex_destroy(m); }
 static inline void tf_mutex_lock(TfMutex *m) { pthread_mutex_lock(m); }
+static inline int tf_mutex_trylock(TfMutex *m) { return pthread_mutex_trylock(m) == 0; } /* 1: taken */
 static inline void tf_mutex_unlock(TfMutex *m) { pthread_mutex_unlock(m); }
 static inline void tf_cond_init(TfCond *c) { pthread_cond_init(c, NULL); }
 static inline void tf_cond_destroy(TfCond *c) { pthread_cond_destroy(c); }

@@ -67,6 +67,7 @@ static int set_error(int code, const char *const *names, const char *const *valu
   if (e) {
     fill(g_msg, sizeof g_msg, e->message, names, values, count);
     fill(g_fix, sizeof g_fix, e->fix, names, values, count);
+    tf__cause_bind(code); /* the failure seen on this thread that led here (tf_report.c) */
   } else {
     snprintf(g_msg, sizeof g_msg, "%s", g_raw);
     g_fix[0] = 0;
@@ -113,6 +114,7 @@ int tf__fail_rejected(const char *code, const char *app) {
     g_code = TF_ERR_SERVER_REJECTED;
     fill(g_msg, sizeof g_msg, kTfReasons[i].message, names, values, 1);
     fill(g_fix, sizeof g_fix, kTfReasons[i].fix, names, values, 1);
+    tf__cause_bind(g_code);
     return g_code;
   }
   return tf__fail(TF_ERR_SERVER_REJECTED, "%s", given);
@@ -135,6 +137,7 @@ int tf__fail_storage_full(long long needed, long long available) {
 void tf__clear_error(void) {
   g_msg[0] = g_fix[0] = g_raw[0] = 0;
   g_code = 0;
+  tf__cause_clear(); /* a failure the call went on from is not the cause of a later one */
 }
 int tf__error_code(void) { return g_code; }
 const char *tf__error_text(void) { return g_msg; }
@@ -200,14 +203,18 @@ int tf__null_handle(const char *what) {
 }
 /* the last error a public call raised in this process (any thread), for tf_client_diagnose */
 static volatile int g_last_raised;
-int tf__raise(int rc) {
+static int raise_code(int rc, int report) {
   if (rc < 0) {
     const int code = tf_last_error_code();
     if (code) __atomic_store_n(&g_last_raised, code, __ATOMIC_SEQ_CST);
+    /* 24.1: where a TfError reaches the app, the error report (the app's own misuse aside) */
+    if (code && report) tf__rep_raised(code);
     return code ? code : rc;
   }
   return rc;
 }
+int tf__raise(int rc) { return raise_code(rc, 1); }
+int tf__raise_again(int rc) { return raise_code(rc, 0); }
 int tf__last_raised(void) { return __atomic_load_n(&g_last_raised, __ATOMIC_SEQ_CST); }
 
 const unsigned char *tf__errors_json(size_t *n) {
@@ -408,6 +415,7 @@ static char *parse_string(Parser *p) {
   return out;
 }
 static int parse_value(Parser *p, TfJson *v);
+void tf_json_free_inner(TfJson *j);
 static int push_kid(TfJson *v, TfJson *kid, int *cap) {
   if (v->n == *cap) {
     *cap = *cap ? *cap * 2 : 4;
@@ -456,11 +464,15 @@ static int parse_value(Parser *p, TfJson *v) {
           p->s++;
         }
         if (parse_value(p, &kid)) {
+          /* the child as far as it got (a half-parsed array or object holds allocations): freed here, since it
+           * is not in v->kids yet and tf_json_free(v) cannot reach it */
+          tf_json_free_inner(&kid);
           free(key);
           return -1;
         }
         kid.key = key;
         if (push_kid(v, &kid, &cap)) {
+          tf_json_free_inner(&kid); /* frees key too */
           p->err = "out of memory";
           return -1;
         }
@@ -634,7 +646,7 @@ int tf_write_file(const char *path, const void *data, size_t n) {
     if (attempt) Sleep((DWORD)(5 * attempt));
     rc = MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? 0 : -1;
 #else
-    if (attempt) usleep((useconds_t)(5000 * attempt));
+    if (attempt) tf__sleep_ms(5 * attempt);
     rc = rename(tmp, path);
 #endif
   }
@@ -803,6 +815,9 @@ void tf__sleep_ms(int ms) {
 #ifdef _WIN32
   Sleep((DWORD)ms);
 #else
-  usleep((useconds_t)ms * 1000);
+  /* nanosleep, not usleep: POSIX 2008 (this file's _POSIX_C_SOURCE) has no usleep, and glibc hides it */
+  struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
+  while (nanosleep(&ts, &ts) && errno == EINTR) {
+  }
 #endif
 }

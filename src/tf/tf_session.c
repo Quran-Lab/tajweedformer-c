@@ -11,7 +11,12 @@
  *
  * With end_on_silence_ms the take ends at the chunk that carries the frame of speechEnded: that chunk is
  * delivered whole and is the last (is_final), later audio is not decoded (no flush), ended(silence) follows.
- * Order for one chunk: speechStarted or speechEnded of its frames, then the chunk, then ended. */
+ * Order for one chunk: speechStarted or speechEnded of its frames, then the chunk, then ended.
+ *
+ * SDK 4.0: the engine's stream is the Core's (qlc_stream_*). The take's top-2 is computed here from its log_probs
+ * (tf_rank.c, the same ranking), since the Core gives heads and greedy ids only. The take's recited range is found
+ * by the Core's detector (tf_recited.c): begun with the take, fed after each push that ran a chunk, finished with
+ * the take; the app's report is the fallback for a take the detector counted nothing for. */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -32,7 +37,7 @@ typedef struct {
 struct TfSession {
   TfModel *m;
   TfClient *client;
-  ZfTajweedStream *zs;
+  qlc_stream *zs;
   unsigned mask;
   char context[32];
   char route[16];
@@ -60,9 +65,19 @@ struct TfSession {
   int from_clip;
   TfRecited recited;
   int failed_code;
+  int failed_memory, failed_status; /* 24.3: the engine's status when it stopped (QLC_E_NOMEM: memory) */
+  char failed_status_text[12];
+  uint64_t take_id; /* the take's id in the Core's recited journal; 0 when the detector is off */
+  int measured;     /* the detector counted this take: the app's report is not used */
+  qlc_recited_result range; /* what it counted (never given to the app): a late report's outcomes pair with it */
+  long long hour_ms[24];    /* ms of speech by the learner's local hour at each chunk (17.8 hour_speech_s) */
 };
 
-ZfTajweedStream *tf__session_engine(const TfSession *s) { return s ? s->zs : NULL; }
+qlc_stream *tf__session_engine(const TfSession *s) { return s ? s->zs : NULL; }
+qlc_stream *tf__session_stream(const TfSession *s) { return s ? s->zs : NULL; }
+int tf__session_take_heads(const TfSession *s, TfRawHeads *out) {
+  return s && s->zs && qlc_stream_heads(s->zs, out) == QLC_OK ? 0 : -1;
+}
 
 static void backend_cpu(TfBackend *b) {
   b->kind = "cpu";
@@ -105,31 +120,37 @@ static void emit(TfSession *s, int type, int at_ms, int silence_ms, int reason, 
 /* the greedy id of one frame of log_probs: the largest log-prob, the lowest id on ties */
 static int greedy_id(const float *row) {
   int a = 0;
-  for (int i = 1; i < ZF_TAJWEED_VOCAB; ++i)
+  for (int i = 1; i < TF_VOCAB; ++i)
     if (row[i] > row[a]) a = i;
   return a;
 }
 
 /* Hands one chunk over: the speech events of its frames, then the chunk (its Heads, the decoded layer of the take
  * up to its end, whether it holds speech). Returns 1 when the chunk ended the take on silence. */
-static int deliver(TfSession *s, TfHeads *chunk, int n40, const ZfTajweedHeads *all, const ZfTajweedTop2 *top2, int is_final) {
-  ZfTajweedHeads upto = *all;
+static int deliver(TfSession *s, TfHeads *chunk, int n40, const TfRawHeads *all, const TfTop2 *top2, int is_final) {
+  TfRawHeads upto = *all;
   upto.n40 = s->frames40 + n40;
   upto.n20 = 2 * upto.n40;
   /* the timing head is computed for every take (the speech rule needs it); the app gets it only when selected */
   const float *timing = all->timing_log_probs;
   tf__heads_select(&upto, s->mask);
-  int speech = 0, ended = 0;
+  int speech = 0, ended = 0, active_now = 0;
   for (int t = s->frames40; t < upto.n40 && upto.log_probs; ++t) {
-    const int id = top2 ? top2[t].token : greedy_id(upto.log_probs + (size_t)t * ZF_TAJWEED_VOCAB);
-    const int ta = timing ? greedy_id(timing + (size_t)(2 * t) * ZF_TAJWEED_VOCAB) : 0;
-    const int tb = timing ? greedy_id(timing + (size_t)(2 * t + 1) * ZF_TAJWEED_VOCAB) : 0;
+    const int id = top2 ? top2[t].token : greedy_id(upto.log_probs + (size_t)t * TF_VOCAB);
+    const int ta = timing ? greedy_id(timing + (size_t)(2 * t) * TF_VOCAB) : 0;
+    const int tb = timing ? greedy_id(timing + (size_t)(2 * t + 1) * TF_VOCAB) : 0;
     const int active = tf__speech_active(id, ta, tb);
     TfSpeechEvent ev;
-    if (id != ZF_TAJWEED_BLANK) s->any_token = 1;
+    if (id != TF_BLANK) s->any_token = 1;
     if (tf__speech_frame(&s->speech, active, &ev)) emit(s, ev.type, ev.at_ms, ev.silence_ms, 0, 0);
     speech |= active;
     s->active_frames += active;
+    active_now += active;
+  }
+  if (active_now) {
+    int hour = 0;
+    tf__local_now(NULL, &hour);
+    s->hour_ms[hour] += 40LL * active_now; /* only the bucket leaves the device, never the zone or a time */
   }
   if (s->speech.ended && !s->finishing) ended = 1; /* this chunk is whole and is the last */
   if (s->on_chunk) {
@@ -155,7 +176,7 @@ static int deliver(TfSession *s, TfHeads *chunk, int n40, const ZfTajweedHeads *
 
 /* the take's Heads, copied out of the engine's stream (which the next take will reuse), and its final decoded
  * layer; `all` holds exactly the take's frames */
-static int keep_take(TfSession *s, const ZfTajweedHeads *all, const ZfTajweedTop2 *top2) {
+static int keep_take(TfSession *s, const TfRawHeads *all, const TfTop2 *top2) {
   const int rc = tf__heads_own(&s->take, all, s->mask, s->m);
   if (rc) return rc;
   s->take.top_k = s->top_k;
@@ -172,7 +193,7 @@ static int keep_take(TfSession *s, const ZfTajweedHeads *all, const ZfTajweedTop
 int tf__session_kept_peak(const TfSession *s) { return s ? s->kept_peak : 0; }
 
 /* the engine's callback, once per chunk, inside a push or the finish call */
-static void on_engine_chunk(void *user, const ZfTajweedHeads *h) {
+static void on_engine_chunk(void *user, const TfRawHeads *h) {
   TfSession *s = (TfSession *)user;
   if (s->state != OPEN || s->silence_end) return; /* audio after the end of the take is not decoded */
   if (s->finishing) {
@@ -190,10 +211,9 @@ static void on_engine_chunk(void *user, const ZfTajweedHeads *h) {
     if (s->n_kept > s->kept_peak) s->kept_peak = s->n_kept;
     return;
   }
-  ZfTajweedHeads all;
-  const ZfTajweedTop2 *top2 = NULL;
-  if (zf_tajweed_stream_heads(s->zs, &all) < 0) return;
-  if (zf_tajweed_stream_top2(s->zs, &top2) < s->frames40 + h->n40) top2 = NULL;
+  TfRawHeads all;
+  const TfTop2 *top2 = NULL; /* computed from log_probs by the decoded layer (tf_rank.c) */
+  if (qlc_stream_heads(s->zs, &all) != QLC_OK) return;
   TfHeads view;
   tf__heads_view(&view, h, s->mask, s->m);
   const int ended = deliver(s, &view, h->n40, &all, top2, 0);
@@ -220,8 +240,8 @@ static TfSession *session_new(TfModel *m, const TfSessionOptions *opt, int rate_
     tf__fail(TF_ERR_INVALID_ARGUMENT, "backend %s is not auto or cpu", o.backend);
     return NULL;
   }
-  if (o.top_k < 0 || o.top_k > ZF_TAJWEED_VOCAB) {
-    tf__fail(TF_ERR_INVALID_ARGUMENT, "top_k %d is not 0 to %d", o.top_k, ZF_TAJWEED_VOCAB);
+  if (o.top_k < 0 || o.top_k > TF_VOCAB) {
+    tf__fail(TF_ERR_INVALID_ARGUMENT, "top_k %d is not 0 to %d", o.top_k, TF_VOCAB);
     return NULL;
   }
   if (!tf__end_on_silence_ok(o.end_on_silence_ms)) {
@@ -247,7 +267,7 @@ static TfSession *session_new(TfModel *m, const TfSessionOptions *opt, int rate_
     tf__model_context_in_force(m, context, sizeof context);
   }
   const int rate = rate_override ? rate_override : o.sample_rate > 0 ? o.sample_rate : 16000;
-  ZfTajweedStream *zs = tf__model_stream(m, context, rate);
+  qlc_stream *zs = tf__model_stream(m, context, rate);
   if (!zs) return NULL;
   TfSession *s = (TfSession *)calloc(1, sizeof *s);
   if (!s) {
@@ -275,9 +295,12 @@ static TfSession *session_new(TfModel *m, const TfSessionOptions *opt, int rate_
   snprintf(s->route, sizeof s->route, "%s", o.input_route ? o.input_route : "unknown");
   /* a new take: every cache and every kept head back to the start, then the heads this take computes (a head
    * nobody asked for is not computed at all) */
-  zf_tajweed_stream_reset(zs);
-  zf_tajweed_stream_set_heads(zs, mask | TF_HEAD_BIT(TF_HEAD_TIMING)); /* timing always: the speech rule */
-  zf_tajweed_stream_set_callback(zs, on_engine_chunk, s);
+  qlc_stream_reset(zs);
+  qlc_stream_set_heads(zs, mask | TF_HEAD_BIT(TF_HEAD_TIMING)); /* timing always: the speech rule */
+  qlc_stream_set_callback(zs, (qlc_chunk_fn)on_engine_chunk, s);
+  /* the recited journal (17.6): the take begins there (off without an index, without analytics) */
+  if (s->client) tf__recited_begin(s->client, tf__model_pm(m), &s->take_id);
+  if (s->client) tf__sharing_take_start(s->client); /* 4.0: an ask not yet on screen waits for this take's end */
   return s;
 }
 
@@ -314,10 +337,11 @@ static int g_takes; /* takes started in this process: the first one is the launc
 
 /* the take for the day's telemetry (SPEC section 6): every take is a session; one that ended with its Heads also
  * counts in takes, audio_s, speech_s, silence_s, tokens and compute_s, and counts its recited report */
-static void count_take(TfSession *s, int aborted) {
+static void count_take(TfSession *s, int aborted, int end) {
   if (!s->client) return;
   TfSessionStats st;
   memset(&st, 0, sizeof st);
+  st.end = end;
   st.model = s->m;
   st.context = s->context;
   st.audio_s = (double)s->samples / s->rate;
@@ -336,6 +360,7 @@ static void count_take(TfSession *s, int aborted) {
       st.speech_frames = s->active_frames;
       st.silence_frames = d->n_frames - s->active_frames;
     }
+    memcpy(st.hour_ms, s->hour_ms, sizeof st.hour_ms);
     for (int h = 0; h < TF_HEAD_COUNT; ++h) {
       if (!(s->mask & TF_HEAD_BIT(h)) || strcmp(tf_head_info(h)->kind, "log_softmax")) continue;
       const int n = tf_heads_greedy(&s->take, tf_head_info(h)->name, NULL);
@@ -344,7 +369,17 @@ static void count_take(TfSession *s, int aborted) {
     tf__clear_error();
   }
   tf__client_session_finished(s->client, &st);
-  tf__recited_end(&s->recited, s->client, !aborted && s->have_take);
+  /* the recited range (17.1): measured by the Core's detector, else the app's report; a take that did not end
+   * with its Heads counts neither, and its journaled units are dropped */
+  if (!aborted && s->have_take) {
+    s->measured = tf__recited_finish(s->client, tf__model_pm(s->m), s->zs, s->take_id, s->recited.surah ? &s->recited : NULL, &s->range);
+    if (s->recited.surah) s->recited.counted = 1;
+    s->take_id = 0;
+  } else {
+    tf__recited_cancel(s->client, tf__model_pm(s->m), s->take_id);
+    s->take_id = 0;
+  }
+  tf__recited_end(&s->recited, s->client, 0);
 }
 
 /* the engine reported an error: the take is over, with nothing kept */
@@ -355,17 +390,21 @@ static int fail_take(TfSession *s, int code) {
   s->failed_code = code;
   share_end(s, 0);
   tf__model_clear_session(s->m, s);
-  count_take(s, 1);
+  count_take(s, 1, 2);
   emit(s, TF_EVENT_ENDED, 0, 0, TF_ENDED_ERROR, code);
-  /* the callbacks may have used the thread's error: put this one back */
-  const char *e = zf_tajweed_stream_last_error(s->zs);
-  if (code == TF_ERR_ENGINE_FAILED) tf__fail(code, "%s", e ? e : "the engine stopped");
+  /* the callbacks may have used the thread's error: put this one back, with its cause (24.3 session) */
+  const char *qn = s->failed_status == QLC_E_NOMEM ? "QLC_E_NOMEM" : s->failed_status == QLC_E_ENGINE ? "QLC_E_ENGINE" : NULL;
+  tf__cause("session", s->failed_memory ? "memory" : "engine", 0, qn, s->failed_status ? s->failed_status_text : NULL);
+  if (code == TF_ERR_ENGINE_FAILED) tf__fail(code, "%s", "the engine stopped");
   else tf__fail(code, "%s", "the take's heads could not be kept");
   return code;
 }
-static int engine_failed(TfSession *s) {
-  const char *e = zf_tajweed_stream_last_error(s->zs);
-  return fail_take(s, tf__fail(TF_ERR_ENGINE_FAILED, "%s", e ? e : "the engine stopped"));
+/* the engine refused audio or the flush (its status: QLC_E_NOMEM is memory) */
+static int engine_failed(TfSession *s, int status) {
+  s->failed_memory = status == QLC_E_NOMEM;
+  s->failed_status = status;
+  snprintf(s->failed_status_text, sizeof s->failed_status_text, "%d", status);
+  return fail_take(s, tf__fail(TF_ERR_ENGINE_FAILED, "%s", "the engine stopped"));
 }
 
 /* the take ended with its Heads: the shared copy is closed, the take is counted, and when it ended by itself it
@@ -374,7 +413,8 @@ static void wrap_up(TfSession *s, int reason) {
   s->state = ENDED;
   share_end(s, 1);
   tf__model_clear_session(s->m, s);
-  count_take(s, 0);
+  /* the app's finish, silence, the limit, the clip's end: normal; the background reasons (never raised here) not */
+  count_take(s, 0, reason == TF_ENDED_BACKGROUND || reason == TF_ENDED_HIDDEN || reason == TF_ENDED_INTERRUPTED ? 1 : 0);
   if (reason) emit(s, TF_EVENT_ENDED, 0, 0, reason, 0);
 }
 
@@ -383,20 +423,19 @@ static void wrap_up(TfSession *s, int reason) {
 static int end_take(TfSession *s, int reason) {
   s->finishing = 1;
   const double t0 = tf__now_s();
-  const int r = zf_tajweed_stream_finish(s->zs);
+  const int r = qlc_stream_finish(s->zs);
   const double dt = tf__now_s() - t0;
   s->compute_s += dt;
   s->compute_us += (long long)(dt * 1e6);
   if (r < 0) {
     for (int i = 0; i < s->n_kept; ++i) tf__heads_release(&s->kept[i].heads);
     s->n_kept = 0;
-    return engine_failed(s);
+    return engine_failed(s, r);
   }
-  ZfTajweedHeads all;
-  const ZfTajweedTop2 *top2 = NULL;
+  TfRawHeads all;
+  const TfTop2 *top2 = NULL;
   int rc = 0;
-  if (zf_tajweed_stream_heads(s->zs, &all) < 0) rc = tf__fail(TF_ERR_ENGINE_FAILED, "the engine kept no heads");
-  if (!rc && zf_tajweed_stream_top2(s->zs, &top2) < all.n40) top2 = NULL;
+  if (qlc_stream_heads(s->zs, &all) != QLC_OK) rc = tf__fail(TF_ERR_ENGINE_FAILED, "the engine kept no heads");
   for (int i = 0; i < s->n_kept; ++i) {
     if (!rc) deliver(s, &s->kept[i].heads, s->kept[i].n40, &all, top2, i == s->n_kept - 1);
     tf__heads_release(&s->kept[i].heads);
@@ -427,14 +466,15 @@ static int push(TfSession *s, const float *samples, int n) {
   for (int at = 0; at < n && s->state == OPEN && !s->silence_end; at += piece) {
     const int k = n - at < piece ? n - at : piece;
     const double t0 = tf__now_s();
-    const int r = zf_tajweed_stream_push_audio(s->zs, samples + at, k);
+    const int r = qlc_stream_push(s->zs, samples + at, k);
     const double dt = tf__now_s() - t0;
     s->compute_s += dt;
-    if (r < 0) return engine_failed(s);
+    if (r < 0) return engine_failed(s, r);
     if (r > 0) s->compute_us += (long long)(dt * 1e6);
     chunks += r;
     s->samples += k;
     share_push(s, samples + at, k);
+    if (r > 0 && s->take_id) tf__recited_feed(tf__model_pm(s->m), s->zs); /* the take's units so far, off the audio path */
   }
   if (s->state == OPEN && s->silence_end) {
     if (s->failed_code) return fail_take(s, s->failed_code);
@@ -471,8 +511,12 @@ const TfHeads *tf_session_heads(TfSession *s) {
   }
   tf__clear_error();
   if (s->state == CANCELLED) tf__fail(TF_ERR_CANCELLED, NULL);
-  else if (s->state == FAILED) tf__fail(s->failed_code == TF_ERR_ENGINE_FAILED || !s->failed_code ? TF_ERR_ENGINE_FAILED : s->failed_code, "the take ended on an error");
-  else if (!s->have_take) tf__fail(TF_ERR_INVALID_ARGUMENT, "the take has not ended: call tf_session_finish first");
+  else if (s->state == FAILED) {
+    /* the take's failure, reported when it happened: handed over again, not reported again */
+    tf__fail(s->failed_code == TF_ERR_ENGINE_FAILED || !s->failed_code ? TF_ERR_ENGINE_FAILED : s->failed_code, "the take ended on an error");
+    tf__raise_again(-1);
+    return NULL;
+  } else if (!s->have_take) tf__fail(TF_ERR_INVALID_ARGUMENT, "the take has not ended: call tf_session_finish first");
   else return &s->take;
   tf__raise(-1);
   return NULL;
@@ -484,9 +528,9 @@ int tf_session_cancel(TfSession *s) {
   if (s->state != OPEN) return 0;
   s->state = CANCELLED;
   share_end(s, 0); /* a cancelled take is kept in a recording only from 2 s */
-  zf_tajweed_stream_reset(s->zs);
+  qlc_stream_reset(s->zs);
   tf__model_clear_session(s->m, s);
-  count_take(s, 1);
+  count_take(s, 1, 3);
   return 0;
 }
 
@@ -512,7 +556,8 @@ int tf__ayah_count(int surah) { return surah >= 1 && surah <= 114 ? kAyahs[surah
 int tf__recited_ok(int surah, int ayah_from, int ayah_to) {
   return surah >= 1 && surah <= 114 && ayah_from >= 1 && ayah_from <= ayah_to && ayah_to <= kAyahs[surah];
 }
-/* state: 0 the take is open, 1 it ended with its Heads, 2 it was cancelled or failed */
+/* state: 0 the take is open, 1 it ended with its Heads, 2 it was cancelled or failed. 4.0: a report after the take
+ * ended counts at once, as the app's report, only when the detector counted nothing for the take (17.1) */
 int tf__recited_report(TfRecited *r, TfClient *c, int state, int surah, int ayah_from, int ayah_to) {
   if (surah < 1 || surah > 114) return tf__fail(TF_ERR_INVALID_ARGUMENT, "surah %d is not 1 to 114", surah);
   if (!tf__recited_ok(surah, ayah_from, ayah_to))
@@ -522,27 +567,138 @@ int tf__recited_report(TfRecited *r, TfClient *c, int state, int surah, int ayah
   r->ayah_from = ayah_from;
   r->ayah_to = ayah_to;
   if (state == 1) {
-    if (c) tf__client_count_recited(c, surah, ayah_from, ayah_to);
+    if (c) {
+      TfRecitedCount k;
+      memset(&k, 0, sizeof k);
+      k.source = 2;
+      k.surah = surah;
+      k.first = ayah_from;
+      k.last = ayah_to;
+      k.app = r;
+      tf__client_count_take_range(c, &k);
+    }
     r->counted = 1;
   }
   return 0;
 }
-/* the take ended: its report, if it has one, is counted when the take counts */
+/* the take ended without counting its report (a take that did not end with its Heads): the report is spent */
 void tf__recited_end(TfRecited *r, TfClient *c, int counts) {
+  (void)c;
   if (!counts || !r->surah || r->counted) return;
-  if (c) tf__client_count_recited(c, r->surah, r->ayah_from, r->ayah_to);
   r->counted = 1;
+}
+void tf__recited_clear(TfRecited *r) {
+  free(r->per);
+  memset(r, 0, sizeof *r);
+}
+
+/* one outcome of 17.9, checked: correct, or incorrect with 0 (none given) or 1 to 1,000 mistakes and at most 8 rule
+ * ids ^[a-z][a-z0-9_]{0,23}$; correct with mistakes or rules is refused */
+static int outcome_in(const TfRecitedOutcome *o, TfOutcomeX *out) {
+  memset(out, 0, sizeof *out);
+  if (o->correct != 0 && o->correct != 1) return tf__fail(TF_ERR_INVALID_ARGUMENT, "outcome.correct is not 0 or 1");
+  if (o->correct && (o->mistakes || o->n_rules)) return tf__fail(TF_ERR_INVALID_ARGUMENT, "a correct outcome has no mistakes and no rules");
+  if (o->mistakes < 0 || o->mistakes > 1000) return tf__fail(TF_ERR_INVALID_ARGUMENT, "outcome.mistakes %d is not 1 to 1000 (0: not given)", o->mistakes);
+  if (o->n_rules < 0 || o->n_rules > 8 || (o->n_rules && !o->rules)) return tf__fail(TF_ERR_INVALID_ARGUMENT, "outcome.rules: at most 8 rule ids");
+  for (int i = 0; i < o->n_rules; ++i)
+    if (!tf__rule_name_ok(o->rules[i]))
+      return tf__fail(TF_ERR_INVALID_ARGUMENT, "rule %s is not a lower-case letter followed by at most 23 lower-case letters, digits or underscores",
+                      o->rules[i] ? o->rules[i] : "(none)");
+  out->set = 1;
+  out->correct = o->correct;
+  out->mistakes = o->mistakes;
+  out->n_rules = o->n_rules;
+  for (int i = 0; i < o->n_rules; ++i) snprintf(out->rules[i], sizeof out->rules[i], "%s", o->rules[i]);
+  return 0;
+}
+int tf__recited_outcome(TfRecited *r, int surah, int ayah_from, int ayah_to, const TfRecitedOutcome *whole, const TfRecitedAyah *per, int n) {
+  if (surah < 1 || surah > 114) return tf__fail(TF_ERR_INVALID_ARGUMENT, "surah %d is not 1 to 114", surah);
+  if (!tf__recited_ok(surah, ayah_from, ayah_to))
+    return tf__fail(TF_ERR_INVALID_ARGUMENT, "ayahs %d to %d are not inside surah %d (1 to %d)", ayah_from, ayah_to, surah, kAyahs[surah]);
+  if (n < 0 || (n && !per)) return tf__fail(TF_ERR_INVALID_ARGUMENT, "per_ayah: %d entries", n);
+  TfRecited x;
+  memset(&x, 0, sizeof x);
+  int rc = whole ? outcome_in(whole, &x.whole) : 0;
+  if (!rc && n) {
+    x.per = (TfPerAyah *)calloc((size_t)n, sizeof(TfPerAyah));
+    if (!x.per) rc = tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
+  }
+  for (int i = 0; !rc && i < n; ++i) {
+    if (per[i].ayah < ayah_from || per[i].ayah > ayah_to) rc = tf__fail(TF_ERR_INVALID_ARGUMENT, "per_ayah: ayah %d is outside %d to %d", per[i].ayah, ayah_from, ayah_to);
+    for (int k = 0; !rc && k < i; ++k)
+      if (per[k].ayah == per[i].ayah) rc = tf__fail(TF_ERR_INVALID_ARGUMENT, "per_ayah: ayah %d is given twice", per[i].ayah);
+    if (!rc) rc = outcome_in(&per[i].outcome, &x.per[i].o);
+    if (!rc) x.per[i].ayah = per[i].ayah, x.n_per++;
+  }
+  if (rc) {
+    free(x.per);
+    return rc;
+  }
+  /* a valid report replaces the take's earlier one (at most one report per take) */
+  free(r->per);
+  r->whole = x.whole;
+  r->per = x.per;
+  r->n_per = x.n_per;
+  return 0;
 }
 
 int tf_session_report_recited(TfSession *s, int surah, int ayah_from, int ayah_to) {
+  return tf_session_report_recited_outcome(s, surah, ayah_from, ayah_to, NULL, NULL, 0);
+}
+
+/* 17.9: the same report with the app's own judgement of the range (whole) and of single ayahs (per_ayah). Nothing
+ * here judges: the counts are the app's. Counted, as the report, only where the detector counted nothing; where it
+ * counted the take, the outcomes are paired with the measured ayahs. */
+int tf_session_report_recited_outcome(TfSession *s, int surah, int ayah_from, int ayah_to, const TfRecitedOutcome *outcome,
+                                      const TfRecitedAyah *per_ayah, int n_per_ayah) {
   if (!s) return tf__raise(tf__null_handle("session"));
   tf__clear_error();
-  return tf__raise(tf__recited_report(&s->recited, s->client, s->state == OPEN ? 0 : s->state == ENDED ? 1 : 2, surah, ayah_from, ayah_to));
+  const int state = s->state == OPEN ? 0 : s->state == ENDED ? 1 : 2;
+  if (state == 2 || s->recited.counted) {
+    /* checked all the same (a wrong call is an error whenever it comes), then nothing more */
+    TfRecited tmp;
+    memset(&tmp, 0, sizeof tmp);
+    const int rc = tf__recited_outcome(&tmp, surah, ayah_from, ayah_to, outcome, per_ayah, n_per_ayah);
+    free(tmp.per);
+    return tf__raise(rc);
+  }
+  if (state == 1 && s->measured) {
+    /* the detector counted this take: a report after it adds only its outcomes, paired with the measured ayahs */
+    TfRecited tmp;
+    memset(&tmp, 0, sizeof tmp);
+    const int rc = tf__recited_outcome(&tmp, surah, ayah_from, ayah_to, outcome, per_ayah, n_per_ayah);
+    if (!rc) {
+      tmp.surah = surah, tmp.ayah_from = ayah_from, tmp.ayah_to = ayah_to;
+      TfRecitedCount k;
+      memset(&k, 0, sizeof k);
+      k.source = 1;
+      k.late = 1;
+      k.surah = s->range.surah, k.first = s->range.first, k.last = s->range.last;
+      k.ties = s->range.ties > 0 ? s->range.ties : 0; /* a tie take's outcomes: not toward first or repeat */
+      k.app = &tmp;
+      if (s->client && (outcome || n_per_ayah)) tf__client_count_take_range(s->client, &k);
+      s->recited.counted = 1;
+    }
+    free(tmp.per);
+    return tf__raise(rc);
+  }
+  int rc = tf__recited_outcome(&s->recited, surah, ayah_from, ayah_to, outcome, per_ayah, n_per_ayah);
+  if (!rc) rc = tf__recited_report(&s->recited, state == 1 ? NULL : s->client, state, surah, ayah_from, ayah_to);
+  if (!rc && state == 0) tf__recited_report_pending(s->client, s->take_id, &s->recited);
+  if (!rc && state == 1 && s->client) {
+    /* after the end of a take the detector did not count: the app's report, with its outcomes, counts now */
+    TfRecited app = s->recited;
+    s->recited.counted = 0;
+    tf__recited_finish(s->client, NULL, NULL, 0, &app, NULL);
+    s->recited.counted = 1;
+  }
+  return tf__raise(rc);
 }
 
 void tf_session_destroy(TfSession *s) {
   if (!s) return;
   if (s->state == OPEN) tf_session_cancel(s);
+  tf__recited_clear(&s->recited);
   tf__model_session_gone(s->m);
   tf__decoded_free(s->so_far);
   if (s->have_take) tf__heads_release(&s->take);
@@ -587,7 +743,11 @@ TfSession *tf_session_listen(TfModel *m, const TfClip *clip, const TfSessionOpti
   if (s->state == OPEN) end_take(s, TF_ENDED_SOURCE_END);
   if (s->state == FAILED) {
     const int code = s->failed_code;
+    char st[12];
+    snprintf(st, sizeof st, "%s", s->failed_status_text);
+    const int memory = s->failed_memory;
     tf_session_destroy(s);
+    tf__cause("session", memory ? "memory" : "engine", 0, NULL, st[0] ? st : NULL); /* the take's failure (24.3) */
     tf__raise(tf__fail(code ? code : TF_ERR_ENGINE_FAILED, "the take ended on an error"));
     return NULL;
   }

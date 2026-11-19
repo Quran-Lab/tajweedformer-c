@@ -11,8 +11,12 @@
  *   model30 <local30 dir> <key> <work dir>   the local 3.0 model folders (not in the repository) */
 
 /* the SHA-256 of sdk_3.0.0/errors.json as recorded when the catalogue was embedded (the contract's file at
- * version 1.8.0, SDK 3.1.0: 26 codes, and the ten entries under server_rejected's reasons). A changed catalogue changes this line, the generated header and test/data together. */
-#define TF_TEST_ERRORS_SHA256 "04b264b9d820f865a0bfd4d695e17a07b2ae6b1be318324c91f3177d322cd510"
+ * sdk-4.0.0-protected 3c62bf3: 26 codes, the ten entries under server_rejected's reasons, and the fix of
+ * sharing_unavailable that names no per-app switch). A changed catalogue changes this line, the generated header and
+ * test/data together. */
+#define TF_TEST_ERRORS_SHA256 "923da8f3d66e765a34574c4e12cbce5ae963688f407a07106f46dcd865fad3bd"
+/* the contract's file when this machine has it; TF_CONTRACT_ERRORS in the environment names another copy (an empty
+ * value skips the comparison) */
 #define TF_TEST_CONTRACT_ERRORS ""
 
 static int t30_down(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
@@ -47,13 +51,15 @@ static int errors_tests(const char *data) {
   {
     char *text = NULL;
     size_t tn = 0;
-    if (!tf_read_file(TF_TEST_CONTRACT_ERRORS, &text, &tn)) {
-      CHECK(tn == n && !memcmp(text, emb, n), "the embedded catalogue differs from %s (run tools/gen_errors.py)", TF_TEST_CONTRACT_ERRORS);
-      printf("errors: the embedded catalogue is the contract's file byte for byte (%d bytes)\n", (int)n);
+    const char *contract = getenv("TF_CONTRACT_ERRORS") ? getenv("TF_CONTRACT_ERRORS") : TF_TEST_CONTRACT_ERRORS;
+    if (*contract && !tf_read_file(contract, &text, &tn)) {
+      const int same = tn == n && !memcmp(text, emb, n);
+      CHECK(same, "the embedded catalogue differs from %s (run tools/gen_errors.py)", contract);
+      if (same) printf("errors: the embedded catalogue is the contract's file byte for byte (%d bytes, %s)\n", (int)n, contract);
       free(text);
     } else {
       printf("errors: %s is not on this machine: the comparison with the contract's file is skipped (the recorded SHA-256 below stands in)\n",
-             TF_TEST_CONTRACT_ERRORS);
+             *contract ? contract : "(TF_CONTRACT_ERRORS empty)");
     }
     char *p = tf_path_join(data, "errors.json");
     text = NULL;
@@ -404,9 +410,9 @@ static void t30_speech(const char *data) {
 /* ------------------------------------------------------------------ vectors: settled.json */
 /* log-probs whose greedy id per frame is ids[t]: the decoded layer then sees exactly these top-1 ids */
 static float *t30_logp(const int *ids, int T) {
-  float *x = (float *)malloc(((size_t)T * ZF_TAJWEED_VOCAB + 1) * sizeof(float));
+  float *x = (float *)malloc(((size_t)T * TF_VOCAB + 1) * sizeof(float));
   for (int t = 0; t < T; ++t)
-    for (int k = 0; k < ZF_TAJWEED_VOCAB; ++k) x[(size_t)t * ZF_TAJWEED_VOCAB + k] = k == ids[t] ? -0.125f : -12.0f - 0.25f * (float)k;
+    for (int k = 0; k < TF_VOCAB; ++k) x[(size_t)t * TF_VOCAB + k] = k == ids[t] ? -0.125f : -12.0f - 0.25f * (float)k;
   return x;
 }
 static void t30_settled(const char *data) {
@@ -441,11 +447,11 @@ static void t30_settled(const char *data) {
         replaced = 1;
       }
       float *lp = t30_logp(ids, T);
-      ZfTajweedHeads h;
+      TfRawHeads h;
       memset(&h, 0, sizeof h);
       h.n40 = T;
       h.n20 = 2 * T;
-      h.vocab = ZF_TAJWEED_VOCAB;
+      h.vocab = TF_VOCAB;
       h.log_probs = lp;
       TfDecoded *d = tf__decode(NULL, &h, NULL, 0);
       tf__decoded_mark(d, -1, t30_bool(st, "final"));
@@ -476,10 +482,10 @@ static void t30_settled(const char *data) {
 }
 
 /* ------------------------------------------------------------------ vectors: telemetry_30.json */
-static TfClient *t30_client(const char *dir, TfAnalytics analytics) {
+static TfClient *t30_client(const char *dir) {
   tf_mkdirs(dir);
   TfClient *c = tf_client_create(&(TfClientOptions){.key = "qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa", .app_id = "org.example.Vectors", .app_version = "3.2",
-                                                    .storage = dir, .analytics = analytics});
+                                                    .storage = dir});
   if (!c) fprintf(stderr, "client: %s\n", tf_last_error());
   return c;
 }
@@ -532,7 +538,7 @@ static void t30_telemetry(const char *data, const char *work) {
   tf__now_override = 1794355200 + 9 * 3600; /* 2026-11-11, mid-morning UTC: every call of a test falls on one day */
   /* 1. the 6.2 counters: the six takes into the day's cohorts */
   snprintf(d, sizeof d, "%s/takes", work);
-  TfClient *c = t30_client(d, TF_ANALYTICS_ON);
+  TfClient *c = t30_client(d);
   const TfJson *takes = tf_json_get(v, "takes");
   for (int i = 0; c && takes && i < takes->n; ++i) {
     const TfJson *t = &takes->kids[i], *heads = tf_json_get(t, "heads"), *sel = tf_json_get(t, "selected"), *cu = tf_json_get(t, "chunk_compute_us");
@@ -605,7 +611,7 @@ static void t30_telemetry(const char *data, const char *work) {
   /* 2. reportChecks: single calls, the day's sequence, 33 rules a day */
   const TfJson *rc = tf_json_get(v, "report_checks");
   snprintf(d, sizeof d, "%s/checks", work);
-  c = t30_client(d, TF_ANALYTICS_ON);
+  c = t30_client(d);
   int vok = 0, vn = 0;
   for (int pass = 0; c && pass < 2; ++pass) {
     const TfJson *l = tf_json_get(rc, pass ? "refused" : "valid");
@@ -623,7 +629,7 @@ static void t30_telemetry(const char *data, const char *work) {
   for (int q = 0; q < 2; ++q) {
     const TfJson *sq = tf_json_get(rc, seqs[q]), *calls = tf_json_get(sq, "calls"), *results = tf_json_get(sq, "results");
     snprintf(d, sizeof d, "%s/checks-%s", work, seqs[q]);
-    c = t30_client(d, TF_ANALYTICS_ON);
+    c = t30_client(d);
     int good = c != NULL;
     for (int i = 0; c && calls && i < calls->n; ++i) {
       const TfJson *k = tf_json_get(&calls->kids[i], "call") ? tf_json_get(&calls->kids[i], "call") : &calls->kids[i];
@@ -652,7 +658,7 @@ static void t30_telemetry(const char *data, const char *work) {
     }
   }
   snprintf(d, sizeof d, "%s/recited", work);
-  c = t30_client(d, TF_ANALYTICS_ON);
+  c = t30_client(d);
   const TfJson *rt = tf_json_get(rr, "takes");
   int tok = 0;
   for (int i = 0; c && rt && i < rt->n; ++i) {
@@ -683,7 +689,7 @@ static void t30_telemetry(const char *data, const char *work) {
   /* 4. the example payload's app-reported fields from its reports, and `reported` for every combination of
    * reports the two calls can make (the list is built from the payload itself) */
   snprintf(d, sizeof d, "%s/example", work);
-  c = t30_client(d, TF_ANALYTICS_ON);
+  c = t30_client(d);
   const TfJson *ex = tf_json_get(v, "example_reports");
   const TfJson *er = tf_json_get(ex, "recited"), *ec = tf_json_get(ex, "checks");
   for (int i = 0; c && er && i < er->n; ++i) {
@@ -702,7 +708,7 @@ static void t30_telemetry(const char *data, const char *work) {
   int combos = 0, combos_ok = 0;
   for (int mask = 0; mask < 16; ++mask, ++combos) {
     snprintf(d, sizeof d, "%s/combo%d", work, mask);
-    c = t30_client(d, TF_ANALYTICS_ON);
+    c = t30_client(d);
     if (!c) continue;
     if (mask & 1) {
       TfRecited r;
@@ -730,9 +736,12 @@ static void t30_telemetry(const char *data, const char *work) {
     tf_json_free(day);
     tf_client_destroy(c);
   }
-  /* 5. analytics off: the calls are still validated and nothing is counted */
+  /* 5. analytics off by Quran Lab's signed config (SDK 4.0: the only switch): the calls are still validated and nothing
+   * is counted */
   snprintf(d, sizeof d, "%s/off", work);
-  c = t30_client(d, TF_ANALYTICS_OFF);
+  tf_mkdirs(d);
+  seed_config(d, "{\"analytics\":false}");
+  c = t30_client(d);
   CHECK(c && tf_client_report_checks(c, "madd", 5, 1) == 0 && tf_client_report_checks(c, "Madd", 5, 1) == TF_ERR_INVALID_ARGUMENT, "analytics off: validation");
   day = c ? t30_day(c) : NULL;
   CHECK(day && !tf_json_get(day, "rule_checks") && !tf_json_get(day, "reported") && !tf_json_get(day, "launches"), "analytics off counted something");
@@ -801,11 +810,11 @@ static void t30_names(const char *data) {
   /* the twelve heads through the public TfHead of a Heads object that holds them all */
   const TfJson *heads = tf_json_get(v, "heads");
   static float zeros[64];
-  ZfTajweedHeads z;
+  TfRawHeads z;
   memset(&z, 0, sizeof z);
   z.n40 = 1;
   z.n20 = 1;
-  z.vocab = ZF_TAJWEED_VOCAB;
+  z.vocab = TF_VOCAB;
   z.log_probs = z.inter1_log_probs = z.inter4_log_probs = z.id_log_probs = z.timing_log_probs = z.gem = z.attr_tafkheem = z.attr_ghunna = z.attr_qalqalah =
       z.attr_face = z.boundary = z.conf = zeros;
   TfHeads all;
@@ -830,7 +839,7 @@ static void t30_names(const char *data) {
         "the default head selection");
   tf__clear_error();
   const TfJson *tok = tf_json_get(v, "tokens");
-  CHECK((int)t30_num(tok, "blank") == ZF_TAJWEED_BLANK && (int)t30_num(tok, "count") == ZF_TAJWEED_VOCAB && (int)t30_num(tok, "word_bar") == 1, "tokens");
+  CHECK((int)t30_num(tok, "blank") == TF_BLANK && (int)t30_num(tok, "count") == TF_VOCAB && (int)t30_num(tok, "word_bar") == 1, "tokens");
   /* events and reasons */
   static const int ev_types[] = {TF_EVENT_SPEECH_STARTED, TF_EVENT_SPEECH_ENDED, TF_EVENT_INTERRUPTED, TF_EVENT_RESUMED, TF_EVENT_BACKEND_CHANGED, TF_EVENT_ENDED};
   static const int reasons[] = {TF_ENDED_SILENCE, TF_ENDED_BACKGROUND, TF_ENDED_HIDDEN, TF_ENDED_INTERRUPTED, TF_ENDED_SOURCE_END, TF_ENDED_LIMIT, TF_ENDED_ERROR};
@@ -845,7 +854,7 @@ static void t30_names(const char *data) {
   const TfJson *so = tf_json_get(v, "session_options"), *eo = tf_json_get(so, "endOnSilenceMs");
   CHECK((int)t30_num(so, "sampleRate_default") == 16000 && (int)t30_num(so, "topK_default") == 0 && tf__end_on_silence_ok((int)t30_num(eo, "min")) &&
             tf__end_on_silence_ok((int)t30_num(eo, "max")) && !tf__end_on_silence_ok((int)t30_num(eo, "min") - 1) && !tf__end_on_silence_ok((int)t30_num(eo, "max") + 1) &&
-            TF_PACE_REAL_TIME == 0 && TF_PACE_FAST == 1 && TF_ANALYTICS_ON == 0 && TF_ANALYTICS_OFF == 1,
+            TF_PACE_REAL_TIME == 0 && TF_PACE_FAST == 1,
         "option values");
   const TfJson *sp = tf_json_get(v, "speech");
   TfSpeech dflt;
@@ -863,8 +872,18 @@ static void t30_names(const char *data) {
   CHECK(cok && codes->n == 26, "the error codes in catalogue order (%d in names.json)", codes ? codes->n : -1);
   const char *base = tf_json_str(tf_json_get(v, "error_docs_base")) ? tf_json_str(tf_json_get(v, "error_docs_base")) : tf_json_str(tf_json_get(tf_json_get(v, "errors"), "docs_base"));
   CHECK(base && !strncmp(tf_error_docs(TF_ERR_INVALID_KEY), base, strlen(base)), "the error docs base %s", base ? base : "(none)");
+  /* client_options: both are 3.x options that 4.0 removed, so they are skipped: analytics and audience (section 26, ONE_SHEET_40.md 26.4: one sheet for every app). An option this replay does not
+   * know fails here instead of being skipped unseen. */
+  const TfJson *co = tf_json_get(v, "client_options");
+  int co_skipped = 0, co_other = 0;
+  for (int i = 0; co && co->type == TJ_OBJ && i < co->n; ++i) {
+    if (!strcmp(co->kids[i].key, "analytics") || !strcmp(co->kids[i].key, "audience")) co_skipped++;
+    else co_other++;
+  }
+  CHECK(co && co->type == TJ_OBJ && co_skipped == 2 && co_other == 0, "client_options: %d of the two 3.x options skipped, %d others", co_skipped, co_other);
   tf__heads_release(&all);
-  printf("names.json: 12 heads, the default selection, events and reasons, option values, %d error codes\n", codes ? codes->n : 0);
+  printf("names.json: 12 heads, the default selection, events and reasons, option values, %d error codes; client_options analytics and "
+         "audience skipped (3.x only)\n", codes ? codes->n : 0);
   tf_json_free(v);
 }
 
@@ -883,10 +902,10 @@ static void t30_topk(const char *data) {
   for (int i = 0; cases && i < cases->n; ++i) {
     const TfJson *c = &cases->kids[i], *bits = tf_json_get(c, "bits"), *r = tf_json_get(c, "ranked");
     const TfJson *ids = tf_json_get(r, "ids"), *lps = tf_json_get(r, "log_probs"), *ms = tf_json_get(r, "margins");
-    float row[ZF_TAJWEED_VOCAB];
-    int good = bits && ids && lps && ms && bits->n == ZF_TAJWEED_VOCAB && ids->n == ZF_TAJWEED_VOCAB &&
-               lps->n == ZF_TAJWEED_VOCAB && ms->n == ZF_TAJWEED_VOCAB && ks && ks->n > 0;
-    for (int t = 0; good && t < ZF_TAJWEED_VOCAB; ++t) {
+    float row[TF_VOCAB];
+    int good = bits && ids && lps && ms && bits->n == TF_VOCAB && ids->n == TF_VOCAB &&
+               lps->n == TF_VOCAB && ms->n == TF_VOCAB && ks && ks->n > 0;
+    for (int t = 0; good && t < TF_VOCAB; ++t) {
       uint8_t b[4];
       const char *hex = tf_json_str(&bits->kids[t]);
       good = hex && strlen(hex) == 8 && tf_hex_decode(hex, b, 4) == 0;
@@ -894,11 +913,11 @@ static void t30_topk(const char *data) {
       const uint32_t u = (uint32_t)b[0] << 24 | (uint32_t)b[1] << 16 | (uint32_t)b[2] << 8 | (uint32_t)b[3];
       memcpy(&row[t], &u, 4);
     }
-    ZfTajweedHeads h;
+    TfRawHeads h;
     memset(&h, 0, sizeof h);
     h.n40 = 1;
     h.n20 = 2;
-    h.vocab = ZF_TAJWEED_VOCAB;
+    h.vocab = TF_VOCAB;
     h.log_probs = row;
     for (int q = 0; good && q < ks->n; ++q) {
       const int k = (int)ks->kids[q].num;
