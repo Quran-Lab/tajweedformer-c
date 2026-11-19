@@ -426,8 +426,43 @@ static TfClient *share_client(const char *dir) {
   o.platform = "linux";
   o.api_url = "https://api.test";
   o.storage_dir = dir;
-  o.telemetry = 0;
   return tf__client_open(&o);
+}
+
+int tf__share_join_ms(TfClient *c);
+/* SDK 4.0: the signed config's flags.share_join_ms is read as a whole
+ * number 0 to 60000 (2.0.3 to 3.x: 10000), anything else as 3000 */
+static int join_window_tests(const char *dir) {
+  tf_mutex_init(&g_st.m);
+  tf_http_set_transport(stub, NULL); /* nothing here should reach a server; if anything does, the stub answers */
+  static const struct {
+    const char *flag; /* the JSON value; NULL: absent */
+    int want;
+  } k[] = {{"0", 0},          {"1", 1},          {"8000", 8000},     {"10000", 10000},  {"10001", 10001}, {"15000", 15000},
+           {"60000", 60000},  {"60001", 3000},   {"1e9", 3000},      {"-1", 3000},      {"2.5", 3000},    {"\"15000\"", 3000},
+           {"true", 3000},    {"null", 3000},    {"[15000]", 3000},  {"{\"ms\":15000}", 3000}, {NULL, 3000}};
+  for (size_t i = 0; i < sizeof k / sizeof k[0]; ++i) {
+    char flags[96], sub[16];
+    if (k[i].flag) snprintf(flags, sizeof flags, "{\"contributions\":true,\"share_join_ms\":%s}", k[i].flag);
+    else snprintf(flags, sizeof flags, "{\"contributions\":true}");
+    snprintf(sub, sizeof sub, "j%02d", (int)i);
+    char *d = tf_path_join(dir, sub);
+    seed_config(d, flags);
+    TfClientConfig o = tf__client_default_config();
+    o.key = "qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa";
+    o.app_id = "org.example.JoinWindow";
+    o.platform = "linux";
+    o.api_url = "https://api.test";
+    o.storage_dir = d;
+    TfClient *c = tf__client_open(&o);
+    const int got = c ? tf__share_join_ms(c) : -1;
+    CHECK(got == k[i].want, "share_join_ms %s: %d, want %d", k[i].flag ? k[i].flag : "absent", got, k[i].want);
+    if (c) tf__client_close(c);
+    free(d);
+  }
+  CHECK(TF_SHARING_JOIN_MS_MAX == 60000 && TF_SHARING_JOIN_MS_DEFAULT == 3000, "the limits: 60000 and 3000");
+  printf("join window: %s\n", fails ? "FAIL" : "ok");
+  return fails ? 1 : 0;
 }
 
 static int upload_tests(const char *dir) {
@@ -536,6 +571,51 @@ static int upload_tests(const char *dir) {
         "bitrate call: %d", tf__sharing_bitrate(c));
   tf__client_close(c);
 
+  /* E, section 26 (ONE_SHEET_40.md 26.1 rule 4 and 26.4; Quran Lab's rule: never ask again): a 3.x install whose
+   * learner said yes on the guardian sheet of an app made for children moves to 4.0, which has no such sheet. The
+   * sharing.json is the one 3.1 writes for it, "guardian":true. 4.0 reads it as granted: no ask at the good moments
+   * that follow, the next take uploads, and "guardian" is written back as it was (4.0 never reads it). */
+  stub_reset();
+  char *de = tf_path_join(dir, "e"), *ep = tf_path_join(de, "sharing.json");
+  static const char k3xGuardianGrant[] =
+      "{\"v\":1,\"consent\":\"granted\",\"asks\":1,\"lastAskSession\":2,\"sessions\":5,\"thanked\":true,\"decidedAt\":1763100000,"
+      "\"consentVersion\":\"share-2026-11-09\",\"consentTextSha256\":null,\"guardian\":true,\"sharedSessions\":2,\"pendingAsk\":0,\"stamp\":0}";
+  tf_mkdirs(de);
+  tf_write_file(ep, k3xGuardianGrant, strlen(k3xGuardianGrant));
+  c = share_client(de);
+  for (int i = 0; c && i < 12; ++i) good_moment(c);
+  TfSharing sh;
+  memset(&sh, 0, sizeof sh);
+  const int st_rc = c ? tf_sharing_status(c, &sh) : -1;
+  const char *sj = c ? tf__client_sharing_status_json(c) : NULL;
+  CHECK(st_rc == 0 && sh.is_on && !sh.pending_ask && sh.asks == 1 && sj && strstr(sj, "\"consent\":\"granted\"") &&
+            strstr(sj, "\"consentVersion\":\"share-2026-11-09\"") && strstr(sj, "\"mayUpload\":true") && tf__client_sharing_ask_now(c) == 0,
+        "a 3.x grant on the guardian sheet after 12 good moments: %s", sj ? sj : "no client");
+  tf__sharing_outbox_resume(c);
+  ss = c ? tf__sharing_session_begin(c, rate, NULL) : NULL;
+  CHECK(ss != NULL, "a 3.x grant on the guardian sheet: no capture (%s)", tf_last_error() ? tf_last_error() : "");
+  for (int i = 0; ss && i < 150; ++i) tf__sharing_session_push(ss, x + i * 960, 960);
+  if (ss) share_finish(c, ss, 1);
+  left = c ? tf__sharing_outbox_wait(c, 20000) : -1;
+  segs = 0;
+  CHECK(left == 0 && g_st.n_s == 1 && joined_ok(&g_st.s[0], 1, &segs) && !g_st.bad_session_body, "a 3.x grant on the guardian sheet: the take did "
+        "not upload (%d left, %d sessions, %d bad bodies)", left, g_st.n_s, g_st.bad_session_body);
+  CHECK(sj && strstr(tf__client_sharing_status_json(c), "\"sharedSessions\":3"), "a 3.x grant on the guardian sheet: %s", tf__client_sharing_status_json(c));
+  if (c) tf__client_close(c);
+  {
+    char *et = NULL;
+    size_t en = 0;
+    TfJson *ej = !tf_read_file(ep, &et, &en) ? tf_json_parse(et, en, NULL) : NULL;
+    const TfJson *g = tf_json_get(ej, "guardian"), *ia = tf_json_get(ej, "installedAt");
+    const char *cs = tf_json_str(tf_json_get(ej, "consent"));
+    CHECK(g && g->type == TJ_BOOL && g->boolean && ia && ia->type == TJ_NUM && cs && !strcmp(cs, "granted") && strstr(et, "\"guardian\":true"),
+          "the state 4.0 wrote back: %s", et ? et : "(none)");
+    tf_json_free(ej);
+    free(et);
+  }
+  printf("a 3.x grant on the guardian sheet: granted, no ask in 12 good moments, the take uploaded (%d segments), guardian written back "
+         "unchanged\n", segs);
+
   stub_reset();
   tf_http_set_transport(NULL, NULL);
   free(x);
@@ -543,10 +623,13 @@ static int upload_tests(const char *dir) {
   free(db);
   free(dc);
   free(dd);
+  free(de);
+  free(ep);
   printf("shared-session upload: %s\n", fails ? "FAIL" : "ok");
   return fails ? 1 : 0;
 }
 
+#ifndef TF_NO_ENGINE
 /* the Session's hook: a Session of a Model that belongs to a client shares each take while consent is on (16 kHz
  * input, so the resampler runs), the take's heads are unchanged by it, and nothing is shared without consent */
 static int session_share_tests(const char *folder, const char *key, const char *list, const char *dir) {
@@ -625,3 +708,4 @@ static int session_share_tests(const char *folder, const char *key, const char *
   free(pcm);
   return fails ? 1 : 0;
 }
+#endif /* TF_NO_ENGINE */

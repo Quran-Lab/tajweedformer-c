@@ -6,12 +6,14 @@ platform's own README gives them.
 
 ## Recitation sharing
 
-### Who decides that the sheet is offered
+### Every learner is asked; the choice is theirs
 
-Quran Lab decides, per app, in the signed config the SDK downloads (`flags.contributions`, and per platform who
-may upload). The app's own sharing option is ignored since 2.0.1. Without a signed config in force nothing is
-offered. Offered is never consent: nothing is recorded for sharing and nothing is sent before the learner
-answers "Share", and a learner who never answers never shares.
+The SDK asks every learner, in every app, under the same rules, and the learner decides: "Share" or "Not now", and
+after a yes they can stop or delete what they shared at any time. No app is exempt, and an app has no option to turn
+the ask off (the app's own sharing option is ignored since 2.0.1). The signed config the SDK downloads keeps Quran
+Lab's incident switch (`flags.contributions`), which stops all asking and sharing, and says per platform who may
+upload; without a signed config in force nothing is asked. Being asked is never consent: nothing is recorded for
+sharing and nothing is sent before the learner answers "Share", and a learner who never answers never shares.
 
 ### Consent
 
@@ -20,7 +22,7 @@ answers "Share", and a learner who never answers never shares.
   a learner who turned sharing off after a yes is not asked again. After that, only the app's own settings
   entry point (the SDK's settings switch) turns sharing on or off. The count carries over from 2.0.0.
 - The learner agrees to one wording, identified by a consent version, recorded when they agree. The SDK's
-  own copy deck has version `share-2026-11-09` (deck `2026-11-13.1`, eight languages). Every shared session
+  own copy deck has version `share-2026-11-09` (deck `2026-11-19.1`, eight languages). Every shared session
   carries the version the learner actually agreed to (`consent_version`), for example `share-2026-11-07b`
   for a learner who agreed in a 2.0.0 app.
 - A grant persists: a new copy deck, a new SDK version or new app wording neither pauses sharing nor asks
@@ -51,8 +53,7 @@ answers "Share", and a learner who never answers never shares.
    show the sheet, through `TfClientOptions.on_consent`. An app that set no callback sees in
    `tf_sharing_status` that an ask waits (`pending_ask`) and shows its sheet then. Either way it is item 3.
 2. **Themed.** Not in this library: the sheet is the app's own window, so its colours, fonts and layout are
-   the app's. The words are the copy deck's, in the learner's language (right to left for Arabic and Urdu),
-   with the guardian lines for a children's app.
+   the app's. The words are the copy deck's, in the learner's language (right to left for Arabic and Urdu).
 3. **Your own UI.** The app receives the SDK's request to ask, shows its own UI with the SDK's localized
    strings (the copy deck the SDK exposes), and reports the learner's answer with the SDK's grant and
    decline calls, only from the learner's own tap. The SDK counts each ask against the same three.
@@ -133,7 +134,8 @@ on real recitation the 80-band log-mel features the model reads differ from the 
 ## Telemetry
 
 On by default, anonymous by construction: sums and histograms, no audio, text, identifiers or times finer than
-the UTC day. Off with the signed config's `flags.analytics: false` or the developer's one opt-out in code.
+the UTC day. Off only with the signed config's `flags.analytics: false` (SDK 4.0: no app can turn analytics off;
+SDKs before 4.0 also had the developer's one opt-out in code).
 
 ### Deltas during the day (2.0.1)
 

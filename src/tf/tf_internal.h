@@ -8,7 +8,25 @@
 #include <stdint.h>
 
 #include "tajweedformer.h"
-#include "zf_tajweed.h"
+#include "qlcore.h"
+
+typedef struct TfPm TfPm;
+typedef struct TfIkey TfIkey;
+typedef struct TfPlat TfPlat;
+
+/* ---- SDK 4.0: the closed Core's types as this library names them ----
+ * The engine is inside the Core (quranlab-core, a prebuilt library); its heads come out as qlc_heads, the layout the
+ * 3.x engine's ZfTajweedHeads had. The vocabulary is TajweedFormer's tj3: 38 tokens, blank 0. */
+#define TF_VOCAB 38
+#define TF_BLANK 0
+typedef qlc_heads TfRawHeads;
+/* per 40 ms frame of log_probs, the best token and the runner-up (tf_rank.c) */
+typedef struct {
+  int token, runner_up;
+  float log_prob, runner_up_log_prob, margin;
+} TfTop2;
+int tf__top2(const float *lp, int frames, int vocab, TfTop2 *out);
+int tf__topk_rows(const float *values, int frames, int cols, int k, int *ids, float *values_out, float *margins);
 
 /* ---- errors (thread-local) ---- */
 /* Failures that stay inside the library (a network call of the client's background work, a refused config): never a
@@ -34,6 +52,79 @@ const char *tf__error_text(void);/* the message as set */
 /* An internal code left on this thread becomes `code` (the catalogue's message with the internal text as its
  * detail); a catalogue code stays. Returns the code in force. */
 int tf__error_as(int code);
+/* tf__raise without a report: the same failure handed to the app again (a failed take's heads asked for) */
+int tf__raise_again(int rc);
+
+/* ---- error reports (tf_report.c; contract sdk_4.0.0 ERRORS_40.md, section 24) ---- */
+enum { TF_REP_NONE = 0, TF_REP_PARTIAL = 1, TF_REP_COMPLETE = 2 }; /* what of the build the call needs is on the device */
+#define TF_REP_DAILY 16         /* signatures an install reports a day */
+#define TF_REP_QUEUE 32         /* reports queued */
+#define TF_REP_REPORTED 64      /* signatures remembered as reported (first_report) */
+#define TF_REP_FIRST_AGAIN 90   /* days after which a signature is a first report again */
+#define TF_REP_KEEP 7           /* days a report is kept */
+#define TF_REP_COUNT_MAX 100000
+#define TF_REP_DAYSIGS 192      /* the days' signature list: 16 a day over the days kept, with room */
+/* 24.4: the code of the TfError the app gets ("none": the call goes on) for a cause; tools/errors40.py code_for */
+const char *tf__rep_code_for(const char *stage, const char *reason, int status, int on_device, const char *error_code);
+int tf__rep_reported(const char *reason, const char *code);      /* 24.1: whether it makes a report at all */
+const char *tf__rep_failure_reason(const char *reason);          /* 24.8: the telemetry failure_reasons name */
+void tf__rep_signature(const char *stage, const char *reason, const char *code, int status, char *out, size_t n);
+void tf__rep_signature_hex(const char *stage, const char *reason, const char *code, int status, char hex[33]);
+const char *tf__rep_storage_free(long long bytes);
+/* The cause of a failure, on this thread: recorded where the failure is seen, taken by the next catalogue code set
+ * on the thread that it can lead to (tf__fail), reported by tf__raise; tf__clear_error forgets it. */
+void tf__cause(const char *stage, const char *reason, int status, const char *error_name, const char *error_code);
+void tf__cause_force(void);       /* the next catalogue code takes the cause whatever 24.4 gives the pair */
+/* the code already set on the thread has this cause (known only after the code was set; nothing else changes) */
+void tf__cause_now(int code, const char *stage, const char *reason, int status, const char *error_name, const char *error_code);
+void tf__cause_retries(int n);    /* the attempts inside the failing call beyond the first */
+void tf__cause_bind(int code);
+void tf__cause_clear(void);
+const char *tf__cause_reason(void); /* the reason of the cause in force, "" for none */
+const char *tf__rep_answer_reason(int status, const char *body, size_t n, char code[33]);
+/* a 403 lease_integrity_failed (18.4.10; ERRORS_40.md 24.3, contract 69326fb): the report's error_code from the
+ * answer's why and check (why:check, or why alone; 0 when why is not a token), and the developer's detail */
+int tf__integrity_code(const char *why, const char *check, char out[33]);
+void tf__integrity_detail(const char *why, const char *check, char *out, size_t n);
+void tf__cause_answer(const char *stage, int status, const char *body, size_t n); /* an answer that failed */
+void tf__cause_transport(const char *stage, int status);                       /* no answer the request took */
+void tf__cause_silent(void); /* the cause, as a silent report, unless an app call of this thread reports it */
+/* >0 while the app's own call (a model, a prefetch, the reference data, a deletion) runs on this thread: its
+ * failures reach the app and are reported there, never as silent ones */
+extern _Thread_local int tf__app_call;
+void tf__rep_raised(int code);
+void tf__rep_silent(const char *stage, const char *reason, int status, const char *error_name, const char *error_code);
+/* the queue machine (tools/errors40.py Reporter): one install's reports, the days' signatures, the reported list */
+typedef struct {
+  char day[11], stage[16], reason[33], code[33], sig[33];
+  int status, count, first_report, first_launch, retries, answer;
+  char name[49], ecode[33], ram[8], free_[8], revision[24], build[41];
+} TfRepItem;
+typedef struct {
+  TfRepItem q[TF_REP_QUEUE + 1];
+  int nq;
+  struct {
+    char day[11], sig[33];
+    int sent;
+  } ds[TF_REP_DAYSIGS];
+  int nds;
+  struct {
+    char sig[33], day[11];
+  } rep[TF_REP_REPORTED];
+  int nrep;
+  int off;
+} TfRepState;
+typedef struct {
+  const char *stage, *reason, *code;
+  int status, first_launch, retries;
+  const char *name, *ecode, *ram, *free_, *revision, *build;
+} TfRepOcc;
+typedef int (*TfRepPost)(void *user, const TfRepItem *it); /* the answer's status; 0 none; -1 stop (tests) */
+int tf__rep_occur(TfRepState *r, const char *day, const TfRepOcc *o);
+void tf__rep_off(TfRepState *r, int off);
+int tf__rep_send_queue(TfRepState *r, const char *today, TfRepPost post, void *user, TfRepItem *made, int max_made);
+void tf__rep_from_json(TfRepState *r, const char *text, size_t n);
+char *tf__rep_to_json(const TfRepState *r);
 /* the embedded catalogue file (sdk_3.0.0/errors.json, byte for byte) and its recorded SHA-256 */
 const unsigned char *tf__errors_json(size_t *n);
 const char *tf__errors_sha256(void);
@@ -123,6 +214,7 @@ typedef struct {
   long long range_start, range_total; /* the answer's Content-Range (bytes S-E/T): S and T; -1 without one */
   char protocol[12];    /* what the answer came on: "h3", "h2" or "http/1.1" (HTTP/1.1 or older); "" from a test's
                            transport */
+  int retry_after;      /* the answer's Retry-After in seconds (the delay form), 0 without one */
 } TfHttpResponse;
 /* A connection kept for several requests to one host, one after another on one thread (the model download):
  * one WinHTTP session and connection, or one curl handle. HTTP/2 is asked for on it (WinHTTP: HTTP/3 too, where
@@ -167,6 +259,11 @@ void tf__http_cancel(volatile int *flag);
  * of the request goes to the place it names. */
 int tf_http(const TfHttpRequest *req, TfHttpResponse *resp);
 void tf_http_response_free(TfHttpResponse *r);
+/* why the thread's last request failed without an answer it took: the kind, and the transport's error name and code
+ * (NULL when none; a token, never a message) */
+enum { TF__FAIL_NETWORK = 0, TF__FAIL_TIMEOUT = 1, TF__FAIL_CANCELLED = 2, TF__FAIL_ANSWER = 3 };
+void tf__http_note(int kind, const char *name, long code);
+int tf__http_failure(const char **name, const char **code);
 /* Tests: the system's transport (WinHTTP, libcurl) whatever transport is set, for a test's transport that
  * answers some requests itself and passes the others on. */
 int tf__http_native(const TfHttpRequest *req, TfHttpResponse *resp);
@@ -223,14 +320,14 @@ int tf_head_from_name(const char *name); /* -1 when unknown */
 /* "all", NULL (the default six) or names separated by commas; 0 and an error for an unknown name */
 unsigned tf__heads_mask(const char *list);
 /* One head's array inside the engine's heads (NULL when absent), and its frame count. */
-const float *tf__heads_array(const ZfTajweedHeads *h, int head, int *frames);
+const float *tf__heads_array(const TfRawHeads *h, int head, int *frames);
 /* keep only the heads in `mask` */
-void tf__heads_select(ZfTajweedHeads *h, unsigned mask);
+void tf__heads_select(TfRawHeads *h, unsigned mask);
 
 /* The Heads object: a view of the engine's heads (a chunk, or heads from anywhere in the tests) or, for a take
  * that has ended, copies it owns. */
 struct TfHeads {
-  ZfTajweedHeads z;
+  TfRawHeads z;
   unsigned mask;          /* the heads it holds */
   const TfModel *m;       /* token names; may be NULL */
   float *own[TF_HEAD_COUNT]; /* copies (a finished take's), else NULL */
@@ -243,21 +340,21 @@ struct TfHeads {
   TfToken *greedy[TF_HEAD_COUNT]; /* built on demand, owned */
   int n_greedy[TF_HEAD_COUNT];
 };
-void tf__heads_view(TfHeads *out, const ZfTajweedHeads *z, unsigned mask, const TfModel *m);
-int tf__heads_own(TfHeads *out, const ZfTajweedHeads *z, unsigned mask, const TfModel *m); /* copies; 0 ok */
+void tf__heads_view(TfHeads *out, const TfRawHeads *z, unsigned mask, const TfModel *m);
+int tf__heads_own(TfHeads *out, const TfRawHeads *z, unsigned mask, const TfModel *m); /* copies; 0 ok */
 void tf__heads_release(TfHeads *h); /* frees what it owns (not the struct) */
 
 /* ---- decoded layer and top-K ---- */
 /* The decoded layer of heads from anywhere (log_probs required; conf optional). k 0 or 2: no ranking beyond the
  * runner-up; 3 to 38: each frame's k best tokens too. top2 may be NULL (the engine's kept top-2 of a take, else
  * computed). Free with tf__decoded_free. */
-TfDecoded *tf__decode(const TfModel *m, const ZfTajweedHeads *heads, const ZfTajweedTop2 *top2, int k);
+TfDecoded *tf__decode(const TfModel *m, const TfRawHeads *heads, const TfTop2 *top2, int k);
 void tf__decoded_free(TfDecoded *d);
 void tf__decoded_mark(TfDecoded *d, int settled, int is_final);
 /* greedy tokens of any ctc head: [frames, 38] log-probs at frame_ms; conf (20 ms logits, n20 of them) only for a
  * 40 ms head. Returns the count and the array (caller frees), or -1. */
 int tf__greedy(const TfModel *m, const float *log_probs, int frames, int frame_ms, const float *conf, int n20,
-               const ZfTajweedTop2 *top2, TfFrame *frames_out, TfToken **out);
+               const TfTop2 *top2, TfFrame *frames_out, TfToken **out);
 
 /* Per frame the k best entries of a token head or a class head: highest value first, equal values by the lower id
  * (a stable argsort). margins[j] = values[j] - the value ranked j + 1, as a double from the float values (also
@@ -270,7 +367,7 @@ typedef struct {
   const float *values;      /* log-probs or probabilities */
   const double *margins;
 } TfTopK;
-TfTopK *tf__topk(const ZfTajweedHeads *heads, int head, int k);            /* heads from anywhere */
+TfTopK *tf__topk(const TfRawHeads *heads, int head, int k);            /* heads from anywhere */
 TfTopK *tf__session_topk(const TfSession *s, int head, int k);             /* a take so far (the engine's kept heads) */
 #define TF_TAKE_MAX_S 1200 /* the most audio one take holds, in seconds at the input rate: then ended(limit) */
 extern int tf__take_max_s; /* TF_TAKE_MAX_S; tests set a few seconds */
@@ -309,8 +406,8 @@ const char *tf__model_default_context(const TfModel *m);
 int tf__model_has_context(const TfModel *m, const char *context);
 /* The engine for a context and an input rate, with its stream: opened on first use, reopened when either differs
  * (never while a Session is open). NULL and an error otherwise. */
-ZfTajweedStream *tf__model_stream(TfModel *m, const char *context, int sample_rate);
-ZfTajweedModel *tf__model_engine(TfModel *m);
+qlc_stream *tf__model_stream(TfModel *m, const char *context, int sample_rate);
+qlc_model *tf__model_engine(TfModel *m);
 /* the one open Session of the Model: set returns -1 when another is open */
 int tf__model_set_session(TfModel *m, TfSession *s);
 void tf__model_clear_session(TfModel *m, TfSession *s);
@@ -320,18 +417,26 @@ double tf__model_load_ms(TfModel *m); /* how long the last engine open took; 0 o
 const TfJson *tf__model_listed(const TfModel *m, const char *path);
 /* the first file with this role (and context, when not NULL): its local path, or NULL */
 const char *tf__model_role_path(const TfModel *m, const char *role, const char *context);
+const char *tf__model_manifest_bytes(const TfModel *m, size_t *n);
+TfPm *tf__model_pm(const TfModel *m);
+void tf__pm_retain(TfPm *p);
+void tf__pm_release(TfPm *p);
+/* the recited index of the build (17.5), handed to the Core when the build has one and it is installed */
+void tf__recited_index(TfClient *c, TfPm *p, const char *build_dir, const char *manifest, size_t n);
 
 /* a clip's samples as floats (16-bit PCM in the folder, verified before it is read); the caller frees. Returns the
  * count, or a negative TfError. */
 int tf__model_clip_samples(const TfModel *m, const char *name, float **out, int *rate);
 /* The reference data of a Model (tf_reference.c): the file's place in the folder and, once opened, the table. */
 struct TfReference {
-  TfModel *m;
-  char path[96];      /* the file's local path in the folder */
-  void *table;        /* the engine's table once opened */
-  int *ids, *word;    /* the last lookup's arrays */
-  int cap;
+  TfModel *m;    /* SDK 4.0: the expected units are read by the Core (qlc_reference_expected, R3) */
+  int **ids, **word, *n, *n_words; /* per ayah of the Quran (6236, in order), made at its first read, kept while the
+                                      Model is open: what tf_reference_units gave stays valid until the Model closes */
 };
+const TfJson *tf__model_role_entry(TfModel *m, const char *role);
+int tf__model_entry_installed(TfModel *m, const TfJson *f);
+qlc_model *tf__model_engine_for_reference(TfModel *m);
+int tf__model_engine_release(TfModel *m);
 void tf__reference_release(TfReference *r);
 
 /* ---- the signed model manifest (tf_model.c; the downloader verifies with the same code) ---- */
@@ -357,6 +462,10 @@ int tf__manifest_accept(const char *bytes, size_t n, const char *want_build, con
 /* 1 when s is a model version: x.y.z, digits only, no leading zeros, at most 4, 4 and 6 digits */
 int tf__is_model_version(const char *s);
 
+/* the take so far, as the Core keeps it (the stream's heads); 0 or -1 */
+int tf__session_take_heads(const TfSession *s, TfRawHeads *out);
+qlc_stream *tf__session_stream(const TfSession *s);
+
 /* ---- the session ---- */
 /* What one take counted, for the telemetry (tf_client.c; SPEC section 6). */
 typedef struct {
@@ -375,6 +484,8 @@ typedef struct {
   long long audio_ms;         /* floor(1000 * input samples / input rate) */
   long long compute_us;       /* compute time of the take's chunks in whole microseconds */
   int speech_frames, silence_frames; /* 40 ms frames of log_probs */
+  int end;                           /* how the take ended (SHARE_ASK_40.md 20.2): 0 normal, 1 interrupted, 2 an error, 3 cancelled */
+  long long hour_ms[24];      /* 4.0 (17.8): ms of speech by the learner's local hour at each chunk */
   int tokens[TF_HEAD_COUNT];  /* greedy tokens per ctc head selected (0 for the others) */
 } TfSessionStats;
 enum { TF_FALLBACK_NONE = 0, TF_FALLBACK_NON_FINITE, TF_FALLBACK_DEADLINE, TF_FALLBACK_MODEL_LOAD, TF_FALLBACK_MEMORY,
@@ -414,20 +525,171 @@ const char *tf__model_context_in_force(TfModel *m, char *out, size_t n);
 int tf__raise(int rc);
 int tf__null_handle(const char *what);
 int tf__last_raised(void);
-ZfTajweedStream *tf__session_engine(const TfSession *s);
+qlc_stream *tf__session_engine(const TfSession *s);
 int tf__ayah_count(int surah); /* ayahs of a surah (1 to 114), 0 otherwise */
 const char *tf__event_name(int type);
 const char *tf__ended_reason_name(int reason);
 int tf__end_on_silence_ok(int ms);
-/* a take's recited report (SPEC 6.3): what was reported last, and whether it has been counted */
+/* the app's judgement of an ayah or a range (17.9), as kept: correct, or incorrect with mistakes and rules */
+typedef struct {
+  int set, correct, mistakes, n_rules;
+  char rules[8][25];
+} TfOutcomeX;
+typedef struct {
+  int ayah;
+  TfOutcomeX o;
+} TfPerAyah;
+/* a take's recited report (SPEC 6.3, with its outcomes 17.9): what was reported last, and whether it has been
+ * counted. 4.0: the report is the fallback, used only for a take the detector counted nothing for (17.1) */
 typedef struct {
   int surah, ayah_from, ayah_to;
   int counted;
+  TfOutcomeX whole;
+  TfPerAyah *per; /* owned */
+  int n_per;
 } TfRecited;
 int tf__recited_ok(int surah, int ayah_from, int ayah_to);
 int tf__recited_report(TfRecited *r, TfClient *c, int state, int surah, int ayah_from, int ayah_to);
 void tf__recited_end(TfRecited *r, TfClient *c, int counts);
 char *tf__client_day_body(TfClient *c); /* today's counts as the delta that would be sent; caller frees */
+
+/* ---- SDK 4.0: the install key store (tf_ikey.c), the Core's platform table (tf_platform.c), the lease (tf_lease.c) ---- */
+typedef struct TfIkey TfIkey;
+enum { TF_IKEY_TPM = 1, TF_IKEY_KSP = 2, TF_IKEY_FILE = 3 };
+TfIkey *tf__ikey_open(const char *storage_dir, int create); /* NULL when the store cannot be used */
+void tf__ikey_close(TfIkey *k);
+int tf__ikey_kind(const TfIkey *k);
+const char *tf__ikey_kind_name(const TfIkey *k); /* "tpm", "software", "file" */
+int tf__ikey_hw(const TfIkey *k);                /* 1 for a TPM key (install_hw) */
+const uint8_t *tf__ikey_spki(const TfIkey *k, int which, size_t *n); /* 0 agreement, 1 signing, 2 pending agreement */
+const char *tf__ikey_cert(const TfIkey *k);
+long long tf__ikey_cert_exp(const TfIkey *k);
+const char *tf__ikey_key_id(const TfIkey *k);   /* the certificate's API key id */
+int tf__ikey_agree(TfIkey *k, int pending, const uint8_t *eph, size_t n, uint8_t z[32]);
+int tf__ikey_sign(TfIkey *k, int pending, const uint8_t *msg, size_t n, uint8_t *sig, size_t *sig_len);
+int tf__ikey_rotate(TfIkey *k);
+int tf__ikey_commit(TfIkey *k, const char *cert);
+void tf__ikey_discard(TfIkey *k);
+int tf__ikey_set_cert(TfIkey *k, const char *cert);
+void tf__ikey_drop_cert(TfIkey *k);
+void tf__ikey_destroy_keys(TfIkey *k); /* tests */
+int tf__ikey_exportable(TfIkey *k);    /* tests */
+void tf__spki_p256(const uint8_t xy[64], uint8_t spki[91]);
+int tf__machine_key(uint8_t out[32]);
+extern const uint8_t *tf__ikey_test_pkcs8;
+extern size_t tf__ikey_test_pkcs8_n;
+extern int tf__ikey_force_kind;
+
+typedef struct TfPlat TfPlat;
+TfPlat *tf__plat_new(const char *storage_dir, TfIkey *ik);
+const qlc_platform *tf__plat_table(TfPlat *p, int pending);
+void tf__plat_set_build(TfPlat *p, const char *build_dir);
+char *tf__plat_path(TfPlat *p, int form, const char *path); /* caller frees; NULL for a path outside the folder */
+uint8_t *tf__plat_state(TfPlat *p, size_t *n);
+void tf__plat_free(TfPlat *p);
+void tf__plat_counter_reset(TfPlat *p);
+extern long long tf__plat_test_wall_ms, tf__plat_test_boot_ms;
+extern const char *tf__plat_test_boot_id;
+extern int tf__plat_test_no_counter;
+
+typedef struct TfPm TfPm;
+TfPm *tf__pm(TfClient *c); /* the Client's Core host, made at first use; NULL and an error when the key store fails */
+qlc_core *tf__pm_core(TfPm *p);
+TfPm *tf__pm_existing(TfClient *c); /* the Core host when the install has keys; NULL when not */
+int tf__pm_lease_expired(int qlc_status, int detail);
+TfIkey *tf__pm_ikey(TfPm *p);
+TfPlat *tf__pm_plat(TfPm *p);
+int tf__pm_base(TfPm *p, const char *build, char *out, size_t cap); /* the lease answer's base for build: 1 when known */
+int tf__pm_error(int qlc_status, int detail); /* a Core status as the catalogue's error */
+int tf__pm_attest(TfClient *c, TfPm *p);
+int tf__pm_lease(TfClient *c, TfPm *p, const char *manifest, size_t mn, const TfJson *m, const char *build);
+/* 18.4.7.1: 1 while the Core's expired lease is in its grace (until: exp + 86400 while a lease is held, else 0) */
+int tf__pm_grace(TfPm *p, long long *until);
+long long tf__pm_next_try(TfPm *p); /* tests: the background refresh's next attempt (unix s), 0 for at the next tick */
+void tf__pm_tick(TfClient *c, const char *build_dir, const char *build);
+int tf__pm_install(TfPm *p, const char *build_dir, const char *manifest, size_t mn, const char *decoded_path);
+qlc_model *tf__pm_open(TfPm *p, const char *build_dir, const char *manifest, size_t mn, const char *context, int threads, int rate, int pin);
+void tf__pm_close(TfPm *p, qlc_model *m);
+int tf__pm_status(TfPm *p, qlc_lease_status *s);
+void tf__pm_lock(TfPm *p);
+void tf__pm_unlock(TfPm *p);
+void tf__pm_client_gone(TfClient *c);
+extern const char *tf__lease_test_base;
+void **tf__client_pm_slot(TfClient *c);
+int tf__client_call_lease(TfClient *c, const char *body, TfHttpResponse *r);
+/* 18.4.7.1: the answer the last request of this thread got (status, 0 for none; the API's refusal: a JSON error
+ * string) and this thread's request count; tf__http_answer_none records a request that never started */
+unsigned tf__http_answer(int *status, int *api_error);
+void tf__http_answer_none(void);
+/* a deadline (tf__now_s) for this thread's API requests, 0 for none: what a model open waits for a lease attempt */
+void tf__client_deadline(double at);
+/* tests: how long a model open past the lease's exp waits for an attempt (18.4.7.1: 10 s), and the minute in which
+ * one attempt's outcome serves the next open of this process (60 s) */
+extern double tf__lease_wait_s, tf__lease_reuse_s;
+void tf__client_set_token(TfClient *c, const char *token, long long expires_in);
+void tf__client_refuse_api(TfClient *c, const char *code);
+void tf__store_tick(TfClient *c);
+void tf_b64url(const uint8_t *in, size_t n, char *out);
+
+/* ---- the recited range (17.1, 17.6) and the app's report with its outcome (17.9) ---- */
+/* what a take's measured or reported range adds to the day (tf_client.c) */
+typedef struct {
+  int source;             /* 1 measured, 2 the app's report, 0 nothing */
+  int recovered;          /* finalised from the journal after a restart */
+  int late;               /* the app's report of a measured take after it ended: its outcomes only */
+  int context;            /* R5: the session context decided the measured range (17.8 recited_takes.context) */
+  int ties;               /* R5: equally good ranges besides the one counted (a refrain tie; 0: none) */
+  int surah, first, last; /* the range counted (never sent: only its counts are) */
+  uint64_t take_id;       /* local only: a take is counted once */
+  const char *day;        /* the take's UTC day (YYYY-MM-DD), NULL for today */
+  const TfRecited *app;   /* 17.9: the app's report with its outcomes, paired with the counted ayahs; may be NULL */
+} TfRecitedCount;
+void tf__client_count_lease(TfClient *c, int outcome);
+void tf__client_session_close(TfClient *c);
+extern int tf__learner_test_kill;
+/* the install's days (tf_learner.c: the Core's journal, qlc_days_*) */
+#define TF_LEARNER_DAYS 40
+typedef struct {
+  char first[11];
+  char active[TF_LEARNER_DAYS][11], local[TF_LEARNER_DAYS][11], sent[10][11];
+  int n_active, n_local, n_sent;
+  char streak_day[10][11];
+  int streak_n[10], n_streaks;
+  char week[6][11];
+  long long week_judged[6], week_correct[6];
+  int n_weeks;
+  char trend_week[11];
+  int session_open;
+  long long session_ms;
+} TfLearner;
+void tf__learner_load(TfClient *c, TfLearner *j);          /* the days from the Core's journal, the open session */
+int tf__learner_save_session(TfClient *c, const TfLearner *j); /* session.json only: the days are the Core's */
+void tf__learner_mark_active(TfClient *c, TfLearner *j, const char *utc, const char *local);
+int tf__learner_facts(const TfLearner *j, const char *day, int learner[5], char gap[8], char streak[8]);
+void tf__learner_mark_sent(TfClient *c, TfLearner *j, const char *day);
+void tf__learner_judged(TfClient *c, TfLearner *j, const char *day, int judged, int correct);
+void tf__learner_trend_sent(TfClient *c, TfLearner *j, const char *week);
+int tf__learner_trend(const TfLearner *j, const char *day, char out[16], char last_week[11]);
+int tf__learner_tenure(const TfLearner *j, const char *day);
+int tf__juz_of(int surah, int ayah);
+long long tf__day_num(const char *day);
+void tf__day_str(long long n, char out[11]);
+void tf__day_monday(const char *day, char out[11]);
+void tf__local_now(char day[11], int *hour);
+extern long long tf__learner_test_tz_s;
+/* the recited range through the Core (tf_recited.c) */
+unsigned tf__recited_flags(TfClient *c);
+int tf__recited_begin(TfClient *c, TfPm *p, uint64_t *id);
+void tf__recited_feed(TfPm *p, const qlc_stream *s);
+void tf__recited_report_pending(TfClient *c, uint64_t id, const TfRecited *r);
+int tf__recited_finish(TfClient *c, TfPm *p, const qlc_stream *s, uint64_t id, const TfRecited *app, qlc_recited_result *out);
+void tf__recited_cancel(TfClient *c, TfPm *p, uint64_t id);
+/* 17.9's arguments, checked (an error and nothing kept when one is wrong) into a report */
+int tf__recited_outcome(TfRecited *r, int surah, int ayah_from, int ayah_to, const TfRecitedOutcome *whole, const TfRecitedAyah *per, int n);
+void tf__recited_clear(TfRecited *r);
+void tf__client_count_take_range(TfClient *c, const TfRecitedCount *r);
+int tf__client_take_counted(TfClient *c, uint64_t take_id); /* 1 when a take id was counted on one of the last 8 days */
+int tf__client_metric_on(const TfClient *c, const char *group); /* flags.metrics.<group> is true */
 
 /* ---- the client ---- */
 /* How the library configures a client; the public TfClientOptions maps onto it. */
@@ -440,8 +702,6 @@ typedef struct {
   const char *cdn_url;        /* default https://cdn.quranlab.ai/models */
   const char *storage_dir;    /* where the SDK keeps its state (config cache, counters, outbox, consent, models) */
   const char *trusted_key_hex;/* config and manifest signing key; NULL = Quran Lab's */
-  int telemetry;              /* 1: anonymous telemetry (deltas of the day's sums); flags.analytics can stop it */
-  int children;               /* the app's audience is children (consent addressed to a guardian) */
   const char *language;       /* copy deck language, BCP 47; NULL = "en" */
   void (*on_consent)(void *user, const TfConsentRequest *request);
   void *user;
@@ -450,7 +710,7 @@ typedef struct {
   void *log_user;
 } TfClientConfig;
 enum { TF_LOG_DEBUG = 0, TF_LOG_INFO = 1, TF_LOG_WARNING = 2, TF_LOG_ERROR = 3 };
-TfClientConfig tf__client_default_config(void); /* telemetry 1 */
+TfClientConfig tf__client_default_config(void); /* anonymous telemetry is always on: only flags.analytics stops it */
 /* The client itself, without the one-per-process rule and without its background thread (the tests drive it). */
 TfClient *tf__client_open(const TfClientConfig *o);
 void tf__client_close(TfClient *c);
@@ -470,6 +730,20 @@ void tf__client_count_recited(TfClient *c, int surah, int ayah_from, int ayah_to
 int tf__client_flush(TfClient *c, int include_today);
 int tf__client_background(TfClient *c);
 int tf__client_report_issue(TfClient *c, const char *kind, const char *code, const char *message);
+/* error reports of the process (tf_report.c): the Client attached at open and detached at close, the signed config in
+ * force (flags.issues), the model in use or being fetched, the app in the foreground, a send point, the 30 s send */
+void tf__rep_attach(TfClient *c, int first_process);
+void tf__rep_detach(TfClient *c);
+void tf__rep_config(TfClient *c);
+void tf__rep_model(const char *version, const char *build);
+void tf__rep_foreground(int fg);
+int tf__rep_send(TfClient *c);
+long long tf__rep_due(void);
+char *tf__rep_body(TfClient *c, const TfRepItem *it);
+char *tf__rep_state_json(void);
+const char *tf__client_ram_tier(void);
+void tf__client_rep_wake(TfClient *c);
+int tf__client_os_major(void);
 const char *tf__client_dir(const TfClient *c);
 const TfClientConfig *tf__client_options(const TfClient *c);
 void tf__client_log(TfClient *c, int level, const char *message);
@@ -546,6 +820,59 @@ int tf__client_flag_int(const TfClient *c, const char *name, int lo, int hi, int
 int tf__client_telemetry_on(const TfClient *c);
 void tf__telemetry_add(TfClient *c, const char *field, long long n);
 extern int tf__client_no_timer; /* tests: no background threads */
+char *tf__share_session_json_test(int rate, int flac); /* tests: a session JSON (tf_share.c) */
+extern uint32_t tf__share_serial; /* tests: the Ogg serial of the next recordings (0: random) */
+
+/* ---- when SDK 4.0 asks a learner to share (tf_share_ask.c; SHARE_ASK_40.md section 20) ---- */
+enum { TF_ASK_UNKNOWN = 0, TF_ASK_GRANTED = 1, TF_ASK_DECLINED = 2, TF_ASK_FINAL = 3 };            /* consent */
+enum { TF_ASK_NONE = 0 }; /* an ask's kind: none, or the public TF_ASK_SHEET and TF_ASK_CARD */
+enum { TF_ASK_EV_LAUNCH = 1, TF_ASK_EV_TAKE_START, TF_ASK_EV_TAKE_END, TF_ASK_EV_ASK_NOW, TF_ASK_EV_SHOWN, TF_ASK_EV_ANSWER,
+       TF_ASK_EV_WITHDRAWN, TF_ASK_EV_SETTING, TF_ASK_EV_UNKNOWN };
+enum { TF_ASK_END_NORMAL = 0, TF_ASK_END_OTHER = 1 };
+enum { TF_ASK_ANSWER_OTHER = 0, TF_ASK_YES, TF_ASK_NOT_NOW, TF_ASK_OPEN };
+typedef struct {
+  int first_min_sessions, first_min_hours, reask_days[2], reask_sessions[2], good_session_min_s, max_asks;
+} TfAskConfig;
+typedef struct {
+  int kind, number, shown; /* kind 0: no ask in hand */
+} TfAskHand;
+typedef struct {           /* this app session's part: in memory only */
+  long long takes, recited_ms;
+  int asked, take_open;
+  TfAskHand ask;
+} TfAskApp;
+typedef struct {
+  int consent;
+  long long asks, sessions, last_ask_session;
+  long long installed_at, last_ask_at, last_ask_day; /* unix ms, unix ms, the calendar day */
+  int has_installed_at, has_last_ask_at, has_last_ask_day;
+  TfAskApp app;
+} TfAskState;
+typedef struct {
+  int type, end, offered, on, answer;
+  long long speech_ms;
+} TfAskEvent;
+void tf__ask_config(const TfJson *raw, TfAskConfig *c);
+long long tf__ask_local_day(long long ms, int tz_min);
+int tf__ask_decide(TfAskState *s, const TfAskEvent *ev, const TfJson *cfg_raw, long long now_ms, int tz_min, const char **why);
+const char *tf__ask_consent_name(int c);
+int tf__ask_consent_of(const char *name);
+void tf__ask_read_field(TfAskState *s, const char *key, const TfJson *v);
+void tf__ask_state_json(const TfAskState *s, TfBuf *b);
+void tf__ask_event_of(const TfJson *e, TfAskEvent *ev);
+/* tf_sharing.c: the events at their hooks (20.10) */
+int tf__sharing_event(TfClient *c, const TfAskEvent *ev, const char **why);
+void tf__sharing_settle_check(TfClient *c);
+void tf__sharing_take_start(TfClient *c);
+void tf__sharing_background(TfClient *c);
+void tf__sharing_foreground(TfClient *c);
+void tf__sharing_session(TfClient *c, int end, long long speech_frames); /* end: 0 normal, 1 interrupted, 2 an error, 3 cancelled */
+int tf__sharing_answer_ask(TfClient *c, int yes);
+int tf__sharing_open(TfClient *c);
+int tf__sharing_shown(TfClient *c);
+extern long long tf__ask_now_ms; /* tests: the wall clock of the ask (0: the system's) */
+extern int tf__ask_tz_min;       /* tests: its UTC offset in minutes (-100000: the device's) */
+extern const char *const *tf__sharing_test_card; /* tests: card strings (line, open, not now) in place of the deck's; {NULL}: none */
 extern long long tf__now_override; /* tests: a fixed clock (unix seconds), 0 for the system's */
 
 /* ---- the model downloader (tf_download.c) ---- */
@@ -570,6 +897,15 @@ typedef struct {
   void *user;
   volatile int *cancel;       /* may be NULL: tf__http_cancel(cancel) from another thread ends the request in flight
                                  and the pause before a resume, and the download returns TF_ERR_DOWNLOAD_FAILED */
+  /* SDK 4.0: after the manifest is accepted and before any file (the lease); 0 or an error that ends the download.
+   * It writes the model folder the lease answer named (base, ending in '/'): the files are read only from
+   * <base><path>, and with none no file is downloaded. Without this hook (the downloader's own tests) the files come
+   * from cdn_url's {base}/{repo}/{build}/{folder}/{path}. */
+  int (*after_manifest)(void *user, const char *manifest, size_t n, const TfJson *m, char *base, size_t base_cap);
+  /* SDK 4.0: a qle1 container is downloaded and verified: the Core installs it (CDN form to device form) */
+  int (*install)(void *user, const char *decoded_path, const char *manifest, size_t n);
+  int want_recited;           /* the recited index (role recited, 17.5) is fetched too */
+  void *hook_user;            /* after_manifest's and install's */
 } TfDownload;
 TfDownload tf__download_defaults(void);
 /* A model request ends when no byte of its answer arrives for this long (30 s). It is not a limit on the whole
@@ -604,7 +940,7 @@ int tf__store_current(TfClient *c, char version[24], char build[41]);
 typedef struct TfShareSession TfShareSession;
 #define TF_SHARING_BITRATE_DEFAULT 192000 /* bit/s: the ladder's top and start */
 #define TF_SHARING_JOIN_MS_DEFAULT 3000   /* the join window without flags.share_join_ms */
-#define TF_SHARING_JOIN_MS_MAX 10000      /* the longest window a config may set */
+#define TF_SHARING_JOIN_MS_MAX 60000      /* the longest window a config may set (SDK 4.0, section 23; 3.x: 10000) */
 #define TF_SHARING_RECORDING_MAX_S 1200   /* the most audio one recording holds: it closes there, also inside a take */
 #define TF_SHARING_RING_MS 1000           /* the feed's ring: the last second fed while no take runs, in memory only */
 #define TF_SHARING_TAIL_MS 500            /* fed audio recorded after a take ends, at most */

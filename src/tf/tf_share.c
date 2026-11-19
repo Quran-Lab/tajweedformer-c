@@ -3,6 +3,15 @@
  * 10, 20, 40, then 60 s at page boundaries, and uploaded in the background with presigned PUTs straight to R2, the
  * same wire as the Swift reference (Cloud/Contributions.swift, Cloud/Outbox.swift) and the web SDK (web/sharing).
  *
+ * SDK 4.0 (SHARING_40.md section 19): a recording captured at any rate but 48000 Hz, while the signed config's
+ * flags.share_flac is true, is kept lossless instead: one Ogg FLAC stream at the capture rate, 16-bit, no resampling
+ * (tf_flac.c: the frame, the pages, the segment plan with the one-frame hold). The form is decided when the recording
+ * opens and holds for every take that joins it. Its session JSON says codec flac, sample_rate the capture rate and
+ * bits_per_sample 16; capture.json carries "codec" and "rate" (the duration of a recovered session is its last
+ * granule over the rate); its segment markers carry bitrate 0 (the ladder is the Opus encoder's). The segment files
+ * keep their local names (seg-NNNNN.opus) whatever the codec: the server's keys end .oga for a FLAC session and the
+ * PUT's content type is audio/ogg for both. No device_model on Windows and Linux (19.2).
+ *
  * On disk, one folder per session under <storage>/outbox/<id>/:
  *   session.json   the POST /v1/uploads body (closed schema, sorted keys, contributor_key and recovery_hash)
  *   capture.json   written by the capture: segments closed, ended, completed, duration, created (unix s), pre_skip
@@ -20,7 +29,8 @@
  * tf__sharing_session_begin .. finish (one take of a TfStream); the RECORDING (the capture: its Ogg stream, outbox
  * folder and session id) is decoupled from it:
  * - When a take ends while sharing is on, its recording stays open for the JOIN WINDOW: the signed config's
- *   flags.share_join_ms (a whole number 0 to 10000; absent or anything else 3000; 0 never joins).
+ *   flags.share_join_ms (a whole number 0 to 60000 from SDK 4.0, 0 to 10000 before it; absent or anything else 3000;
+ *   0 never joins; contract sdk_4.0.0/SHARE_JOIN_40.md, section 23).
  * - A take that starts within the window (wall ms since the previous take with audio ended <= the window) with the
  *   same input rate, contributor, consent version and model revision continues the same stream: no new headers,
  *   the resampler and the encoder keep their state (a partial Opus frame is completed by the next take's first
@@ -41,7 +51,7 @@
  * - `completed` is the last take's that had audio; the 2 s minimum of a cancelled session applies to the
  *   recording's total audio; the session JSON is written once, at the first take.
  * - The takes: [{"start_ms","gap_ms"}], start_ms the stream position of the take's first sample (floor(1000 x
- *   input samples before it / input rate)), gap_ms the wall gap rounded to the nearest 100 (0 to 10000), the first
+ *   input samples before it / input rate)), gap_ms the wall gap rounded to the nearest 100 (0 to 60000), the first
  *   {0, 0}. Kept in takes.json from the second take on (rewritten atomically as a take joins, so recovery keeps
  *   it) and sent once the recording is closed and all its segments are uploaded: POST /v1/uploads/{id}/takes. A
  *   recording of one take has no list. The call never touches the session's uploaded state or the ladder.
@@ -85,6 +95,7 @@
 #include <unistd.h>
 #endif
 
+#include "tf_flac.h"
 #include "tf_internal.h"
 #include "tf_ogg.h"
 #include "tf_share.h"
@@ -117,7 +128,7 @@ void tf__share_window_check(TfClient *c);
 #define MIN_PARTIAL_S 2.0
 /* back-to-back takes (2.0.3; the same numbers in every SDK) */
 #define JOIN_MS_DEFAULT TF_SHARING_JOIN_MS_DEFAULT /* 3000: the join window when the signed config sets none */
-#define JOIN_MS_MAX TF_SHARING_JOIN_MS_MAX         /* 10000: the longest window, and the largest gap recorded */
+#define JOIN_MS_MAX TF_SHARING_JOIN_MS_MAX         /* 60000: the longest window, and the largest gap recorded */
 #define REC_CAP_MS (TF_SHARING_RECORDING_MAX_S * 1000LL) /* 20 minutes: such a recording takes no further take */
 #define MAX_TAKES 256                  /* takes per recording (the take list call takes no more) */
 #define HOLD_MS TF_SHARING_HOLD_MS     /* with this little room under the cap a joining take's audio is held */
@@ -393,13 +404,22 @@ static int marker_read(const Share *s, const char *id, int n, int *bitrate, long
   tf_json_free(j);
   return ok ? 0 : -1;
 }
-/* seconds of segment n: (granule_n - granule_{n-1}) / 48000, segment 1 from 0; the plan's length when a marker
- * cannot be read */
+/* a session's granule rate: the capture rate of a FLAC session (capture.json's codec and rate), else Opus's 48000 */
+static int granule_rate(const Share *s, const char *id) {
+  TfJson *cap = read_json(s, id, "capture.json");
+  const char *codec = tf_json_str(tf_json_get(cap, "codec"));
+  const TfJson *r = tf_json_get(cap, "rate");
+  const int rate = codec && !strcmp(codec, "flac") && tf_json_is_int(r) && r->num >= 8000 && r->num <= 192000 ? (int)r->num : 48000;
+  tf_json_free(cap);
+  return rate;
+}
+/* seconds of segment n: (granule_n - granule_{n-1}) / the granule rate, segment 1 from 0; the plan's length when a
+ * marker cannot be read */
 static double segment_seconds(const Share *s, const char *id, int n) {
   long long g1 = -1, g0 = 0;
   marker_read(s, id, n, NULL, &g1);
   if (n > 1) marker_read(s, id, n - 1, NULL, &g0);
-  if (g1 >= 0 && g0 >= 0 && g1 >= g0) return (double)(g1 - g0) / 48000.0;
+  if (g1 >= 0 && g0 >= 0 && g1 >= g0) return (double)(g1 - g0) / granule_rate(s, id);
   return (double)(tf_ogg_segment_start(n + 1) - tf_ogg_segment_start(n)) * 960.0 / 48000.0;
 }
 static int uploaded_list_has(const TfJson *item, int n) {
@@ -443,6 +463,8 @@ struct Rec {
   TfClient *c;
   char id[33];
   int input_rate, resample;
+  int flac;             /* SDK 4.0: Ogg FLAC at the capture rate (19.3); else Opus */
+  TfFlacMux fm;
   TfResampler rs;
   TfEncoder enc;
   TfOgg ogg;
@@ -491,20 +513,32 @@ struct TfShareSession {
 
 static long long ms_of(long long samples, int rate) { return rate > 0 ? samples * 1000 / rate : 0; }
 static long long rec_ms(const Rec *o) { return ms_of(o->samples, o->input_rate); }
-/* a wall gap in ms, rounded to the nearest 100 (half up) within 0 to 10000 (a clock set back gives 0) */
+/* a wall gap in ms, rounded to the nearest 100 (half up) within 0 to 60000 (a clock set back gives 0) */
 static int round_gap(long long gap) {
   if (gap < 0) gap = 0;
   if (gap > JOIN_MS_MAX) gap = JOIN_MS_MAX;
   return (int)((gap + 50) / 100 * 100);
 }
-/* the join window in force: flags.share_join_ms, a whole number 0 to 10000, else 3000 */
+/* the join window in force: flags.share_join_ms, a whole number 0 to 60000, else 3000 */
 static int join_window(const TfClient *c) { return tf__client_flag_int(c, "share_join_ms", 0, JOIN_MS_MAX, JOIN_MS_DEFAULT); }
 
 static void capture_save(Rec *x, int ended, int completed) {
-  char t[320];
-  snprintf(t, sizeof t, "{\"v\":1,\"created\":%lld,\"closed\":%d,\"ended\":%s,\"completed\":%s,\"duration_ms\":%lld,\"pre_skip\":%d,\"samples\":%lld}",
-           x->created, x->closed, ended ? "true" : "false", completed ? "true" : "false", rec_ms(x), x->enc.pre_skip, x->samples);
+  char t[360], codec[48] = "";
+  if (x->flac) snprintf(codec, sizeof codec, ",\"codec\":\"flac\",\"rate\":%d", x->input_rate);
+  snprintf(t, sizeof t, "{\"v\":1,\"created\":%lld,\"closed\":%d,\"ended\":%s,\"completed\":%s,\"duration_ms\":%lld,\"pre_skip\":%d,\"samples\":%lld%s}",
+           x->created, x->closed, ended ? "true" : "false", completed ? "true" : "false", rec_ms(x), x->flac ? 0 : x->enc.pre_skip, x->samples,
+           codec);
   write_text(sh(x->c), x->id, "capture.json", t);
+}
+/* a FLAC segment closed (its last page written, tf_flac.c): its marker gets the granule of that page */
+static void on_flac_segment(void *user, int n, long long granule) {
+  Rec *x = (Rec *)user;
+  Share *s = sh(x->c);
+  marker_write(s, x->id, n, 0, granule);
+  x->closed = n;
+  capture_save(x, 0, 0);
+  ladder_closed(s, backlog_s(s));
+  wake(s);
 }
 /* a segment closed: its marker gets the granule of its last page, capture.json the count, and the ladder hears
  * of the backlog (this segment included) */
@@ -742,7 +776,7 @@ static void seq_next(TfClient *c, long long start, long long *take_seq, long lon
 /* ---- a recording's life ---- */
 /* the session JSON, sorted keys (as the Swift and web SDKs write it) */
 static char *session_json(const char *contributor, const char *key, const char *rhash, const char *cv, const char *ch, int input_rate,
-                          const char *route, const char *revision, long long take_seq, long long gap_prev) {
+                          const char *route, const char *revision, long long take_seq, long long gap_prev, int flac) {
   TfBuf b;
   tf_buf_init(&b);
   char day[16];
@@ -754,11 +788,13 @@ static char *session_json(const char *contributor, const char *key, const char *
   gmtime_r(&t, &g);
 #endif
   strftime(day, sizeof day, "%Y-%m-%d", &g);
-  tf_buf_puts(&b, "{\"audio\":{\"channels\":1,\"codec\":\"opus\",\"container\":\"ogg\"");
+  /* 19.5: a FLAC session at its capture rate, 16-bit; an Opus session coded at 48000 */
+  if (flac) tf_buf_puts(&b, "{\"audio\":{\"bits_per_sample\":16,\"channels\":1,\"codec\":\"flac\",\"container\":\"ogg\"");
+  else tf_buf_puts(&b, "{\"audio\":{\"channels\":1,\"codec\":\"opus\",\"container\":\"ogg\"");
   if (input_rate >= 8000 && input_rate <= 192000) tf_buf_printf(&b, ",\"input_sample_rate\":%d", input_rate);
   tf_buf_puts(&b, ",\"input_route\":");
   tf_buf_json_str(&b, route);
-  tf_buf_puts(&b, ",\"sample_rate\":48000}");
+  tf_buf_printf(&b, ",\"sample_rate\":%d}", flac ? input_rate : 48000);
   /* the version the learner agreed to; with the app's own wording also the SHA-256 of that text (sorted keys:
    * consent_text_sha256 before consent_version). Without own wording the field is absent: the 2.0.0 schema is
    * closed. */
@@ -794,6 +830,10 @@ static char *session_json(const char *contributor, const char *key, const char *
   tf_buf_printf(&b, ",\"os_major\":%d,\"recovery_hash\":\"%s\",\"take_seq\":%lld}", tf__client_os_major(), rhash, take_seq);
   return tf_buf_take(&b);
 }
+/* tests: the session JSON of a recording at `rate` (flac 1: the lossless form), with stand-in identifiers */
+char *tf__share_session_json_test(int rate, int flac) {
+  return session_json("0123456789abcdef0123456789abcdef", "AAAA", "00", "share-2026-11-09", "", rate, "built_in", "4.1.0", 1, -1, flac);
+}
 
 static const char *const kRoutes[] = {"built_in", "wired", "usb", "bluetooth", "car", "continuity", "other", "unknown", NULL};
 
@@ -809,14 +849,18 @@ static void rec_release(Share *s, Rec *o) {
     o->take = NULL;
   }
   if (o->resample) tf_rs_free(&o->rs);
-  tf_enc_free(&o->enc);
+  if (!o->flac) tf_enc_free(&o->enc);
   set_active(s, o->id, 0);
   wake(s);
   free(o);
 }
 /* nothing of the recording is kept: sharing went off, what was shared was deleted, or a write failed */
+static void rec_abandon(Rec *o) {
+  if (o->flac) tf_flac_abandon(&o->fm);
+  else tf_ogg_abandon(&o->ogg);
+}
 static void rec_drop(Share *s, Rec *o) {
-  tf_ogg_abandon(&o->ogg);
+  rec_abandon(o);
   remove_session(s, o->id);
   rec_release(s, o);
 }
@@ -829,7 +873,9 @@ static int rec_close(Share *s, Rec *o) {
   const int keep = o->opened && !o->failed && tf__client_sharing_state(o->c) && dur > 0 &&
                    (o->completed || dur >= MIN_PARTIAL_S || o->closed > 0);
   int rc = keep ? 0 : -1;
-  if (keep) {
+  if (keep && o->flac) {
+    rc = tf_flac_finish(&o->fm); /* the samples left over as the last frame, and the end-of-stream page */
+  } else if (keep) {
     rc = o->resample ? tf_rs_flush(&o->rs, put_samples, o) : 0;
     if (!rc) rc = tf_enc_flush(&o->enc, put_packet, o);
     if (!rc) rc = tf_ogg_finish(&o->ogg, tf_enc_final_granule(&o->enc));
@@ -838,7 +884,7 @@ static int rec_close(Share *s, Rec *o) {
     capture_save(o, 1, o->completed);
     ms = (int)(dur * 1000 + 0.5);
   } else {
-    tf_ogg_abandon(&o->ogg);
+    rec_abandon(o);
     remove_session(s, o->id);
   }
   rec_release(s, o);
@@ -846,7 +892,7 @@ static int rec_close(Share *s, Rec *o) {
 }
 /* tests: the process "dies" (the files stay as they are, nothing is finished) */
 static void rec_crash(Share *s, Rec *o) {
-  tf_ogg_abandon(&o->ogg);
+  rec_abandon(o);
   rec_release(s, o);
 }
 
@@ -865,7 +911,9 @@ static Rec *rec_open(TfClient *c, Share *s, int rate, const char *route, const c
   tf_hex_encode(r, 16, x->id);
   x->c = c;
   x->input_rate = rate;
-  x->resample = rate != 48000;
+  /* 19.3: lossless at the capture rate when it is not 48000 and the signed config's flags.share_flac is true */
+  x->flac = rate != 48000 && tf__client_flag(c, "share_flac", 0);
+  x->resample = !x->flac && rate != 48000;
   x->created = now_s();
   snprintf(x->contributor, sizeof x->contributor, "%s", contributor);
   snprintf(x->consent_version, sizeof x->consent_version, "%s", cv);
@@ -884,7 +932,7 @@ static Rec *rec_open(TfClient *c, Share *s, int rate, const char *route, const c
   char *dir = sess_path(s, x->id, NULL);
   long long take_seq, gap_prev;
   seq_next(c, start_wall, &take_seq, &gap_prev);
-  char *body = session_json(contributor, key, rhash, cv, ch, rate, route, revision, take_seq, gap_prev);
+  char *body = session_json(contributor, key, rhash, cv, ch, rate, route, revision, take_seq, gap_prev, x->flac);
   if (!dir || !body || tf_mkdirs(dir) || write_text(s, x->id, "stamp", stamp) || write_text(s, x->id, "session.json", body)) {
     free(dir);
     free(body);
@@ -894,14 +942,32 @@ static Rec *rec_open(TfClient *c, Share *s, int rate, const char *route, const c
   }
   free(body);
   set_active(s, x->id, 1);
+  uint32_t serial;
+  tf_random_bytes((uint8_t *)&serial, sizeof serial);
+  if (tf__share_serial) serial = tf__share_serial;
+  if (x->flac) {
+    /* the lossless form: the two header pages now, the frames as the audio comes (tf_flac.c) */
+    char vendor[64];
+    snprintf(vendor, sizeof vendor, "QuranLab SDK %s", TF_SDK_VERSION);
+    x->fm.on_segment = on_flac_segment;
+    x->fm.user = x;
+    capture_save(x, 0, 0);
+    marker_write(s, x->id, 1, 0, -1);
+    const int bad = tf_flac_open(&x->fm, dir, ".opus", serial, rate, vendor);
+    free(dir);
+    if (bad) {
+      rec_drop(s, x);
+      tf__fail(TF_ERR_ENGINE_FAILED, "the FLAC writer could not start");
+      return NULL;
+    }
+    x->opened = 1;
+    return x;
+  }
   /* segment 1 opens with the rung in force when the capture starts */
   const int bitrate = ladder_bitrate(s);
   x->seg_bitrate = bitrate;
   x->next_seg = 2;
   x->next_start = tf_ogg_segment_start(2);
-  uint32_t serial;
-  tf_random_bytes((uint8_t *)&serial, sizeof serial);
-  if (tf__share_serial) serial = tf__share_serial;
   char vendor[96];
   snprintf(vendor, sizeof vendor, "QuranLab SDK %s %s", TF_SDK_VERSION, tf_opus_version());
   int bad = (x->resample && tf_rs_init(&x->rs, rate)) || tf_enc_init(&x->enc, bitrate);
@@ -926,6 +992,22 @@ static Rec *rec_open(TfClient *c, Share *s, int rate, const char *route, const c
 
 /* audio into the recording's stream; a failed write ends the recording for good (it is deleted when it closes) */
 static int rec_encode(Rec *o, const float *pcm, long long n) {
+  if (o->flac) {
+    /* 19.3: the samples as 16-bit integers, as they were captured (no resampling, no gain, no dither) */
+    int16_t q[4096];
+    while (n > 0) {
+      const int k = n > 4096 ? 4096 : (int)n;
+      for (int i = 0; i < k; ++i) q[i] = tf_pcm16(pcm[i]);
+      o->samples += k;
+      if (tf_flac_push(&o->fm, q, k)) {
+        o->failed = 1;
+        return -1;
+      }
+      pcm += k;
+      n -= k;
+    }
+    return 0;
+  }
   while (n > 0) {
     const int k = n > 48000 ? 48000 : (int)n;
     o->samples += k;
@@ -1435,14 +1517,21 @@ static void recover(Share *s, const char *id, const TfJson *cap) {
     remove_session(s, id);
     return;
   }
-  /* what was kept: up to the last whole page. The take list (2.0.3) keeps the takes that begin before it. */
+  /* what was kept: up to the last whole page. The take list (2.0.3) keeps the takes that begin before it. A FLAC
+   * session (19.4) has no pre-skip and its granule counts samples at the capture rate; its pages after the last whole
+   * one are lost with the frame the muxer held, and every page kept holds a whole frame of 4096 samples. */
   if (last_granule < 0) marker_read(s, id, kept, NULL, &last_granule);
-  const long long duration_ms = last_granule > pre_skip ? (last_granule - pre_skip) / 48 : 0;
+  const char *codec = tf_json_str(tf_json_get(cap, "codec"));
+  const int flac = codec && !strcmp(codec, "flac");
+  const int rate = flac ? granule_rate(s, id) : 48000;
+  const long long skip = flac ? 0 : pre_skip;
+  const long long duration_ms = last_granule > skip ? (last_granule - skip) * 1000 / rate : 0;
   takes_trim(s, id, duration_ms);
-  char t[320];
+  char t[360], fl[48] = "";
+  if (flac) snprintf(fl, sizeof fl, ",\"codec\":\"flac\",\"rate\":%d", rate);
   snprintf(t, sizeof t,
-           "{\"v\":1,\"created\":%lld,\"closed\":%d,\"ended\":true,\"completed\":false,\"duration_ms\":%lld,\"pre_skip\":%lld,\"recovered\":true}",
-           created, kept, duration_ms, pre_skip);
+           "{\"v\":1,\"created\":%lld,\"closed\":%d,\"ended\":true,\"completed\":false,\"duration_ms\":%lld,\"pre_skip\":%lld,\"recovered\":true%s}",
+           created, kept, duration_ms, skip, fl);
   write_text(s, id, "capture.json", t);
 }
 
@@ -1664,6 +1753,14 @@ static void retry(Item *it, const char *why, int immediately, int lng) {
 
 /* outcome of a Worker answer: 1 URLs taken; 0 retry scheduled / paused; -1 the session is gone (deleted) */
 enum { ANS_URLS = 1, ANS_WAIT = 0, ANS_GONE = -1, ANS_OFFLINE = -2 };
+/* 24.1: a shared recording the server refused for good will not be uploaded: a silent report (sharing, the answer's
+ * reason, status and error) */
+static int gone(const TfHttpResponse *r) {
+  char code[33];
+  const char *reason = tf__rep_answer_reason(r->status, r->body, r->body_n, code);
+  tf__rep_silent("sharing", reason, r->status, NULL, code);
+  return ANS_GONE;
+}
 static int answer(TfClient *c, Share *s, const char *id, Item *it, int call_rc, TfHttpResponse *r) {
   if (call_rc) {
     /* no connection or a timeout: the bitrate steps down (not when the client stopped its calls or has no key) */
@@ -1707,7 +1804,7 @@ static int answer(TfClient *c, Share *s, const char *id, Item *it, int call_rc, 
       remove_session(s, id);
       tf_mutex_unlock(&s->m);
     }
-    return ANS_GONE;
+    return gone(r);
   }
   if (!strcmp(code, "volume_limit") || !strcmp(code, "capped_limit")) {
     snprintf(it->error, sizeof it->error, "%.120s: retry tomorrow", why);
@@ -1716,18 +1813,18 @@ static int answer(TfClient *c, Share *s, const char *id, Item *it, int call_rc, 
   }
   if (!strcmp(code, "segment_cap")) {
     live_remove(c, s, id); /* the capped tier's last allowed segment went: what arrived is valid audio */
-    return ANS_GONE;
+    return gone(r);
   }
   if (r->status == 404 || r->status == 410) {
     live_remove(c, s, id);
-    return ANS_GONE;
+    return gone(r);
   }
   if (r->status == 401) retry(it, why, it->attempts < 3, 0);
   else if (r->status >= 500 || r->status == 408 || r->status == 425 || r->status == 429) retry(it, why, 0, 0);
   else if (!strcmp(code, "contributions_disabled") || !strcmp(code, "attestation_required")) retry(it, why, 0, 1);
   else {
     live_remove(c, s, id); /* a refused body (an SDK bug) is never retried */
-    return ANS_GONE;
+    return gone(r);
   }
   return ANS_WAIT;
 }

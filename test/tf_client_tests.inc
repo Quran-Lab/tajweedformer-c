@@ -9,6 +9,29 @@ typedef struct {
   char last_path[256], last_inm[128], config_path[256];
   char *bodies[16]; /* request bodies seen, by route */
 } Replay;
+/* SDK 4.0 (SHARE_ASK_40.md 20): a good moment as an app reaches one: a new app session a month after the last (past
+ * every interval of 20.1), three completed takes of 20 s of speech each (a minute in this app session), and the 3 s
+ * settle; an ask due then is handed to the app (on_consent, or pendingAsk). The ask's own clock, tf__ask_now_ms. */
+static long long g_moment = 1800000000000LL;
+static void good_moment(TfClient *c) {
+  g_moment += 31LL * 86400000;
+  tf__ask_now_ms = g_moment;
+  tf__ask_tz_min = 0;
+  TfAskEvent ev;
+  memset(&ev, 0, sizeof ev);
+  ev.type = TF_ASK_EV_LAUNCH;
+  tf__sharing_event(c, &ev, NULL);
+  for (int k = 0; k < 3; ++k) {
+    TfSessionStats ss;
+    memset(&ss, 0, sizeof ss);
+    ss.feedback_shown = 1;
+    ss.speech_frames = 500;
+    tf__client_session_finished(c, &ss);
+  }
+  tf__ask_now_ms += 3000;
+  tf__sharing_settle_check(c);
+}
+
 static Replay g_rp;
 static const TfJson *exchange(const char *name) {
   const TfJson *ex = tf_json_get(g_rp.fx, "exchanges");
@@ -22,6 +45,12 @@ static int route_of(const char *path) {
     if (!strncmp(path, r[i], strlen(r[i]))) return i;
   return -1;
 }
+static int memmem_s(const char *b, size_t n, const char *needle) {
+  const size_t k = strlen(needle);
+  for (size_t i = 0; i + k <= n; ++i)
+    if (!memcmp(b + i, needle, k)) return 1;
+  return 0;
+}
 static int replay(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
   (void)u;
   const char *path = strstr(q->url, "/v1/");
@@ -32,10 +61,12 @@ static int replay(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
   const int rt = path ? route_of(path) : -1;
   if (rt == 2) snprintf(g_rp.config_path, sizeof g_rp.config_path, "%s", path);
   if (rt >= 0 && q->body) {
-    free(g_rp.bodies[rt]);
-    g_rp.bodies[rt] = (char *)malloc(q->body_n + 1);
-    memcpy(g_rp.bodies[rt], q->body, q->body_n);
-    g_rp.bodies[rt][q->body_n] = 0;
+    /* SDK 4.0 error reports (kind "error", ERRORS_40.md 24) go to the issues route too: kept apart (slot 5) */
+    const int slot = rt == 4 && memmem_s((const char *)q->body, q->body_n, "\"kind\":\"error\"") ? 5 : rt;
+    free(g_rp.bodies[slot]);
+    g_rp.bodies[slot] = (char *)malloc(q->body_n + 1);
+    memcpy(g_rp.bodies[slot], q->body, q->body_n);
+    g_rp.bodies[slot][q->body_n] = 0;
   }
   const char *name = rt == 0   ? "attest unattested (native linux)"
                      : rt == 1 ? "register (linux)"
@@ -58,11 +89,20 @@ static int replay(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
   if ((v = tf_json_str(tf_json_get(hd, "etag")))) snprintf(r->etag, sizeof r->etag, "%s", v);
   return 0;
 }
-/* every key of `got` must be a key of `want`; `exact`: and every key of `want` in `got` */
+/* the fields SDK 4.0 adds to an events body (SDK_32_CONTRACT_DRAFT.md 17.1, 17.8, 17.9): not in the 3.x recording */
+static int field40(const char *k) {
+  static const char *const f[] = {"app_ayahs", "app_surah_ayahs", "juz_ayahs", "hour_speech_s", "take_s", "session_s", "learner", "learner_gap", "streak",
+                                  "repeat_ayahs", "recited_takes", "lease", "judged", "judged_surah_ayahs", "correct_surah_ayahs", "judged_tenure", "trend"};
+  for (size_t i = 0; i < sizeof f / sizeof f[0]; ++i)
+    if (!strcmp(k, f[i])) return 1;
+  return 0;
+}
+/* every key of `got` must be a key of `want` (or one 4.0 adds); `exact`: and every key of `want` in `got` */
 static void keys_within(const TfJson *got, const TfJson *want, const char *at, int exact) {
   CHECK(got && got->type == TJ_OBJ, "%s: no body", at);
   if (!got || got->type != TJ_OBJ) return;
-  for (int i = 0; i < got->n; ++i) CHECK(tf_json_get(want, got->kids[i].key) != NULL, "%s.%s is not in the recorded schema", at, got->kids[i].key);
+  for (int i = 0; i < got->n; ++i)
+    CHECK(tf_json_get(want, got->kids[i].key) != NULL || field40(got->kids[i].key), "%s.%s is not in the recorded schema", at, got->kids[i].key);
   if (exact)
     for (int i = 0; want && i < want->n; ++i) CHECK(tf_json_get(got, want->kids[i].key) != NULL, "%s.%s missing", at, want->kids[i].key);
 }
@@ -192,13 +232,27 @@ static int client_tests(const char *fx_path, const char *dir) {
   CHECK(tf_json_str(tf_json_get(ev, "product")) && !strcmp(tf_json_get(ev, "product")->str, "native"), "product native");
   keys_within(is, tf_json_get(tf_json_get(exchange("issue (linux)"), "request"), "body"), "issue", 0);
   CHECK(is && !tf_json_get(is, "message"), "an issue carried free text");
+  /* 4.0 (ERRORS_40.md 24.1): the config that did not verify is a silent error report at this send point, code none,
+   * the stage of its cause; no message, frames or detail */
+  {
+    TfJson *er = parse_or_null(g_rp.bodies[5]);
+    const TfJson *eo = tf_json_get(er, "error");
+    CHECK(er && !strcmp(tf_json_str(tf_json_get(er, "kind")) ? tf_json_get(er, "kind")->str : "", "error") &&
+              !strcmp(tf_json_str(tf_json_get(er, "code")) ? tf_json_get(er, "code")->str : "", "none") && !tf_json_get(er, "message") &&
+              !tf_json_get(er, "frames") && !tf_json_get(er, "detail"),
+          "error report: %s", g_rp.bodies[5] ? g_rp.bodies[5] : "none sent");
+    CHECK(eo && tf_json_str(tf_json_get(eo, "stage")) && !strcmp(tf_json_get(eo, "stage")->str, "config") && tf_json_str(tf_json_get(eo, "reason")) &&
+              !strcmp(tf_json_get(eo, "reason")->str, "signature"),
+          "error report: the config's signature (%s)", g_rp.bodies[5] ? g_rp.bodies[5] : "none");
+    tf_json_free(er);
+  }
   tf_json_free(ev);
   tf_json_free(is);
   tf__client_close(c);
   printf("client replay (the portal team fixtures, local key id %s): %s\n", tf_json_str(tf_json_get(g_rp.fx, "local_key_id")), fails ? "FAIL" : "ok");
 
-  /* the sharing state machine: never before a session with feedback; the first ask and two re-asks, 7 sessions apart,
-   * then never again */
+  /* the sharing state machine, SDK 4.0 (SHARE_ASK_40.md 20; share_ask.json replays every rule in tf40_tests): an
+   * ask only at a good moment, offered only by the config; the first ask and two re-asks, then never again */
   tf_http_set_transport(NULL, NULL);
   tf__now_override = 0;
   char sdir[1024];
@@ -220,10 +274,7 @@ static int client_tests(const char *fx_path, const char *dir) {
       seed_config(d0, cases[k].flags);
       so.storage_dir = d0;
       TfClient *oc = tf__client_open(&so);
-      TfSessionStats ss;
-      memset(&ss, 0, sizeof ss);
-      ss.feedback_shown = 1;
-      tf__client_session_finished(oc, &ss);
+      if (oc) good_moment(oc);
       asked = oc && strstr(tf__client_sharing_status_json(oc), "\"pendingAsk\":true") != NULL;
       CHECK(asked == cases[k].want, "%s: %s", cases[k].what, oc ? tf__client_sharing_status_json(oc) : "no client");
       /* offered is never consent: not sharing until the learner answers */
@@ -236,17 +287,15 @@ static int client_tests(const char *fx_path, const char *dir) {
   TfClient *sc = tf__client_open(&so);
   int asks_at[8], na = 0;
   for (int i = 1; i <= 40 && sc; ++i) {
-    TfSessionStats ss;
-    memset(&ss, 0, sizeof ss);
-    ss.feedback_shown = i != 1;
-    tf__client_session_finished(sc, &ss);
+    good_moment(sc); /* three completed takes each: asks at moments 1, 4 (7 sessions later) and 8 (10 later) */
     if (strstr(tf__client_sharing_status_json(sc), "\"pendingAsk\":true")) {
       if (na < 8) asks_at[na] = i;
       na++;
-      tf__client_sharing_answer(sc, 0);
+      tf_sharing_shown(sc);
+      tf_sharing_answer(sc, 0);
     }
   }
-  CHECK(na == 3 && asks_at[0] == 2 && asks_at[1] == 9 && asks_at[2] == 16, "asks: %d, at %d %d %d", na, na > 0 ? asks_at[0] : -1,
+  CHECK(na == 3 && asks_at[0] == 1 && asks_at[1] == 4 && asks_at[2] == 8, "asks: %d, at %d %d %d", na, na > 0 ? asks_at[0] : -1,
         na > 1 ? asks_at[1] : -1, na > 2 ? asks_at[2] : -1);
   CHECK(sc && strstr(tf__client_sharing_status_json(sc), "\"consent\":\"final\""), "final after the third Not now");
   /* desktop uploads at the capped tier when the config names no tier for it */
@@ -255,12 +304,7 @@ static int client_tests(const char *fx_path, const char *dir) {
   /* three sheets per install, ever: none after a restart either, and ask_now asks nothing */
   tf__client_close(sc);
   sc = tf__client_open(&so);
-  for (int i = 0; i < 30 && sc; ++i) {
-    TfSessionStats ss;
-    memset(&ss, 0, sizeof ss);
-    ss.feedback_shown = 1;
-    tf__client_session_finished(sc, &ss);
-  }
+  for (int i = 0; i < 30 && sc; ++i) good_moment(sc);
   CHECK(sc && tf__client_sharing_ask_now(sc) == 0 && strstr(tf__client_sharing_status_json(sc), "\"asks\":3,") &&
             strstr(tf__client_sharing_status_json(sc), "\"pendingAsk\":false"),
         "a fourth sheet after a restart: %s", sc ? tf__client_sharing_status_json(sc) : "");
@@ -452,6 +496,7 @@ static int sharing_tests(const char *vdir, const char *fx_path, const char *dir)
 static char g_cdn[1024];
 static int g_cut_once, g_requests, g_ranged, g_bad_url;
 static int g_link_down, g_down_requests; /* 3.1.3: after the cut every file request fails until the test lets the link up */
+#ifndef TF_NO_ENGINE
 static int serve_cdn(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
   (void)u;
   g_requests++;
@@ -559,3 +604,4 @@ static int download_tests(const char *cdn, const char *dest, const char *key) {
   printf("downloader (layout 3, gzip, Range resume, native profile c16_l64): %s, %d requests\n", fails ? "FAIL" : "ok", g_requests);
   return fails ? 1 : 0;
 }
+#endif /* TF_NO_ENGINE */

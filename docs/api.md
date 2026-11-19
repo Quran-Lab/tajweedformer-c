@@ -1,14 +1,23 @@
-# The C API: `tajweedformer.h` (SDK 3.1.4)
+# The C API: `tajweedformer.h` (SDK 4.0.0)
 
 One library for Windows and Linux apps and for servers: `tajweedformer.dll` / `libtajweedformer.so` (or the static
 library) and one header, `include/tajweedformer.h`. It includes nothing but `<stddef.h>` and names no engine type.
+SDK 4.0 runs the model inside Quran Lab's closed Core (`qlcore.dll` / `qlcore.so`, shipped beside the library): the
+model is downloaded encrypted, installed encrypted for this install, and opened with a lease the server gives the
+install (see the README, "The protected model"). The API is 3.x's, with one addition
+(`tf_session_report_recited_outcome`) and options removed ([migrating-to-4.md](migrating-to-4.md) lists every change):
+
+Coming from 3.x: `TfClientOptions.analytics` (`TfAnalytics`) is gone, not deprecated: anonymous analytics are always
+on, because they are anonymous daily counts and durations only, never audio, text, names or device identifiers;
+Quran Lab's signed config (`flags.analytics`) is the only off switch.
+
+To evaluate the model on your own recordings without writing code, `tajweedformer-eval` (built and shipped with the
+library) runs a folder of WAV or FLAC files through this API and writes the transcripts, a summary of the heads and,
+with references, the unit and word error rates: README, "Evaluate the model on your own data".
+
 SDK 3.0.0 is a pure inference engine: audio in, the model's own output out. It never compares a recitation with an
 expected ayah and never says "mistake"; an app that judges builds its judge on the output (see
 [migrating-to-3.md](migrating-to-3.md)).
-
-To evaluate the model on your own recordings without writing code, `tajweedformer-eval` (3.1.4, built with the
-library) runs a folder of WAV or FLAC files through this API and writes the transcripts, a summary of the heads and,
-with references, the unit and word error rates: README, "Evaluate the model on your own data".
 
 Five things, with the same names and the same order of calls as the Android, Apple and web SDKs:
 
@@ -22,7 +31,7 @@ Five things, with the same names and the same order of calls as the Android, App
 
 Every options struct (`TfClientOptions`, `TfModelOptions`, `TfPrefetchOptions`, `TfSessionOptions`) may be NULL or
 zeroed: zero is the default of every field. Strings and arrays returned as `const` belong to the object they came
-from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"3.1.4"`.
+from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"4.0.0"`.
 
 ## Errors
 
@@ -74,8 +83,7 @@ background. One Client per process: a second one while the first is not destroye
 `tf_client_destroy` sends what is counted and closes the shared recording.
 
 `TfClientOptions`: `key` and `app_id` (required), `app_version`, `storage` (a folder the app can write; default
-`%LOCALAPPDATA%/<app_id>/tajweedformer` on Windows, `$XDG_DATA_HOME` or `~/.local/share` on Linux), `analytics`
-(`TfAnalytics`: `TF_ANALYTICS_ON` by default, `TF_ANALYTICS_OFF`), `audience` (`"general"` or `"children"`),
+`%LOCALAPPDATA%/<app_id>/tajweedformer` on Windows, `$XDG_DATA_HOME` or `~/.local/share` on Linux),
 `language` (the copy deck's language), `on_consent` (the SDK asks the app to show the sharing sheet, with a
 `TfConsentRequest`), `debug` and `on_log` (in the app's debug builds the client logs a newer SDK release and a
 version pin the server could not honour), `user`.
@@ -175,7 +183,10 @@ held span of a long vowel from `timing_log_probs`), `qalqalah` and `gemination` 
 ### Reference data: read-only
 
 The expected units of each ayah (the same token ids as the model's vocabulary), for an app that aligns a take with
-an ayah itself. The SDK never aligns them and never compares them with a take.
+an ayah itself. The SDK never aligns them and never compares them with a take. **SDK 4.0:** the table is encrypted
+with the model and read by the Core: the fetch downloads it and the Core installs it (refused with `session_open`
+while a take runs), and the first `tf_reference_units` needs a valid lease (`needs_connection` without one; a later
+call tries again). What it gives stays valid until the Model is closed.
 
 ```c
 TfReference *reference = tf_model_reference(model);       /* NULL when the build has none: not an error */
@@ -316,24 +327,64 @@ per take (a second replaces the first), during the take or after it ended. `tf_c
 lower-case letters, digits and underscores (at most 24, a letter first; the calibration's class ids where they
 apply), `0 <= flagged <= checked <= 100000`, at most 32 rules.
 
+**SDK 4.0: the SDK counts the ayat of each take by itself** (inside the Core, from the take's own output and the
+build's index); where it could not tell, it uses what the app reported for that take; a take is never counted
+twice. No ayah number reaches the app, a log or the server: only the day's totals.
+
+**The app's own judgement** (4.0; the other SDKs' `reportRecited` with an outcome; a function of its own here since
+C has no optional arguments):
+
+```c
+TfRecitedOutcome whole = { .correct = 0, .mistakes = 2, .rules = (const char *[]){ "madd", "qalqalah" }, .n_rules = 2 };
+TfRecitedAyah one = { .ayah = 255, .outcome = { .correct = 1 } };
+tf_session_report_recited_outcome(session, 2, 255, 257, &whole, &one, 1);   /* tf_session_report_recited stays */
+```
+
+`TfRecitedOutcome`: `correct` (1 or 0), `mistakes` (incorrect only, 1 to 1000; 0 when not given), `rules` and
+`n_rules` (incorrect only, at most 8 rule ids). `TfRecitedAyah`: an `ayah` of the range and its `outcome`. The
+whole-range outcome applies to every ayah `per_ayah` does not name; neither given is the plain report. A correct
+outcome with mistakes or rules, an ayah outside the range or named twice, and a bad rule id are `invalid_argument`
+and nothing is kept. Each rule of an incorrect ayah adds 1 to that rule's checks and flags, so do not also report
+the same findings with `tf_client_report_checks`. Where the SDK measured the take itself, the outcomes are paired
+with the ayahs it measured. The counts are the app's; the SDK never judges.
+
 ## Sharing
 
-Recitation sharing. Quran Lab's signed config decides whether learners in this app are asked; the learner
-decides. With a yes, every take of a Session whose Model came from `tf_client_model` is shared in full in the
+Recitation sharing. Every learner is asked, under the same rules in every app, and the choice is theirs: "Not now",
+or a yes they can take back at any time with the settings switch, and they can delete what they shared. No app is
+exempt and no option turns the ask off. Quran Lab's signed config (`flags.contributions`) is an incident switch: until
+the SDK holds a signed config, and while the switch is off, nothing is asked or shared. With a yes, every take of a Session whose Model came from `tf_client_model` is shared in full in the
 background: one Ogg Opus recording for takes in a row, an on-disk queue that survives restarts. Nothing is
 recorded or sent before a yes. The sheet is shown at most three times per install; a yes is never asked again.
 
-This library has no UI. The SDK asks at a good moment through `TfClientOptions.on_consent` (a
-`TfConsentRequest`: `reask`, `guardian`, `copy_json`, `consent_version`), the app shows its own sheet with those
-strings and reports the learner's own tap.
+This library has no UI. SDK 4.0 asks at a good moment (SHARE_ASK_40.md section 20: never within 24 hours of the
+install or before the 3rd completed session; after "Not now" 14 days and 7 sessions, then 30 days and 10; at most
+three asks, ever; a yes, or sharing turned off, ends asking): 3 s after a take that ended normally, with a minute of
+speech in this app session and no new take meanwhile, through `TfClientOptions.on_consent` (a `TfConsentRequest`:
+`kind` (a `TfAskKind`), `reask`, `copy_json`, `consent_version`, and for a card `card_line`, `card_open`,
+`card_not_now`), or `pending_ask` for an app without the callback. `on_consent` is called on the SDK's own thread
+once the settle has passed (from `tf_sharing_ask` and `tf_sharing_open`, on the caller's): hand the request to the UI
+thread. The app shows its own screen with those strings, calls `tf_sharing_shown` as it appears (the ask counts
+then), and reports the learner's own tap.
+
+**The first ask** (`TF_ASK_SHEET`) is the full sheet. **A re-ask** (`TF_ASK_CARD`) is a small card that does not
+block: no dim, no focus taken, at the bottom of the window, the card's line and two equal buttons, `card_open` ("See
+how it helps": `tf_sharing_open`, which hands over the full sheet for the same ask) and `card_not_now`
+(`tf_sharing_answer(client, 0)`). It has no timeout and no yes: consent is only given on the full sheet. Swiped away,
+or gone because a take starts or the app goes to the background, it is "Not now" (the SDK records it: take the card
+away when a Session starts or the app leaves the foreground). Every bundled copy deck has the card's strings (from
+deck 2026-11-15.1, in all eight languages); with a deck without them the SDK would hand a card over as the re-ask
+sheet (`TF_ASK_SHEET` with `reask` 1 or 2), answered as a sheet.
 
 | Call | What it does |
 | - | - |
-| `tf_sharing_status(client, &s)` | `TfSharing`: `is_available`, `is_on`, `asks`, `pending_ask`, `guardian`, `shared`, `consent_version`, `consent_text`, `consent_sha256` |
+| `tf_sharing_status(client, &s)` | `TfSharing`: `is_available`, `is_on`, `asks`, `pending_ask`, `shared`, `consent_version`, `consent_text`, `consent_sha256`, `pending_kind` |
 | `tf_sharing_is_available(client)`, `tf_sharing_is_on(client)` | the two answers alone |
 | `tf_sharing_set_on(client, on)` | the settings switch. Off stops uploads at once and deletes the unsent queue: the request in flight is aborted and the SDK hands nothing more to the system after the call has returned (what the system had already buffered may still go out, which can be the segment being sent), and it returns within 3 s even when a request hangs |
-| `tf_sharing_ask(client)` | ask now, if an ask is still allowed. `sharing_unavailable` when the config does not offer sharing to this app |
-| `tf_sharing_answer(client, share)` | the learner's answer to a sheet: 1 share, 0 not now |
+| `tf_sharing_ask(client)` | ask now, if an ask is due (the app picks where in its flow, the rules pick whether: never at launch, during a take, or before the next ask is due): 1 when one was handed over, 0 when none is due. `sharing_unavailable` while Quran Lab's incident switch has sharing off |
+| `tf_sharing_shown(client)` | the app's screen for the ask is on screen now: 1 it counts and stays, 0 take it back (the ask is gone) |
+| `tf_sharing_open(client)` | a card's "See how it helps": the full sheet for the same ask is handed over |
+| `tf_sharing_answer(client, share)` | the learner's answer to the ask in hand: 1 share (the full sheet only; on a card `invalid_argument` and nothing recorded), 0 not now |
 | `tf_sharing_copy_json(client)` | the copy deck in the client's language, with the app's own wording applied |
 | `tf_sharing_feed(client, samples, n, sample_rate)` | audio the app already captures outside takes: the last second before a take and the half second after it go into the shared recording. Dropped at once without a yes. The model never sees it |
 | `tf_sharing_items_json(client)` | the queue: `[{"id","created","ended","completed","segments","uploaded","takes","error"}]` |
@@ -363,8 +414,9 @@ its model through a Client, as an app does (since 3.1.0 it opens no folder, and 
 
 ## Tests
 
-`ctest` runs what needs no model data (the error catalogue, the shared 3.0 vectors, the public Client against a
-stub server, sharing, telemetry, and `test/api_scan.py`, which keeps this page and the header in step);
-`test/run_tests.sh` adds the model: conformance through Sessions (35 clips, all twelve heads, bit for bit), the
-decoded layer, and the Model, Session, listen and reference tests on a 3.0 model folder. Every test has a time
-limit and `tf_tests` caps its own memory at 2 GB.
+`ctest` runs SDK 4.0's tests (`test/tf40_tests.c`: the install key store, the contract's lease, clock, container
+and attest vectors through the Core, the whole flow against a stand-in server, the recited counting rules) and the
+3.x library tests that need no model (the error catalogue, the public Client against a stub server, sharing,
+telemetry, and `test/api_scan.py`, which keeps this page and the header in step). The conformance run (35 clips, all
+twelve heads, bit for bit, through the whole 4.0 path on an encrypted test build) is in the README. Every test has a
+time limit and `tf_tests` caps its own memory at 2 GB.

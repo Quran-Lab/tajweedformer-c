@@ -18,7 +18,7 @@ Everything an assistant needs to integrate this SDK correctly: use only the name
 </td>
 <td width="33%" valign="top">
 
-**Desktops and servers**<br>A C API, a CLI and a server runner for Windows and Linux on x86-64, with int8 kernels for AVX2, AVX-VNNI and AVX-512 VNNI.
+**Desktops and servers**<br>A C library and a CLI for Windows and Linux on x86-64, over the Quran Lab Core with its int8 kernels for AVX2, AVX-VNNI and AVX-512 VNNI.
 
 </td>
 </tr>
@@ -35,7 +35,7 @@ Everything an assistant needs to integrate this SDK correctly: use only the name
 </td>
 <td valign="top">
 
-**Data for your own judge**<br>The SDK scores nothing. The model's thresholds come with it as read-only data, so your app can judge a recitation its own way. The expected units of each ayah do not: with this release and the model build served now, `tf_model_reference` returns NULL.
+**Data for your own judge**<br>The SDK scores nothing. The model's thresholds come with it as read-only data, and the expected units of each ayah where the served build carries them, so your app can judge a recitation its own way.
 
 </td>
 </tr>
@@ -46,7 +46,7 @@ Everything an assistant needs to integrate this SDK correctly: use only the name
 - **Made for the Quran.** Trained on Quranic recitation, with its own sound units and heads for what tajweed is about.
 - **Feedback in the moment.** Output streams while the learner recites, so your app can respond on the word itself, not after the take.
 - **One engine on every platform.** The same engine runs the [Windows and Linux](https://github.com/Quran-Lab/tajweedformer-c), [Android](https://github.com/Quran-Lab/tajweedformer-android), [iOS and macOS](https://github.com/Quran-Lab/tajweedformer-apple) and [web](https://github.com/Quran-Lab/tajweedformer-web) SDKs, all set from one portal.
-- **Free, and it stays free.** Quran Lab is a non-profit waqf: the SDKs and models are never sold. The licence, NPL-1.2, asks three things: no paywall on model features, no results presented as rulings, and show the notice.
+- **Free, and it stays free.** Quran Lab is a non-profit waqf: the SDKs and models are never sold. The licence, NPL-1.2, and Quran Lab's access terms ask two things: no paywall on model features, and no output presented as an authoritative religious ruling. A line telling learners that automatic feedback can be wrong is encouraged, not required.
 
 ## Built for AI developers
 
@@ -54,78 +54,77 @@ Copy the setup prompt from [sdk.quranlab.ai](https://sdk.quranlab.ai) and paste 
 
 ## At a glance
 
-- **What it is:** the TajweedFormer SDK for Windows and Linux: `tajweedformer.dll` /
-  `libtajweedformer.so` (and a static library) with one C header, [`include/tajweedformer.h`](include/tajweedformer.h),
-  over the [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) engine, plus the
-  `tajweedformer` command-line tool and server tier. The engine runs on native int8 kernels (AVX-512 VNNI,
-  AVX-VNNI, AVX2, picked at run time).
-- **What it gives:** a pure inference engine. Audio in, the model's own output out: every head of the network
-  (selectable), greedy tokens, the decoded layer (tokens with times, confidence, runner-up and margin; which
-  tokens are settled), and events (speech started, speech ended, the take ended). The model's calibration and
-  the expected units of each ayah come as read-only data. The SDK never compares a recitation with an expected
-  ayah and never says "mistake": a judge is the app's own, built on this output
-  ([docs/migrating-to-3.md](docs/migrating-to-3.md)).
-- **Five names, the same in every SDK:** Client, Model, Session, Heads, Backend (`TfClient`, `TfModel`,
-  `TfSession`, `TfHeads`, `TfBackend`). The Client downloads and verifies the model; a Session is one take.
-- **Model:** TajweedFormer V4 (`Quran-Lab/tajweedformer-v4`, `sdk/v4.0`; contexts `c16_l64`, `c8_l64`,
-  `c24_l72`, `c24_l256`), addressed by version (`4.0.0`). SDK 3.0.0 runs 3.0 builds; 2.x builds stay on the 2.x
-  SDKs.
-- **Who it is for:** desktop apps on Windows and Linux, and servers decoding many recitations.
-- **Status:** released, 3.1.4. Through the library's own API on Windows x86-64 (clang on the Microsoft runtime): V4
-  conformance 35/35 through Sessions (all twelve outputs of every chunk, bit for bit), the shared 3.0 vectors
-  (manifest, speech events, settled tokens, telemetry, contexts, names), the error catalogue, and the Model,
-  Session and reference tests on a 3.0 model folder. Linux: built and tested by the CI workflow (see
-  [CHANGELOG.md](CHANGELOG.md)).
+- **What it is:** the TajweedFormer SDK for Windows and Linux: `tajweedformer.dll` / `libtajweedformer.so` with one
+  C header, [`include/tajweedformer.h`](include/tajweedformer.h), over **the Core** (`qlcore.dll` / `qlcore.so`),
+  Quran Lab's closed binary that holds the engine, the model formats, the keys and the recited-ayah detector. This
+  repository holds the wrappers: the API, networking, the install key store, telemetry and sharing.
+- **What it gives:** a pure inference engine. Audio in, the model's own output out: every head of the network, greedy
+  tokens, the decoded layer, events. The calibration comes as read-only data. The SDK never says "mistake".
+- **Five names, the same in every SDK:** Client, Model, Session, Heads, Backend.
+- **Model:** TajweedFormer V4 as an encrypted build. SDK 4 runs encrypted builds only, and every model version from
+  V4.1 on is published only encrypted, for SDK 4.0 and later.
+- **Coming from 3.x:** [docs/migrating-to-4.md](docs/migrating-to-4.md) says what changes. SDK 3.x stops receiving the
+  V4 model on 15 January 2027, 00:00 UTC.
+- **Status:** 4.0.0, built and tested on Windows x86-64 (MinGW-w64 GCC 13): the 35 conformance clips through the
+  whole 4.0 path (download, install, lease, the Core) give outputs byte-identical to the 3.1.3 C SDK's; the
+  contract's 4.0 vectors (lease, clock, container, attest proof) and a stand-in server's flow pass. Linux x86-64:
+  built and tested on every change (GCC, the full `ctest` against the Core's test release for `linux-x64`); the
+  conformance clips run on Windows.
 
 ## The TajweedFormer SDKs
 
-One model, one engine, the same bits on every platform. Each SDK compiles the same engine source
-(Quran-Lab/tajweedformer-engine, pinned as a submodule), so no platform can drift from the others.
+One model and one engine, the same bits on every platform. From 4.0 the engine runs inside the Quran Lab Core, a
+closed library that each SDK ships as a binary: it opens the encrypted model under a lease for each install and never
+hands out its weights or keys. The SDKs around it are open source.
 
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
-| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR) | Android 8.0+ on arm64-v8a and armeabi-v7a, desktop JVM | Maven Central `ai.quranlab:tajweedformer:3.1.5` |
+| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR), the exact CPU engine on every phone | Android 8.0+ on arm64-v8a and armeabi-v7a | Maven Central `ai.quranlab:tajweedformer:4.0.0` |
 | [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.1.4"`, product `TajweedFormer` |
-| [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | WebAssembly SDK with SIMD128 | Browsers, Node 20+ | `npm install @quran-lab/tajweedformer` |
-| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C API and server runner with x86 int8 kernels (AVX2, AVX-VNNI, AVX-512 VNNI) | Windows, Linux (x86-64) | CMake `FetchContent`, tag 3.1.4 |
-| [tajweedformer-engine](https://github.com/Quran-Lab/tajweedformer-engine) | The engine: exact C runtime, inference library, conformance suite | everything above | Git submodule |
+| [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | Web SDK: a hosted loader, and the engine in Quran Lab's frame on your page | Browsers, and Node for desktop apps | `<script src="https://web.quranlab.ai/4/loader.js">`, or `npm install @quran-lab/tajweedformer` |
+| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C library and CLI | Windows, Linux (x86-64) | CMake `FetchContent`, tag 4.0.0 |
 
-The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), hosted by Quran Lab and served by
+The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), encrypted end to end, hosted by Quran Lab and served by
 `cdn.quranlab.ai/models` to app keys from [sdk.quranlab.ai](https://sdk.quranlab.ai).
-SDK 2.x runs V4 only.
-[sdk.quranlab.ai](https://sdk.quranlab.ai) is where you create an app, get its developer key,
-choose which model revision your users get, and, for SDK 2.x scoring, set the tajweed checks (presets,
-per-class thresholds) your users see, without shipping a new build.
+[sdk.quranlab.ai](https://sdk.quranlab.ai) is where you create an app, get its developer key, choose which model
+revision your learners get, and see the problems your app's learners hit.
 
 ## Install
 
-There are no prebuilt binaries: CMake builds the release tag inside your own project. `CMakeLists.txt`:
+The library builds from this repository's tag inside your project, over the Quran Lab Core, which is not built from
+source: download the Core's binary for your target from the release's folder,
+`https://cdn.quranlab.ai/sdk/native/4.0.0/` (`qlcore-4.0.0-windows-x64.zip` with `qlcore.dll` and
+`libwinpthread-1.dll`, or `qlcore-4.0.0-linux-x64.tar.gz` with `qlcore.so`; `SHA256SUMS` beside them), and unpack
+it into a folder of your project, here `qlcore/`. `CMakeLists.txt`:
 
 ```cmake
 cmake_minimum_required(VERSION 3.24)
-project(app C CXX)
+project(app C)
 
 include(FetchContent)
+set(QLCORE_DIR "${CMAKE_SOURCE_DIR}/qlcore" CACHE PATH "the Core's binary for this target")
 FetchContent_Declare(tajweedformer
   GIT_REPOSITORY https://github.com/Quran-Lab/tajweedformer-c.git
-  GIT_TAG        3.1.4)
+  GIT_TAG        4.0.0)
 FetchContent_MakeAvailable(tajweedformer)
 
 add_executable(quickstart quickstart.c)
 target_link_libraries(quickstart PRIVATE tajweedformer)
-if(WIN32)   # the library beside the program
+if(WIN32)   # the library, the Core and its thread library beside the program
   add_custom_command(TARGET quickstart POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    $<TARGET_RUNTIME_DLLS:quickstart> $<TARGET_FILE_DIR:quickstart> COMMAND_EXPAND_LISTS)
+    $<TARGET_RUNTIME_DLLS:quickstart> "${QLCORE_DIR}/libwinpthread-1.dll" $<TARGET_FILE_DIR:quickstart> COMMAND_EXPAND_LISTS)
 endif()
 ```
 
 ```sh
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release                                                         # Linux
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++     # Windows
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release                                # Linux
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc        # Windows, MinGW-w64
 cmake --build build
 ```
 
-To build the repository by itself (the library, the `tajweedformer` command-line tool and the tests), clone it with `git clone --recurse-submodules --branch 3.1.4 https://github.com/Quran-Lab/tajweedformer-c`, then `cmake --preset linux` or `cmake --preset windows-clang`, and `cmake --build --preset` with the same name.
+Ship `tajweedformer.dll`, `qlcore.dll` and `libwinpthread-1.dll` beside your program (Windows), or
+`libtajweedformer.so` and `qlcore.so` in one folder (Linux). Use the Core's file exactly as it was published: the Core
+checks its own code, and a changed Core gets no lease.
 
 ## Before you start
 
@@ -133,10 +132,13 @@ To build the repository by itself (the library, the `tajweedformer` command-line
 | - | - |
 | **Key** | A desktop key from [sdk.quranlab.ai](https://sdk.quranlab.ai), for your app's id (a reverse-DNS id on Linux, the package family name on Windows). |
 | **Systems** | Windows and Linux on x86-64. |
-| **Compilers** | Linux: gcc or clang. Windows: LLVM clang on the Microsoft runtime, or MinGW-w64 GCC. Microsoft's `cl.exe` cannot build the engine. CMake 3.24 or later, and Ninja. |
+| **The Core** | Its binary for your target, from the release's folder (see Install): `qlcore.dll` with `libwinpthread-1.dll` on Windows, `qlcore.so` on Linux. CMake reads its folder from `QLCORE_DIR`. |
+| **Compilers** | Linux: gcc or clang. Windows: MinGW-w64 GCC; an app built with MSVC links the DLL as well (only C types cross it). CMake 3.24 or later, and Ninja. |
 | **Libraries** | Linux: the development files of libcurl and OpenSSL 3 (`libcurl4-openssl-dev libssl-dev` on Debian and Ubuntu). Windows: none. The build downloads libopus 1.6.1 once and checks its hash. |
 | **Microphone** | The library takes samples; capturing them is your program's part. The quick start pipes the system's recorder in. |
-| **Download** | The model is 56.2 MB for the default context (68.8 MB on disk), downloaded once by `tf_client_model` into the SDK's folder; every context together is 58.5 MB. |
+| **Download** | The model is 56.2 MB for the default context (69.1 MB on disk), encrypted, downloaded once by `tf_client_model` into the SDK's folder; every context together is 58.5 MB. The first run needs a connection. |
+| **Offline** | The model opens under a lease of 24 hours that Quran Lab signs for this install, renewed in the background while the machine is online. When the lease has ended and Quran Lab cannot be reached, the model keeps opening for up to 24 hours more; a refusal ends that at once. A model that is open keeps running. |
+| **Analytics** | Anonymous counts and durations (never audio, text, names or device identifiers) and reports of the failures your learners hit are always sent; you find them at sdk.quranlab.ai under your app, Problems included. |
 | **Takes** | One Client per process, and one take at a time. A server runs one worker process per take. |
 
 ## Quick start
@@ -159,8 +161,8 @@ static int recite(const char *key) {
 ```
 
 Put your app's id where the example says `com.example.quickstart`: a key works for the first app id that used
-it. `tf_client_model` downloads the model once, verifies every file, opens it and
-warms the engine. Each chunk (320 ms of audio) prints what the model heard so far; the take ends by itself after
+it. `tf_client_model` downloads the model once, verifies every file, installs it encrypted for
+this install, gets its lease, opens it and warms the engine. Each chunk (320 ms of audio) prints what the model heard so far; the take ends by itself after
 1.5 s of silence following speech (`end_on_silence_ms`). In a noisy room a take may not end on silence, so keep
 a way to stop (here the end of the input; an app calls `tf_session_finish`); the 20-minute limit ends it in any
 case. Values under 1000 can end a take in a breath pause between two words. A call on a NULL object fails and keeps the first error, so one check at the
@@ -183,21 +185,24 @@ the tokens heard so far with the tentative ones in brackets (`settled`), and the
 project.
 
 Everything is in [docs/api.md](docs/api.md); an app coming from 2.x reads
-[docs/migrating-to-3.md](docs/migrating-to-3.md). There are no prebuilt binaries: the library is built from source.
+[docs/migrating-to-3.md](docs/migrating-to-3.md). Coming from 3.x: `TfClientOptions.analytics` (`TfAnalytics`) is
+gone, not deprecated: anonymous analytics are always on, because they are anonymous daily counts and durations only,
+never audio, text, names or device identifiers.
 
 ## Evaluate the model on your own data
 
 `tajweedformer-eval` runs the model over your own recordings, on your own machine, and writes one JSON line per file:
-the transcript (units, text and timings), a summary of each tajweed head, the processing time and, with references,
-the unit and word error rates. It uses this library's public API only, with your app's desktop key: the model is
-downloaded once into the SDK's folder, checked against its signed manifest, and run by the SDK as in any app.
-**The raw weights are not needed to evaluate the model**: the tool writes its JSON lines and nothing else. Once the
-model is downloaded it runs with no network.
+the transcript (units, text and word timings), a summary of each tajweed head, the processing time and, with
+references, the unit and word error rates. It uses the public C API only, with your app's desktop key: the model is
+downloaded once and runs inside the Core as in any app. **The raw weights are not needed to evaluate the model**, and
+the tool never writes model files or plaintext. Once the model is installed it runs with no network while the
+install's lease is valid (24 hours on a desktop, renewed whenever it is online, and 24 hours more while Quran Lab
+cannot be reached).
 
-Windows: `tajweedformer-eval.exe` is in the release's `tajweedformer-3.1.4-windows-x64.zip` with `tajweedformer.dll`
-(and `vcruntime140.dll`, the Microsoft C runtime, for machines that do not have it). Linux: build it from source,
-`cmake --preset linux` and `cmake --build --preset linux` (every preset builds it). It runs where this SDK runs:
-Windows x64 and Linux x86-64.
+It ships beside the library (`tajweedformer-eval.exe` with `tajweedformer.dll`, `qlcore.dll` and
+`libwinpthread-1.dll` on Windows; `tajweedformer-eval` with `libtajweedformer.so` and `qlcore.so` on Linux), and every
+build of this repository makes it: the CMake lines under Install build it beside the library. It runs where the C SDK
+runs: Windows x64 and Linux x86-64.
 
 Windows (PowerShell):
 
@@ -218,7 +223,7 @@ tail -n 1 results.jsonl              # the totals
 Write the results with `--out`: Windows PowerShell 5.1's `>` rewrites a program's output as UTF-16.
 
 `refs.csv` (UTF-8) has one row per file. A reference is an ayah range (`S:A`, `S:A-B` or `S:A-S2:B`), whose
-expected units come from the model's own reference data (downloaded once, as the model is), or the expected units
+expected units come from the model's own reference data (fetched once, as the model is), or the expected units
 themselves, written as the transcript's text writes them: unit names separated by spaces, `|` between words.
 
 ```
@@ -250,17 +255,17 @@ of channels (averaged to one), at 8 to 48 kHz (the SDK resamples); convert anyth
 line says `"limit": true`. One take runs at a time per process (the engine's rule); for more at once, run one process
 per file list, each with its own `--storage`.
 
-One line per file, here from the test run on the 35 conformance clips (`tf_tests eval30`), shortened where it says
-`...`. The output is plain ASCII: the units' letters are `\u` escapes, which every JSON reader decodes.
+One line per file, here from the test run (`tf40_tests eval`: a clip of 112:1 as a 48 kHz stereo WAV), shortened
+where it says `...`. The output is plain ASCII: the units' letters are `\u` escapes, which every JSON reader decodes.
 
 ```json
-{"file":"Saood_112001.pcm","duration_s":2.011,"sample_rate":16000,"channels":1,"limit":false,"processing_s":0.138,"rtf":0.0687,"transcript":{"text":"\u0642 u \u0644 \u0647 u \u0648 a ...","units":[{"id":22,"unit":"\u0642","start_ms":80,"end_ms":160,"confidence":0.9981},{"id":33,"unit":"u","start_ms":160,"end_ms":200,"confidence":0.9971},...],"words":[{"text":"\u0642 u \u0644 \u0647 u \u0648 a ...","start_ms":80,"end_ms":1840,"confidence":0.9715}]},"heads":{"inter1_log_probs":{"frame_ms":40,"frames":72,"units":16},"timing_log_probs":{"frame_ms":20,"frames":144,"units":15},"gem":{"frame_ms":20,"frames":144,"classes":{"single":{"frames":138,"mean":0.960953},"held":{"frames":6,"mean":0.039047}}},"attr_qalqalah":{"frame_ms":20,"frames":144,"classes":{"none":{"frames":108,"mean":0.752688},"sughra":{"frames":0,"mean":0.002045},"kubra":{"frames":36,"mean":0.245267}}},"conf":{"frame_ms":20,"frames":144,"mean":0.997055,"frames_over_half":144}},"reference":{"source":"112:1","text":"\u0642 u \u0644 | \u0647 u \u0648 a | ...","units":16,"words":4},"errors":{"units":{"ref":16,"hyp":16,"sub":0,"del":0,"ins":0,"rate":0.000000},"words":{"ref":4,"wrong":0,"rate":0.000000}}}
+{"file":"Saood_112001.wav","duration_s":2.011,"sample_rate":48000,"channels":2,"limit":false,"processing_s":0.771,"rtf":0.3832,"transcript":{"text":"\u0642 u \u0644 \u0647 u \u0648 a ...","units":[{"id":22,"unit":"\u0642","start_ms":80,"end_ms":160,"confidence":0.9981},{"id":33,"unit":"u","start_ms":160,"end_ms":200,"confidence":0.9970},...],"words":[{"text":"\u0642 u \u0644 \u0647 u \u0648 a ...","start_ms":80,"end_ms":1840,"confidence":0.9706}]},"heads":{"inter1_log_probs":{"frame_ms":40,"frames":72,"units":16},"timing_log_probs":{"frame_ms":20,"frames":144,"units":15},"gem":{"frame_ms":20,"frames":144,"classes":{"single":{"frames":138,"mean":0.960402},"held":{"frames":6,"mean":0.039598}}},"attr_qalqalah":{"frame_ms":20,"frames":144,"classes":{"none":{"frames":108,"mean":0.753246},"sughra":{"frames":0,"mean":0.002035},"kubra":{"frames":36,"mean":0.244719}}},"conf":{"frame_ms":20,"frames":144,"mean":0.997019,"frames_over_half":144}},"reference":{"source":"112:1","text":"\u0642 u \u0644 | \u0647 u \u0648 a | ...","units":16,"words":4},"errors":{"units":{"ref":16,"hyp":16,"sub":0,"del":0,"ins":0,"rate":0.000000},"words":{"ref":4,"wrong":0,"rate":0.000000}}}
 ```
 
-The last line holds the totals (here the 35 clips: 827 units and 144 words, no error):
+The last line holds the totals:
 
 ```json
-{"total":{"files":35,"evaluated":35,"failed":0,"with_reference":35,"audio_s":182.104,"processing_s":9.496,"rtf":0.0521,"units":{"ref":827,"hyp":827,"sub":0,"del":0,"ins":0,"rate":0.000000},"words":{"ref":144,"wrong":0,"rate":0.000000},"sdk":"3.1.4","model":"4.0.0","context":"c16_l64","threads":0}}
+{"total":{"files":6,"evaluated":6,"failed":0,"with_reference":6,"audio_s":27.507,"processing_s":7.804,"rtf":0.2837,"units":{"ref":138,"hyp":143,"sub":3,"del":0,"ins":5,"rate":0.057971},"words":{"ref":25,"wrong":2,"rate":0.080000},"sdk":"4.0.0","model":"4.1.0","context":"c16_l64","threads":2}}
 ```
 
 `transcript` is what the public API gives: the decoded text, each unit with its id, time and confidence, and the
@@ -288,6 +293,55 @@ not a unit), so the unit error rate is a phoneme error rate.
 What leaves the machine: none of the audio (sharing needs a learner's yes, which this tool never gives); the
 anonymous daily counts and durations every app of the SDK sends.
 
+## The protected model
+
+What happens the first time `tf_client_model` runs, and what stays on the device:
+
+1. **The install's keys.** On Windows with a TPM, an ECDH P-256 key (to receive leases) and an ECDSA P-256 key (to
+   prove it holds them) are made in the TPM through CNG's Microsoft Platform Crypto Provider, for this user, never
+   exportable. Without a TPM they are made in CNG's Microsoft Software Key Storage Provider, not exportable, their
+   private halves protected by DPAPI for this user; the SDK reports that as a software key store. On Linux one
+   P-256 key does both, in a file of the storage folder (mode 0600), sealed under a key from the machine id and the
+   user id, so a folder copied to another machine or user does not open (a machine without a machine id keeps the
+   file unsealed, mode 0600 only).
+2. **The install certificate.** `POST /v1/attest` carries both public keys and `install_sig`, the signing key's
+   signature (made through the Core) over the agreement key's hash. Desktop installs are not attested: the
+   certificate says `att none`, and a TPM changes only its `hw` field. **A new agreement key is made at every
+   attest**; when an attest fails, the new key is deleted and the old one kept.
+3. **The lease.** A challenge, the Core's proof, and `POST /v1/model-key`: the server answers a lease for this
+   install's key and this Core release. Desktop leases last 24 hours (the unattested class; the server may give
+   longer ones in an emergency, and each is held to its own end) and are refreshed in the background after the time
+   the server chose (with its own jitter), retried after 1, 5 and 30 minutes, then 2 and 4 hours, then every 6 hours,
+   or after the answer's `Retry-After` (a `503 lease_unavailable`, never a refusal). A valid lease never waits for a
+   refresh. The clock is the Core's: a device
+   clock moved back never lengthens a lease, one moved forward never locks a learner out for long. A lease answer
+   may carry the week's data piece (signed data, never code); the SDK hands it to the Core after the lease is
+   accepted, and the Core uses it from the next request on.
+4. **The files.** The signed config names the build and its key id (no download address); the signed manifest must
+   name that key id before a lease is asked for. The build's containers (encrypted, as the CDN serves them) are
+   downloaded only from the model folder the lease answer names (https, on Quran Lab's hosts; an answer without
+   one downloads nothing), checked against the signed manifest, and handed to the
+   Core, which writes the device form (encrypted again, for this install) and checks the plaintext's hash inside.
+   The downloaded form is deleted. **No plaintext model file is ever written**; the only plain files are the
+   calibration and the sample clips (public data).
+5. **Opening.** The Core reads the device forms into its own memory with the lease. Offline with a valid lease the
+   model opens. Past the lease's end an open first asks for a new one (waiting at most 10 seconds, not at all
+   offline); while Quran Lab cannot be reached (no answer, a 5xx, a 429, a redirect, a page that is not the API's)
+   the model keeps opening for 24 hours past the lease's end, its grace, and each such open is reported silently
+   (`lease`, `grace`). A refusal ends the grace at once. After it, `tf_client_model` answers `needs_connection` (no
+   answer) or `download_failed` (a server's error). A Model already open keeps running until it is closed.
+
+**Refusals.** Every refusal of the lease route goes to the Core. When the server refuses the key or the app there,
+the refusal counts only when the Core verifies its signature (Quran Lab's key, this install, this request, within
+10 minutes): then the lease is gone and the model's files are removed, as in 3.x. An unsigned refusal there is a
+failed request and changes nothing. A refusal while a new data piece is in force sends the Core back to the last
+piece a lease was accepted with, and a request refused for the Core's proof under a new piece is asked once more
+under it, so a bad week's piece never costs a learner the model. On the other routes 3.x's rules stand.
+
+**The honest limit.** A model that runs on a device can be taken by someone who controls that device and has the
+skill and the time. The goal is that a key, an AI agent, a copied folder or a script gets nothing usable: the
+folder holds ciphertext bound to this install, and the key that opens it never exists outside the Core.
+
 ## What the SDK gives
 
 - **Chunks.** While audio comes in, `on_chunk` gets each chunk as it is ready: its Heads, whether it holds
@@ -308,338 +362,73 @@ anonymous daily counts and durations every app of the SDK sends.
 - **One report for support.** `tf_client_diagnose_json`: SDK, key, config, model, context, backend, storage, the
   last error and the protocol of the last model download, with nothing private in it.
 
+
 ## Calibration and reference data
 
-Two files of the model come as read-only data, for an app that builds its own judge. The SDK applies neither.
-
 - **The calibration** (`tf_model_calibration_json`, `tf_model_calibration_number`): the thresholds Quran Lab
-  measured on the heads. Per context: for each class of mistake (`vowel_sub`, `vowel_del`, `vowel_ins`,
-  `short_to_long`, `long_to_short`, `cons_sub`, `cons_del`, `insertion`) a threshold per preset (`strict`,
-  `balanced`, `sensitive`, `very_sensitive`) on a log-likelihood ratio between the expected sequence and its best
-  single-unit alternative, fused from `log_probs` and `inter1_log_probs`; the cuts for madd length on
-  `timing_log_probs`; the taus for qalqalah and gemination on `attr_qalqalah` and `gem`; and the word level.
-- **The reference data** (`tf_model_reference`, `tf_reference_fetch`, `tf_reference_units`): the expected units of
-  every ayah as token ids of the model's vocabulary, with the word of each unit. Downloaded only when the app
-  asks.
-
-How the 2.x scorer used them, step by step: [docs/migrating-to-3.md](docs/migrating-to-3.md).
+  measured on the heads, read-only, never applied by the SDK (as in 3.x).
+- **The reference data** (`tf_model_reference`): the table of expected units is encrypted with the model and read by
+  the Core. `tf_reference_fetch` downloads it when the app asks and the Core installs it (with the Model's engine
+  closed for the moment: it is refused while a take runs); `tf_reference_units` asks the Core, which reads the table at
+  the first ask (that ask needs a valid lease, as a take does). The units and words are 3.x's: the conformance run
+  holds every ayah of the Quran to the plaintext table (`test/reference_fnv.py`).
 
 ## Running in an app
 
-- **One Client per process, created early.** `tf_client_create` never waits for the network. Call
-  `tf_client_prefetch` or `tf_client_model` at start so the model is there before the first take. The
-  `unmetered_only` option of `tf_client_prefetch` cannot be honoured here: this library cannot tell what kind of
-  connection the machine has (the diagnose report says `"connection": "unknown"`), so the download goes ahead.
-- **Without a network** a model the Client downloaded runs; a first run without one is `needs_connection`.
-- **On a poor connection** the download goes on by itself: a file whose transfer breaks, or brings no byte for
-  30 seconds, is resumed from the bytes on disk, up to five times with a growing pause, before the call fails
-  with `download_failed`; the next call goes on from the same bytes. A slow link that keeps delivering is never
-  cut. `tf_client_destroy` from another thread ends a download in flight.
-- **The model comes from Quran Lab's server, through the Client.** No call opens a model folder of the app's own,
-  and a model folder put into the Client's storage by anything but the Client itself is deleted and downloaded
-  (the Client keeps a record of its own downloads that is bound to this machine and user: on Windows a key
-  protected with DPAPI; on Linux a key derived from the machine id and the user id, or, on a machine without a
-  machine id, a key file in the storage folder). After an update from an earlier SDK the model is downloaded
-  once more.
-- **When Quran Lab refuses the key or the app** (a revoked key, a paused or blocked app), the SDK stops running
-  the model and removes the downloaded model from the device. Once the key is accepted again the model is
-  downloaded again. Until then `tf_client_model` and `tf_client_prefetch` fail with that refusal, without a
-  network too. A Model that is already open keeps running until it is closed; its files are removed when it is
-  closed, or at the next start. The sharing state and recordings that are not sent yet are not touched. On
-  this platform nothing of the model stays behind: the library keeps a model only in the Client's storage
-  folder and has no cache of its own anywhere else.
-- **A Session is one take.** For the next take create a new Session of the same Model (one line). A Model has
-  one open Session, and a process runs one take at a time: a server runs one process per take
-  (`tajweedformer serve`), each with its own storage folder.
-- **Leaving and returning.** Call `tf_client_background` when the app is minimized or about to sleep (it sends
-  the telemetry counted so far and closes the shared recording) and `tf_client_foreground` when it returns, then
-  start a new take.
-- **The app's id.** `TfClientOptions.app_id` is the id the key was made for at sdk.quranlab.ai: the package
-  family name or AppUserModelID on Windows, a reverse-DNS id on Linux. A key works for the first app id that
-  used it: another id gets `server_rejected` with "This key belongs to another app" and the fix (a key for
-  this app, or this id allowed on the key's page). The quick start registers `com.example.quickstart`, so give
-  it a key of its own or put your app's id there.
-- **Storage.** `TfClientOptions.storage` is a folder the app can write; `tf_client_storage_json` says what the
-  SDK holds there and `tf_client_remove_models` frees the model files.
-- **Memory.** A Session keeps no audio. A take's Heads grow with its length (they are its output); end a take
-  when the learner stops, which `end_on_silence_ms` does by itself.
-
-## How it works
-
-```mermaid
-flowchart LR
-  hf[("cdn.quranlab.ai/models<br/>tajweedformer-v4")] -- "tools/zfv4, zfpublic" --> files["Model files<br/>.zfg .zfg.bin .zfw"]
-  audio(["Audio"]) --> decode["zf_decode / the stream API"]
-  files --> decode
-  decode --> engine["tajweedformer-engine engine<br/>(NEON emulation on x86)"]
-  engine -- "zf_s8_linear_hook" --> native["tajweedformer-c<br/>AVX-512 VNNI / AVX-VNNI / AVX2"]
-  engine --> out(["Heads, decoded layer, events"])
-  classDef here fill:#2a3b8f,stroke:#2a3b8f,color:#ffffff
-  class native here
-```
-
-The engine is built by its own CMake, in its exact configuration: the NEON emulation on x86 (the
-engine's exact paths exist only in NEON form, `zf/neon_emu.h`), `ZF_QUANT_DIVIDE=1`, and no
-floating-point contraction. Every int8 linear and lowered convolution in the engine goes through one
-function, which first offers the work to a **weak hook**, `zf_s8_linear_hook`: rows of the shifted
-int8 activations against a range of weight panels, written as int32 at a column shift. The engine's
-weak default declines; `src/zf_vnni_hook.c` is the strong definition, linked as an object so it wins
-the link (`hooked_check` fails if it does not). The hook:
-
-- computes exactly the requested rows and panel range, so it serves the engine's pooled,
-  multi-threaded calls as well as single-thread ones;
-- builds its own weight layout lazily from the engine's packed panels the first time each weight is
-  seen, and caches it for the process (lock-free lookup, locked insert; a fingerprint guards against
-  a reused pointer), so any number of streams on any number of threads use it;
-- picks the widest tier the CPU and OS support, once (cpuid and xgetbv).
-
-The tiers form the same integer, `sum_k q_k*w_k - zp*sum_k w_k`, which is what the engine's
-`sum_k (q_k - zp)*w_k` equals:
-
-| Tier | Instruction | Why it is exact |
-| - | - | - |
-| AVX-512 VNNI | `VPDPBUSD` zmm, 64 multiply-adds | u8 x s8 into s32, four-way, wrapping, no saturation |
-| AVX-VNNI | `VPDPBUSD` ymm (VEX), 32 multiply-adds | the same instruction at 256 bits (Alder Lake and later) |
-| AVX2 | `VPMADDUBSW` on \|a\| and sign(w, a), then `VPMADDWD` | a is the engine's shifted int8, so \|a\| <= 128; no weight is -128 (the engine's packer refuses one); a pair is at most 2 x 128 x 127 = 32512, so the int16 step never saturates |
-| scalar | C | the same sum |
-
-The float side of the decode (front end, attention, softmax, BiasNorm, the activations) is the
-engine's own code, unchanged.
-
-<!-- exactness:begin -->
-## Exactness
-
-Bit-exact means the same thing in every Quran Lab TajweedFormer SDK repository. For the same input,
-the engine gives the same tokens and the same value, to the last bit, for every output of every
-chunk, as ONNX Runtime's ARM int8 reference running the published model. For V4 that is all twelve
-outputs (the final CTC log-probs and the eleven tajweed heads) at every shipped context; for v3.2 it
-is the log-probs. It is checked on the 35 parity clips of the conformance set (the
-`conformance-data-2` release of tajweedformer-engine): the tokens, the chunk count and an FNV-1a
-fingerprint of every output of every chunk are compared with the expected files, and one bit of
-difference on one clip is a failure. Paths that cannot meet this (the Neural Engine, NPUs, fp16
-anywhere) are called approximate, and they are measured against the exact engine, never the other
-way round.
-<!-- exactness:end -->
-
-### How this repository proves it
-
-Two levels. The kernels against the engine's kernel, on random shapes (`ctest`):
-
-| test | what it proves |
-| - | - |
-| `vnni_check` | every tier this CPU has equals an independent integer golden (200 shapes), and its single-thread speed |
-| `dropin_check` | every tier equals the engine's own `zf_linear_s8` (972 shapes), full width and a pooled sub-range each |
-| `hooked_check` | the engine's `zf_linear_s8` and `zf_linear_s8_tile`, through the hook, equal the golden on every tier, and the hook took the calls |
-| `validate_against_ort.py` | the kernel equals ONNX Runtime's `MatMulInteger` on real model weights (v3.1; needs the gated model and ORT; not in `ctest`) |
-
-The whole decode against ONNX Runtime: the engine's harnesses are linked with the hook, so the
-engine's own conformance scripts run every chunk on the native kernels.
-
-**V4**, `bench/v4_conformance.sh` (tokens, chunk count and all twelve outputs of every chunk), Windows
-x86-64, MinGW-w64 GCC 13.2, Intel Core i9-14900KF, tier AVX-VNNI, 2026-11-07 (`ZF_NATIVE_STATS=1`
-confirms every int8 call of `zf_set_rt`, `zf_stream_check` and `zf_tajweed_check` ran on the native
-tier, none declined):
-
-| Line | `c16_l64` | `c24_l72` | `c24_l256` |
-| - | - | - | - |
-| `zf_set_rt` (features) | 35/35 | 35/35 | 35/35 |
-| stream, 1/7/13/3/29-frame pushes | 35/35 | 35/35 | 35/35 |
-| stream, batch 8 | 35/35 | 35/35 | 35/35 |
-| stream, audio | 35/35 | | |
-| `zf_tajweed.h`, audio | 35/35 | | |
-
-The same eleven lines on the AVX2 tier (`ZF_NATIVE_INT8=avx2`): 35/35 on every line, 0 failing.
-
-`c8_l64` (160 ms) through a Session, all twelve outputs of every chunk, on the same build and folder: 35/35; its features lines
-and the two audio lines of `bench/v4_conformance.sh` are in the engine's branch `v4-c8`, 35/35 each.
-
-**v3.2**, `bench/conformance.sh` (the engine's full matrix: threads, pools, push sizes, batches,
-release build, concurrent streams, carried states, hand-over), same machine, tier AVX-VNNI: all 33
-lines 35/35, 0 failing.
-
-The clang build on the Microsoft runtime: V4 every line 35/35 except `zf_tajweed.h, audio`, whose
-harness the engine does not build for that runtime; v3.2 all 33 lines 35/35.
-
-| Tier | Kernel tests | Whole decode, V4 and v3.2 |
-| - | - | - |
-| AVX-512 VNNI | **not run in 2.0.0**: compiles; the 1.x kernel passed on a Ryzen 7 9700X (2026-09), the 2.0.0 one adds panel ranges and has never executed | **not run**: no AVX-512 machine available |
-| AVX-VNNI | yes (14900KF) | yes, tables above |
-| AVX2 | yes (14900KF) | V4: yes, all eleven lines (forced with `ZF_NATIVE_INT8=avx2`) |
-| scalar | yes (14900KF) | the engine's own kernel is the reference; `ZF_NATIVE_INT8=off` runs it |
-| CUDA `dp4a` | no | no: compiles with nvcc 13.1, never run |
-
-The CUDA tier (`cuda/zf_gemm_cuda.cu`) is a standalone int8 GEMM, not wired into the engine. `dp4a`
-is an exact int8 dot, so its matmul can be exact; a full-GPU forward pass would not be (GPU
-transcendentals and FMA in the float layers). There is no fp16 tier: fp16 is not bit-exact.
-
-## Performance
-
-Host throughput of the whole decode (audio in, every output of every chunk), `zf_decode --bench` over
-the 35 parity clips (182 s of audio, decoded round robin for 60 s, the 1.05 s end-of-utterance flush
-of each clip computed but not counted as audio), 8 threads in total per run, int8 on AVX-VNNI. Intel
-Core i9-14900KF, Windows 11, 2026-11-07. **The PC was shared and loaded by other work (about 75% CPU
-busy before these runs), so the figures are indicative and low.**
-
-| Build | Model | 8 streams x 1 thread, `ZF_PIN=0` | 8 streams x 1 thread, engine default | 1 stream x 8 threads |
-| - | - | - | - | - |
-| clang, Microsoft runtime | V4 `c16_l64` | **55.6x** real time (7.0x per stream) | 13.8x | 21.6x |
-| clang, Microsoft runtime | v3.2 | **58.1x** (7.4x per stream) | 14.3x | 36.8x |
-| MinGW-w64 GCC 13.2 | V4 `c16_l64` | **34.7x** (4.4x per stream) | 9.3x | 18.1x |
-| MinGW-w64 GCC 13.2 | v3.2 | **38.7x** (4.9x per stream) | 9.7x | 26.4x |
-
-How to read it:
-
-- **Many streams want one thread each and the engine's core pinning off.** Each stream's pool pins its
-  calling thread to the fastest core, so eight one-thread streams all land on the same core (the
-  "engine default" column). `ZF_PIN=0` turns that off in a development build; a release build ignores
-  the environment, so a release server needs an engine-side switch (reported to the engine).
-- **V4 at `c16_l64` costs about as much per second of audio as v3.2** with many streams (55.6x against
-  58.1x); a single stream on 8 threads is slower for V4 because its 320 ms chunk has less work per
-  chunk to split.
-- **clang builds the engine about 1.5x faster than MinGW GCC here**, with the same bits (both builds
-  pass the conformance sets). For a Windows server, build with clang.
-- The int8 matmuls are no longer the bottleneck: with the hook off (`ZF_NATIVE_INT8=off`) a V4 clip
-  is only about 10% slower. The rest of a chunk is the engine's float side through the NEON emulation.
-
-The kernels alone, single thread, `vnni_check` (MAC-weighted mix of the model's int8 shapes):
-
-| Device | Tier | Figure | Measured |
-| - | - | - | - |
-| Core i9-14900KF | AVX-VNNI | 157 GMAC/s on 24x512x512; the mix in 3.5 ms | 2026-11-07 |
-| Ryzen 7 9700X | AVX-512 VNNI | 356 GMAC/s; the int8 part of a v3.1 chunk in about 1.3 ms | 2026-09-27 (1.x) |
-| Ryzen 7 9700X | WASM SIMD128, for comparison | 51 GMAC/s | 2026-09-27 (1.x) |
-
-## The int8 kernels (internal API)
-
-| Call | What it does |
-| - | - |
-| `zf_int8_cpu_tier()`, `zf_int8_tier()`, `zf_int8_set_tier(t)` | the best tier the CPU has, the one in use, and a lower one for testing |
-| `zf_vnni_packed_bytes(n, k)`, `zf_vnni_row_sums_count(n)` | sizes of the packed weights and their row sums |
-| `zf_vnni_pack(w, n, k, packed, row_sums)` | packs an `n x k` int8 weight once, at load |
-| `zf_vnni_kpad(k)` | the padded row stride for the activations |
-| `zf_vnni_linear_u8(q, m, ldq, packed, row_sums, n, k, a_zero_point, out, ldc)` | the exact int8 linear on uint8 activations |
-| `zf_vnni_linear_s8(...)`, `zf_vnni_linear_s8_cols(..., c0, c1, j_shift)` | the same on the engine's shifted int8 activations, all columns or a range |
-
-The header is [`include/zf_gemm_vnni.h`](include/zf_gemm_vnni.h) (and
-[`include/zf_gemm_cuda.h`](include/zf_gemm_cuda.h) for the CUDA tier). An application that wants the
-engine with the native kernels links the engine's library `zf_stream` together with the `zf_vnni_hook`
-object and `zf_gemm_vnni`, as the repository's own harness `zf_decode` does.
-
-| Environment | Effect |
-| - | - |
-| `ZF_NATIVE_INT8=off\|scalar\|avx2\|avxvnni\|avx512vnni` | use a lower tier (one the CPU lacks falls back to the best it has); `off` declines every call, so the engine's own kernel runs |
-| `ZF_NATIVE_STATS=1` | print, at exit, how many hook calls each tier took |
-
-> **Linking note.** The engine's `kernels.c` defines the hook *weak*, so a strong definition inside a
-> static archive is never pulled and the decode silently stays on the engine's kernel. The hook is
-> therefore an **object library** (`zf_vnni_hook`), linked into each executable directly. Any consumer
-> that wants the native kernels must link it the same way; `ZF_NATIVE_STATS=1` shows whether it did.
-
-## Build from source
-
-The engine sources are pinned as the submodule `vendor/zipformer-sdk` (tajweedformer-engine; the
-directory keeps its name).
-
-```bash
-git clone --recurse-submodules https://github.com/Quran-Lab/tajweedformer-c
-cmake --preset windows-clang && cmake --build --preset windows-clang   # the default on Windows
-cmake --preset windows-mingw && cmake --build --preset windows-mingw   # MinGW-w64 GCC, the same bits, slower
-cmake --preset linux && cmake --build --preset linux                   # Linux (apt: ninja-build libcurl4-openssl-dev)
-bash test/run_tests.sh build/windows-clang <data>                      # the library's tests (data: below)
-```
-
-The presets build the release configuration (`ZF_NATIVE_RELEASE`: the engine's exact settings, the `ZF_*`
-environment ignored). Outputs: `tajweedformer.dll` + `tajweedformer.lib` (Windows) or `libtajweedformer.so`
-(Linux), `tajweedformer_static`, the `tajweedformer` CLI, `tajweedformer-eval`, `quickstart` and `tf_tests`. The shared library exports
-exactly the functions of `include/tajweedformer.h` (`src/tf/tajweedformer.def`; a version script on Linux).
-
-- **Windows:** LLVM `clang.exe` on the Microsoft runtime (the default), or MinGW-w64 GCC (for example Strawberry Perl's `c\bin`; the binaries need
-  `libwinpthread-1.dll` from there on `PATH`), or LLVM `clang.exe` on the Microsoft runtime. MSVC
-  `cl.exe` cannot build the engine (GNU vector extensions); see the engine's `docs/windows.md`. No WSL.
-- **Ubuntu / Linux:** gcc or clang.
-- Each x86 tier is its own translation unit, compiled with its own `-m` flags; the dispatcher and
-  everything else stay at the baseline ISA and a run-time check selects the tier, so one binary runs
-  on any x86-64.
-- Only the engine targets this project uses are built (the engine is added with `EXCLUDE_FROM_ALL`):
-  its libraries and the conformance harnesses, each linked with the hook.
-- **CUDA (optional):** `-DZF_CUDA=ON` (CUDA toolkit; compute capability 6.1 or later for `dp4a`).
-
-## Verify it yourself
-
-The library's tests. `ctest` runs what needs no model data: the error catalogue (the embedded copy against the
-shared one), the shared 3.0 vectors (manifest acceptance, speech events, settled tokens, telemetry, contexts,
-names), the public Client against a stub server (one per process, options, storage, diagnose), sharing, uploads,
-consent, telemetry deltas, `test/api_scan.py` (the header, the exports and docs/api.md name the same surface) and
-`test/quickstart_check.py`. `test/run_tests.sh` adds the model: crypto (SHA-2, Ed25519 RFC 8032), folder
-verification (wrong key, unsigned, a changed file), V4 conformance through a Session per clip (35 clips, all
-twelve outputs of every chunk, the engine's `v4_c16_l64_audio_expected.jsonl`; other contexts against the native
-reference when given), the default head selection, the decoded layer against the shared layers vectors, and on a
-3.0 model folder the Model, Session, listen, reference and download tests. Every test has a time limit and the
-test program caps its own memory at 2 GB. No CI runner has a model: the model-backed part runs where the model
-folders are, as one bounded command, `python test/local_proof.py <build dir>` (the 35 conformance clips bit for bit
-through the Session API, every sample clip through `tf_session_listen`, and top-K on those clips); it skips
-cleanly elsewhere.
-
-What the public CI covers, and what it does not. On every push it builds the library on Linux and on Windows and
-runs `ctest`: the kernels against the engine's own, and everything above that needs no model. That includes the
-ranking behind `top_k`, on the 26 shared rows of `topk.json` (ties, a flat row, a margin a float cannot hold),
-compared exactly. It does NOT run, because no runner has the model: the whole decode on the conformance clips;
-the sample clips through `tf_session_listen`; `top_k` on real takes (the 35 clips at `c16_l64` and `c8_l64`
-against the shared `topk_takes.json`); the download from a CDN with the real manifest. Those four are the local
-proof above, run before every release on a machine with the model. It also does not run the AVX-512 VNNI tier
-(no runner and no machine here has one; the table under Exactness says what was run where), and it runs no
-sanitizer or fuzzer on the parsers.
-
-The engine's own harnesses on the native kernels:
-
-```bash
-ctest --test-dir build --output-on-failure      # vnni_check, dropin_check, hooked_check
-
-# the whole decode on the native kernels against the engine's expected outputs
-# (data: the conformance-data-2 release of tajweedformer-engine; on Windows from Git Bash)
-vendor/zipformer-sdk/bench/v4_conformance.sh build/engine <sdk/v4.0 folder> <data>
-vendor/zipformer-sdk/bench/conformance.sh build/engine build-rel/engine <data>
-ZF_NATIVE_INT8=avx2 vendor/zipformer-sdk/bench/v4_conformance.sh build/engine <sdk/v4.0 folder> <data>
-```
-
-Against ONNX Runtime's `MatMulInteger` on the real weights (v3.1; needs the gated model):
-
-```bash
-python3 -m venv .venv && . .venv/bin/activate
-pip install numpy onnx onnxruntime
-cc -O3 -fPIC -c -Iinclude src/int8_avx512.c -mavx512f -mavx512bw -mavx512vnni
-cc -O3 -fPIC -c -Iinclude src/int8_avxvnni.c -mavx2 -mavxvnni
-cc -O3 -fPIC -c -Iinclude src/int8_avx2.c -mavx2
-cc -O3 -fPIC -shared -Iinclude src/zf_gemm_vnni.c int8_avx512.o int8_avxvnni.o int8_avx2.o -o libzfvnni.so
-python3 test/validate_against_ort.py libzfvnni.so zipformer_p_arabic_v3.1.int8.onnx
-```
+- **One Client per process, created early.** `tf_client_create` never waits for the network; call
+  `tf_client_prefetch` or `tf_client_model` at start.
+- **Storage.** `TfClientOptions.storage` (default: `%LOCALAPPDATA%/<app_id>/tajweedformer`, or
+  `$XDG_DATA_HOME/<app_id>/tajweedformer`) holds the containers, the Core's state, the install's identity and the
+  SDK's own state. Nothing in it opens outside this install. `tf_client_remove_models` removes the model files.
+- **A Session is one take**; a process runs one take at a time (`tajweedformer serve` runs one process per take).
+- **The diagnose report** (`tf_client_diagnose_json`) adds `"protected"` (the contract's section 25): which key store
+  holds the keys, whether the lease is valid, in its grace, expired or stopped and until when, its class (`7d` or
+  `24h`), when it is renewed, the grace's end, and the Core's release.
 
 ## Recitation sharing
 
 How the SDK talks to Quran Lab, what it sends and when, is in [docs/platform-client.md](docs/platform-client.md) (the
 same page in every TajweedFormer SDK); the C calls are in [docs/api.md](docs/api.md).
 
-- **Quran Lab decides whether sharing is offered** to an app, in the signed config it downloads
-  (`flags.contributions`); without a config in force nothing is offered. Offered is never consent: nothing is
-  recorded or sent before the learner answers "share".
-- **The sheet is the app's.** This library has no UI: the SDK asks at a good moment through the `on_consent`
-  callback (or `pending_ask` in `tf_sharing_status`), with the copy deck in the learner's language (deck
-  `2026-11-13.1`, consent `share-2026-11-09`, eight languages), and the app reports the learner's tap with
-  `tf_sharing_answer`. The SDK counts the asks and keeps the re-ask rules.
-- **At most three sheets, and a yes is final.** The sheet is shown at most three times per install, ever. A
-  learner who answered "share" is never asked again: the grant keeps the version they agreed to across copy
-  decks, wording changes and SDK upgrades, and every shared recording carries that version. After that only the
-  app's settings switch (`tf_sharing_set_on`) turns sharing on or off.
-- **What is shared.** Every take of a Session whose Model came from `tf_client_model`, in full, as Ogg Opus, from
-  an on-disk queue that survives restarts (`tf_sharing_items_json`).
+- **Every learner is asked, and the choice is theirs.** The SDK asks every learner, under the same rules in every
+  app (below); the learner can say "Not now", turn sharing off, or delete what they shared at any time. No app is
+  exempt and no option turns the ask off. Being asked is never consent: nothing is recorded or sent before the
+  learner answers "share". Quran Lab's signed config (`flags.contributions`) is an incident switch: until the SDK
+  holds a signed config, and while the switch is off, nothing is asked or shared.
+- **The ask is the app's to draw.** This library has no UI: the SDK hands an ask over through the `on_consent`
+  callback (or `pending_ask` and `pending_kind` in `tf_sharing_status`), with the copy deck in the learner's
+  language (deck `2026-11-19.1`, consent `share-2026-11-09`, eight languages); the app draws it, calls
+  `tf_sharing_shown` as it appears (the ask counts then), and reports the learner's tap with `tf_sharing_answer`.
+- **When (SDK 4.0, contract section 20).** Never within 24 hours of the install (or of the upgrade to 4.0) or before
+  the 3rd completed session, and only at the end of a good session: a take that ended normally, a minute of speech
+  in this app session, and 3 s with no new take after it. After "Not now" the next ask needs both 14 days and 7
+  sessions, the one after it 30 days and 10; one ask per app session and per day. `tf_sharing_ask` lets the app
+  choose where in its flow an ask appears, never whether: it asks nothing (0) when none is due. Quran Lab's signed
+  config can only make asks rarer.
+- **The first ask is the full sheet; a re-ask is a card.** `kind` says which. Draw the card small and out of the
+  way: at the bottom of the window, no dim, no focus taken, no timeout; the card's line and two equal buttons,
+  "See how it helps" (`tf_sharing_open`: the SDK hands over the full sheet for the same ask, where the learner
+  says yes or not now) and "Not now" (`tf_sharing_answer(client, 0)`). A card has no yes. Take it away when a
+  Session starts or the app goes to the background: the SDK counts that as "Not now". Until the copy decks carry the
+  card's three strings, the SDK hands a re-ask over as the re-ask sheet instead.
+- **At most three asks, and a yes is final.** At most three asks per install, ever, a card included once it was
+  on screen. A learner who answered "share" is never asked again: the grant keeps the version they agreed to across
+  copy decks, wording changes and SDK upgrades, and every shared recording carries that version. After that only
+  the app's settings switch (`tf_sharing_set_on`) turns sharing on or off.
+- **What is shared.** Every take of a Session whose Model came from `tf_client_model`, in full, from an on-disk
+  queue that survives restarts (`tf_sharing_items_json`): Ogg Opus at 48 kHz; or, for audio captured at any other
+  rate once Quran Lab's signed config sets `flags.share_flac`, lossless Ogg FLAC at the capture rate, 16-bit, with no
+  resampling. No device model
+  is sent from Windows or Linux.
 - **Own wording.** `tf_sharing_set_wording` replaces any deck string. A learner who agrees then agrees to that
   text: the consent version becomes `custom-` plus 24 hex digits of its SHA-256, and every recording shared under
   it carries `consent_text_sha256` so Quran Lab can review the wording (`TfSharing.consent_text` and
   `consent_sha256` give it to the developer).
 - **Bitrate on bad networks.** Opus starts at 192 kbit/s and steps down to 96, 64 and 32 kbit/s when uploads fail
-  for network reasons or the queue backs up, and back up when uploads succeed; each segment keeps one bitrate.
+  for network reasons or the queue backs up, and back up when uploads succeed; each segment keeps one bitrate. A
+  lossless recording has no bitrate to step.
 - **Takes in a row are one recording.** When a take ends, the shared recording stays open for a few seconds (3 s,
-  or what the signed config's `flags.share_join_ms` sets): a take that starts in that time with the same sample
+  or what the signed config's `flags.share_join_ms` sets, up to 60 s): a take that starts in that time with the same sample
   rate continues the same Ogg stream. The recording closes when no take follows in time, at
   `tf_client_background`, when sharing is turned off, after 20 minutes, or when the next take has another sample
   rate. For a recording of several takes the SDK then sends where each take starts and how long the pause before
@@ -657,78 +446,146 @@ same page in every TajweedFormer SDK); the C calls are in [docs/api.md](docs/api
 
 ## Telemetry
 
-Anonymous by construction (sums and histograms per UTC day; no audio, text, identifiers or times finer than the
-day), on by default, off with the signed config's `flags.analytics: false` or `TfClientOptions.analytics =
-TF_ANALYTICS_OFF`. The SDK sends deltas during the day: every 15 minutes while a client is open, at
-`tf_client_background` and at `tf_client_destroy`, each with a random `report_id` so a retry is counted once. It
-counts what it sees itself: launches, sessions and takes, seconds of audio, of speech and of silence, compute
-time, tokens per head, per model version, build, context and backend, and the sharing sheet's asks and answers.
-What only the app knows it reports, as counts: `tf_session_report_recited` (which ayahs a take covered) and
-`tf_client_report_checks` (how many sites the app's own judge checked and flagged, per rule). Nothing is sent
-for them when the app never calls them. `POST /v1/register` goes out once per UTC day per install. Details:
-[docs/platform-client.md](docs/platform-client.md).
+Anonymous by construction, as in 3.x (sums per UTC day; no audio, text or identifier), and always on in SDK 4.0:
+no app can turn them off (they are anonymous daily counts and durations only, never audio, text, names or device
+identifiers). Quran Lab's signed config (`flags.analytics: false`) is the only off switch.
+
+**The ayat recited are counted by the SDK itself** (SDK 4.0, contract draft 17.1): after each take the Core's
+detector finds which ayat of which surah the take recited, from the take's own units and the build's index, and the
+day's totals `ayahs` and `surah_ayahs` grow by them. The take's units are journaled by the Core while it runs (every
+10 seconds and at its end), so a take killed half way is still counted, once, on the day it began. Where the
+detector could not tell, the app's `tf_session_report_recited` (or `_outcome`) for that take is used and sent as
+`app_ayahs` and `app_surah_ayahs`; a take is never counted twice. No ayah number reaches the app, a log or the
+server. `flags.recited: false` turns the detector off; `flags.recited_twins: false` its cross-surah rule.
+
+**More automatic analytics (17.8, 17.9), the same as the Apple SDK's.** Measured ayahs per juz (`juz_ayahs`) and
+those recited again in the same session (`repeat_ayahs`); seconds of speech by the learner's local hour
+(`hour_speech_s`: only the hour's bucket leaves the device); finished takes and closed sessions by their seconds of
+audio (`take_s`, `session_s`); whether the install was active and came back (`learner` with `active`, `new`, `d1`,
+`d7`, `d30`; `learner_gap`; `streak` of local days), once per active day; the lease's requests and the takes by how
+they were counted (`lease`, `recited_takes`); and the app's own judgement (`tf_session_report_recited_outcome`:
+`judged` with first attempt and repeat in the session, `judged_surah_ayahs`, `correct_surah_ayahs`, `judged_tenure`
+by how long the install has been in use, and once a week the install's `trend` against its four weeks before, all
+listed in `reported`). An analytics session runs from the first take until the Model or the Client is closed; one a
+process left open when it ended is closed at the next start. Every group is on by default; the signed config turns
+one off with `flags.metrics.<group>: false` (`juz`, `hours`, `lengths`, `learner`, `repeats`, `health`, `judged`),
+and then nothing of it is sent. The install's own days (its first and active days, the streak, six weeks of
+judgements) are kept in the Core's journal with its recited counters (`qlc_days_*`) and never sent; the open
+analytics session is `session.json` of the storage folder. A take the session context decided counts in
+`recited_takes.context`, and a take counted through a refrain tie counts toward a juz only when every copy lies in
+it, never as a repeat, and its judgement not toward first attempt or repeat.
+
+**Error reports**. Every error a call hands to the app, except the five that
+only say the API was used wrongly (`invalid_argument`, `client_exists`, `session_open`, `session_closed`,
+`cancelled`), and every failure the SDK goes on from without telling the app (a launch's config, register or token
+request answered with a failure, a config that does not verify, the lease's background refresh, a telemetry delta
+refused or kept 7 days, a shared recording refused for good, an installed build whose files were removed) is sent to
+Quran Lab as one small report: where the cause was (`config`, `lease`, `manifest`, `download`, `storage`,
+`model_open`, `session` and the rest), why (`http`, `timeout`, `hash`, `memory`, ...), the HTTP status, the transport's
+or the Core's error name and code, how often it happened that day, the memory tier, the free-space bucket and the ABI.
+Never a message, a path, a URL or an identifier. One report per UTC day and kind of failure, with its count; at most
+16 a day and 32 waiting, kept 7 days (`errors.json` in the storage folder); sent with the telemetry and 30 s after a
+new one. The signed config's `flags.issues: false` turns them off. The code the app gets is always the specific one:
+`needs_connection` only when no request got an answer and nothing of the build is here; any answer of a server is
+`download_failed` with what answered in its message. A failed download is also counted in the day's telemetry, with
+its reason (`failure_reasons`).
+
+## Build from source, tests and CI
+
+CMake builds the library, the CLI, the eval tool and the tests over the Core's binary for your target (Install):
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DQLCORE_DIR=<the Core's folder>
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+- **Windows x64:** MinGW-w64 GCC 13 (Strawberry Perl's `c\bin` has it), CMake and Ninja; the Core is built with the
+  same toolchain.
+- **Linux x86-64:** GCC or clang, libcurl, OpenSSL 3, CMake and Ninja, and the Core's `qlcore.so` for linux-x64.
+  A library for every distribution from Debian 10 and Ubuntu 20.04 on (their OpenSSL is 1.1) is built on Debian 10
+  with OpenSSL 3's libcrypto linked in statically (`-DOPENSSL_ROOT_DIR=<an OpenSSL 3 built with -fPIC, no-shared>
+  -DOPENSSL_USE_STATIC_LIBS=TRUE`): it needs glibc 2.25 and the system's `libcurl.so.4`, and keeps OpenSSL to itself.
+  Tested so, in containers: Debian 10 and Ubuntu 20.04, 22.04 and 24.04, ctest in full on each.
+
+What `ctest` runs: `tf40_ikey` (the key store: TPM and software KSP on Windows, the key file on Linux; agreement,
+signing, not exportable, a new agreement key per attest), `tf40_recited` and `tf40_outcome` (the counting rules of
+17.1 and 17.9), `tf40_learner` (every group of 17.8 and 17.9 on the wire, a session a kill left open, tenure, the
+weekly trend), `tf40_eval_units` (tajweedformer-eval without a model: the edit distance and its split, the reference's
+words, ayah ranges, CSV and JSONL references, JSON escapes, every WAV form it reads, FLAC from this SDK's encoder and
+from ffmpeg's: LPC, stereo decorrelation, 24-bit, wasted bits), `tf40_switches` (a signed config with every group off, and without), `tf40_json_leak` (the JSON parser frees a half-parsed child: quranlab-core's sdk-patches/0001),
+`tf40_errors` (section 24's `errors_40.json`, a copy in `test/data/sdk_4.0.0`: every `codes`, `queue`, `telemetry` and
+`signatures` case), `tf40_errors_flow` (with `TF_CONTRACT`: each stage this SDK reports, from its failure against the
+stand-in server, the code the app gets and the report it sends), the
+3.x library tests that need no model (client, sharing, consent, bitrate, telemetry, sdk_latest, errors, crypto), and
+with `TF_CONTRACT` (a quranlab-contract checkout; its test keys only, never a server's): `tf40_lease`, `tf40_clock`,
+`tf40_container`, `tf40_attest` (the contract's vectors through this library and the Core), `tf40_flac` (section
+19's `vectors/sharing40`: `flac16k` byte for byte, every `flac_cases.json` case by SHA-256 and in full, `pcm16.json`,
+the start bodies of `upload_start.json`), `tf40_share_ask` (section 20's `share_ask.json`: every config case, and
+every step of its 40 cases, action, reason and the whole new state), `tf40_share_moments` (the ask through the SDK on
+a fake clock: the settle, the card, its open, a take that ends it, the re-ask sheet in a card's place) and
+`tf40_flow` (the
+whole flow against a stand-in server: config, attest with `install_sig`, challenge, the lease request's closed schema
+and signature, download from the lease answer's model folder (and nothing when the answer names none, or one off
+Quran Lab's hosts), install, signed and unsigned stops,
+`install_cert_invalid`, `challenge_invalid`, the route off, a config without the build's key id and one with another,
+and the data pieces of the contract's `piece.json`: each one in force from the next request, a proof refused once
+under a new piece and asked again under the last good one, a piece with a bad signature changing nothing), and
+`tf40_lease_clock` (the staging clock case of 11-15: on one boot moved by hand past a lease's `exp`, a lease from a
+server whose clock stayed behind is refused by the Core as expired; one from a server whose clock moved with the
+device's re-anchors the Core's clock and is valid). The Core used by the tests is the contract's test release
+`4.0.0-c1`.
+
+**Conformance.** `test/make_flow40.py --testbuild <folder>` takes an encrypted test build (made by quranlab-core's
+`tools/make_test_build.py` from a local V4 build, with the release tool's `protected.py encrypt` and the contract's
+test root), and `tf40_tests conformance <fixture> <clips.txt> <out.jsonl> <work>` runs the 35 clips through the
+whole 4.0 path; the engine's `bench/v4_conformance_check.py` compares the result with
+`conformance/v4_c16_l64_audio_expected.jsonl`. The same run fetches the build's reference data and reads every ayah
+through the Core; its `ref_fnv` must equal `python test/reference_fnv.py <plaintext expected_tj3.zfx>`. On the same
+fixture, `tf40_tests piece_order <fixture> <vectors> <work>` replays `piece_order.json`, and
+`tf40_tests eval <fixture> <clips.txt> <work>` runs `tajweedformer-eval` on six files made from five of the 35 clips
+(raw, float WAV in a subfolder, FLAC, 48 kHz stereo WAV, `.f32`, and one held against another ayah) with CSV
+references: every line's fields, the transcripts equal to a Session's, the error counts equal to a plain edit
+distance of the reference data's units, the totals; then again with no network at all and JSONL references, one of
+them units text; after both, no 32 bytes of any of the build's plaintext model files anywhere in its work folder. Never
+put a test build inside a repository.
+
+**Checks.** Every change is built and tested on Linux x86-64 with the full `ctest`, and Windows x64 is built and
+tested the same way for each release. The conformance run needs the model and stays a release-time check on a machine
+that has it. The Core's own checks cover its binaries' symbols and strings, and the release build strips the SDK's
+library.
 
 ## Layout
 
 ```
-include/  tajweedformer.h     the public C API (tf_ names only; no engine type)
-          zf_gemm_vnni.h      the int8 kernels' API (tiers, packing, linear)
-          zf_gemm_cuda.h      the CUDA tier's API
-src/      zf_gemm_vnni.c      tier detection and dispatch, packing, the scalar kernel
-          int8_avx512.c, int8_avxvnni.c, int8_avx2.c   one x86 tier each, built with its own -m flags
-          zf_vnni_hook.c      the engine's zf_s8_linear_hook: weight cache, ranges, threads
+include/  tajweedformer.h     the public C API (tf_ names only)
+core/     qlcore.h            the Core's interface, copied unchanged; CORE_VERSION names its commit
 src/tf/   tf_api.c            the public Client: one per process, model, prefetch, storage, diagnose
-          tf_model.c, tf_store.c, tf_download.c, tf_reference.c   manifest and folder verification, the model
-                              store by build, downloads, the reference data
-          tf_session.c, tf_speech.c, tf_heads.c, tf_decode.c, tf_topk.c   a take, speech events, Heads, the
-                              decoded layer
+          tf_model.c, tf_store.c, tf_download.c   the signed manifest, the build store, the encrypted download
+          tf_ikey.c           the install key store (CNG TPM or software KSP; the Linux key file)
+          tf_platform.c       the platform table the Core runs on (storage forms, clocks, the state's seal)
+          tf_lease.c          the attest, the lease, refusals, the data piece, refresh: the Core host of a Client
+          tf_reference.c      the reference data through the Core (qlc_reference_expected)
+          tf_learner.c        the learner's days (the Core's journal) and the rules of section D
+          tf_recited.c        the recited range on the Core's detector and journal; the app's fallback
+          tf_session.c, tf_speech.c, tf_heads.c, tf_decode.c, tf_topk.c, tf_rank.c   a take, events, Heads, the
+                              decoded layer and its ranking
           tf_client.c, tf_sharing.c, tf_http.c   registration, the signed config, telemetry, consent, HTTP
-          tf_share.c, tf_share_audio.c, tf_ogg.c   the shared recording: resampler, Opus, Ogg, outbox, uploader
-          tf_crypto.c, tf_util.c, tf_copy_deck.c, tf_error_catalogue.h   SHA-2, Ed25519, JSON, errors; the copy decks
-cmake/    opus.cmake          libopus 1.6.1 (pinned tarball, checked) as a static library
+          tf_report.c         the error reports: causes, the queue, sending
+          tf_share.c, tf_share_audio.c, tf_ogg.c   the shared recording
+          tf_crypto.c, tf_util.c, tf_copy_deck.c, tf_error_catalogue.h   SHA-2, Ed25519, JSON, errors, copy decks
+cmake/    opus.cmake          libopus 1.6.1 (pinned tarball, checked)
 cli/      tajweedformer.c     info, decode, serve, download, diagnose (each through a Client)
           tajweedformer_eval.c   tajweedformer-eval: the model on your own recordings, the public API only
 examples/ quickstart.c        the example app; its marked region is the README's quick start
-test/     tf_tests.c, *.inc, api_scan.py, quickstart_check.py, check_outputs.py, run_tests.sh   the library's tests
-tools/    gen_errors.py       makes src/tf/tf_error_catalogue.h from the shared error catalogue
-runner/   zf_decode.c         streaming decoder (internal harness, also runs v3.2); --bench for many streams
-cuda/     zf_gemm_cuda.cu     GPU int8 tier (dp4a), compiles, never run
-test/     vnni_check.c        every tier == integer golden, and speed
-          dropin_check.c      every tier == the engine's own zf_linear_s8 (972 shapes)
-          hooked_check.c      the engine's entry points through the hook == golden; the hook took them
-          validate_against_ort.py   the kernel == ONNX Runtime's MatMulInteger on real weights
-docs/     api.md               the C API
-          migrating-to-3.md    from 2.x, and what a judge of your own needs
-          platform-client.md   how the SDK talks to Quran Lab (the same page in every SDK)
-          engineering-notes.md
-vendor/   zipformer-sdk       the engine (tajweedformer-engine), pinned as a submodule
+test/     tf40_tests.c        SDK 4.0's tests; make_flow40.py makes the stand-in server's data;
+                              tf40_eval_tests.inc tests tajweedformer-eval (data/eval: make_eval_flac.py);
+                              tf40_errors_tests.inc the error reports (data/sdk_4.0.0: the contract's errors_40.json)
+          tf_tests.c, *.inc   the 3.x library tests that need no model
+tools/    build.py            build, test and package one target
+docs/     api.md, migrating-to-3.md, migrating-to-4.md, platform-client.md
+NAMES.md                      every public type and function
 ```
-
-## Status and roadmap
-
-Done:
-
-- SDK 3.0.0: inference only. The engine at tajweedformer-engine 070b0ab (API 4: the inference target without the
-  scorer, the context chosen per stream, the reference reader), built in its exact configuration with the native
-  hook; V4 bit-exact end to end on Windows x86-64 through Sessions.
-- Exact int8 tiers for AVX-512 VNNI, AVX-VNNI and AVX2; a hook that serves pooled and concurrent
-  calls; a model-driven runner with a multi-stream benchmark.
-
-Next:
-
-- Run V4 conformance on an AVX-512 VNNI machine (a Zen 4 or Zen 5 server, or Ice Lake and later Xeon).
-- The float side is now most of a chunk's time on x86 (the NEON emulation). Exact AVX2 forms of its
-  hottest loops, each held to the conformance sets, are where the next speed is.
-- Run the CUDA tier on a GPU and check it against the CPU kernel; wire it into the hook if it pays.
-
-## Download size
-
-`tf_client_model` (or `tf_client_prefetch` ahead of use) fetches the CPU files of the model folder (`sdk/v4.0`,
-manifest format 3) and the sample clips, gzip on the wire, resumable, every file checked against the signed
-manifest. Model revision v4.0-2026-11-10: **56.2 MB** for the default context `c16_l64`
-(68.8 MB on disk); another context's files come on first use, 58.5 MB for every context
-(72.5 MB on disk). The reference data is downloaded only when the app asks
-(`tf_reference_fetch`); with this release and the model build served now `tf_model_reference` returns NULL. The optional ONNX Runtime graphs are not downloaded.
 
 ## Problems and wishes
 

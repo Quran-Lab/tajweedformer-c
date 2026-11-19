@@ -52,6 +52,7 @@ EXPORTS
   tf_session_listen
   tf_session_push
   tf_session_report_recited
+  tf_session_report_recited_outcome
   tf_sharing_answer
   tf_sharing_ask
   tf_sharing_copy_json
@@ -60,9 +61,11 @@ EXPORTS
   tf_sharing_is_available
   tf_sharing_is_on
   tf_sharing_items_json
+  tf_sharing_open
   tf_sharing_recovery_code
   tf_sharing_set_on
   tf_sharing_set_wording
+  tf_sharing_shown
   tf_sharing_status
   tf_sharing_summary_json
   tf_version

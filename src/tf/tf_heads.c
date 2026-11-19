@@ -29,15 +29,8 @@ static const TfHeadInfo kHeads[TF_HEAD_COUNT] = {
     {"conf", 1, 20, "logit", 0, NULL},
 };
 
-/* tf's head bits are the engine's ZF_TAJWEED_HEAD_* bits (the same order as ZfTajweedHeads) */
-_Static_assert(TF_HEAD_BIT(TF_HEAD_LOG_PROBS) == ZF_TAJWEED_HEAD_LOG_PROBS && TF_HEAD_BIT(TF_HEAD_INTER1) == ZF_TAJWEED_HEAD_INTER1 &&
-               TF_HEAD_BIT(TF_HEAD_INTER4) == ZF_TAJWEED_HEAD_INTER4 && TF_HEAD_BIT(TF_HEAD_ID) == ZF_TAJWEED_HEAD_ID &&
-               TF_HEAD_BIT(TF_HEAD_TIMING) == ZF_TAJWEED_HEAD_TIMING && TF_HEAD_BIT(TF_HEAD_GEM) == ZF_TAJWEED_HEAD_GEM &&
-               TF_HEAD_BIT(TF_HEAD_TAFKHEEM) == ZF_TAJWEED_HEAD_TAFKHEEM && TF_HEAD_BIT(TF_HEAD_GHUNNA) == ZF_TAJWEED_HEAD_GHUNNA &&
-               TF_HEAD_BIT(TF_HEAD_QALQALAH) == ZF_TAJWEED_HEAD_QALQALAH && TF_HEAD_BIT(TF_HEAD_FACE) == ZF_TAJWEED_HEAD_FACE &&
-               TF_HEAD_BIT(TF_HEAD_BOUNDARY) == ZF_TAJWEED_HEAD_BOUNDARY && TF_HEAD_BIT(TF_HEAD_CONF) == ZF_TAJWEED_HEAD_CONF &&
-               TF_HEADS_ALL == ZF_TAJWEED_HEADS_ALL,
-               "tf head bits must equal the engine's");
+/* tf's head bits are the Core's (QLC_HEADS_ALL, QLC_HEADS_DEFAULT; the same order as qlc_heads) */
+_Static_assert(TF_HEADS_ALL == QLC_HEADS_ALL && sizeof(TfRawHeads) == sizeof(qlc_heads), "tf head bits must equal the Core's");
 
 const TfHeadInfo *tf_head_info(int h) { return h >= 0 && h < TF_HEAD_COUNT ? &kHeads[h] : NULL; }
 int tf_head_from_name(const char *name) {
@@ -73,7 +66,7 @@ unsigned tf__heads_mask(const char *list) {
   return m | TF_HEAD_BIT(TF_HEAD_LOG_PROBS); /* log_probs is always computed */
 }
 
-static const float **slot(ZfTajweedHeads *h, int head) {
+static const float **slot(TfRawHeads *h, int head) {
   switch (head) {
     case TF_HEAD_LOG_PROBS: return &h->log_probs;
     case TF_HEAD_INTER1: return &h->inter1_log_probs;
@@ -90,13 +83,13 @@ static const float **slot(ZfTajweedHeads *h, int head) {
     default: return NULL;
   }
 }
-const float *tf__heads_array(const ZfTajweedHeads *h, int head, int *frames) {
+const float *tf__heads_array(const TfRawHeads *h, int head, int *frames) {
   if (!h || head < 0 || head >= TF_HEAD_COUNT) return NULL;
-  const float *p = *slot((ZfTajweedHeads *)h, head);
+  const float *p = *slot((TfRawHeads *)h, head);
   if (frames) *frames = kHeads[head].rate_ms == 40 ? h->n40 : h->n20;
   return p;
 }
-void tf__heads_select(ZfTajweedHeads *h, unsigned mask) {
+void tf__heads_select(TfRawHeads *h, unsigned mask) {
   for (int k = 0; k < TF_HEAD_COUNT; ++k)
     if (!(mask & TF_HEAD_BIT(k))) *slot(h, k) = NULL;
 }
@@ -109,7 +102,7 @@ static void name_list(TfHeads *out) {
     if (*slot(&out->z, k)) out->names[out->n_names++] = kHeads[k].name;
 }
 
-void tf__heads_view(TfHeads *out, const ZfTajweedHeads *z, unsigned mask, const TfModel *m) {
+void tf__heads_view(TfHeads *out, const TfRawHeads *z, unsigned mask, const TfModel *m) {
   memset(out, 0, sizeof *out);
   out->z = *z;
   tf__heads_select(&out->z, mask);
@@ -120,7 +113,7 @@ void tf__heads_view(TfHeads *out, const ZfTajweedHeads *z, unsigned mask, const 
   name_list(out);
 }
 
-int tf__heads_own(TfHeads *out, const ZfTajweedHeads *z, unsigned mask, const TfModel *m) {
+int tf__heads_own(TfHeads *out, const TfRawHeads *z, unsigned mask, const TfModel *m) {
   tf__heads_view(out, z, mask, m);
   for (int k = 0; k < TF_HEAD_COUNT; ++k) {
     const float **p = slot(&out->z, k);

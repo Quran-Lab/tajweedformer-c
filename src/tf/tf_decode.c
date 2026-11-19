@@ -23,25 +23,25 @@ typedef struct {
 } Decoded;
 
 /* Greedy CTC over one head: runs of the same best token, blank removed. top2: the engine's per-frame top-1 and
- * runner-up (zf_tajweed_stream_top2 for a take, zf_tajweed_top2 otherwise; ties to the lower id). The margin is
+ * runner-up (tf__top2, the 3.x engine's ranking, tf_rank.c; ties to the lower id). The margin is
  * recomputed in double from the two float log-probs, as the layers vectors define it (the engine's own margin is
  * float). */
-int tf__greedy(const TfModel *m, const float *log_probs, int T, int frame_ms, const float *conf, int n20, const ZfTajweedTop2 *top2,
+int tf__greedy(const TfModel *m, const float *log_probs, int T, int frame_ms, const float *conf, int n20, const TfTop2 *top2,
                TfFrame *frames_out, TfToken **out) {
   if (!log_probs || T < 0 || !out) return tf__fail(TF_ERR_INVALID_ARGUMENT, "the heads need log_probs");
-  ZfTajweedTop2 *own = NULL;
+  TfTop2 *own = NULL;
   TfFrame *fr = frames_out ? frames_out : (TfFrame *)calloc((size_t)T + 1, sizeof(TfFrame));
   TfToken *tokens = (TfToken *)calloc((size_t)T + 1, sizeof(TfToken));
   int n = 0;
   if (!fr || !tokens) goto oom;
   if (!top2 && T > 0) {
-    own = (ZfTajweedTop2 *)malloc(sizeof(ZfTajweedTop2) * (size_t)T);
+    own = (TfTop2 *)malloc(sizeof(TfTop2) * (size_t)T);
     if (!own) goto oom;
-    if (zf_tajweed_top2(log_probs, T, ZF_TAJWEED_VOCAB, own) != T) {
+    if (tf__top2(log_probs, T, TF_VOCAB, own) != T) {
       free(own);
       if (!frames_out) free(fr);
       free(tokens);
-      return tf__fail(TF_ERR_ENGINE_FAILED, "zf_tajweed_top2 failed");
+      return tf__fail(TF_ERR_ENGINE_FAILED, "the top-2 ranking failed");
     }
     top2 = own;
   }
@@ -98,13 +98,13 @@ oom:
   return tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
 }
 
-TfDecoded *tf__decode(const TfModel *m, const ZfTajweedHeads *h, const ZfTajweedTop2 *top2, int k) {
+TfDecoded *tf__decode(const TfModel *m, const TfRawHeads *h, const TfTop2 *top2, int k) {
   if (!h || !h->log_probs || h->n40 < 0) {
     tf__fail(TF_ERR_INVALID_ARGUMENT, "the heads need log_probs");
     return NULL;
   }
-  if (k < 0 || k > ZF_TAJWEED_VOCAB) {
-    tf__fail(TF_ERR_INVALID_ARGUMENT, "top_k must be 0 to %d", ZF_TAJWEED_VOCAB);
+  if (k < 0 || k > TF_VOCAB) {
+    tf__fail(TF_ERR_INVALID_ARGUMENT, "top_k must be 0 to %d", TF_VOCAB);
     return NULL;
   }
   const int T = h->n40;

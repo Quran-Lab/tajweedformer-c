@@ -1,8 +1,8 @@
-/* tajweedformer-eval: evaluate the TajweedFormer model on your own recordings, on your own machine (SDK 3.1.4;
- * Windows and Linux). It uses the public C API only (include/tajweedformer.h) with an app's desktop key, as any app
- * does: the model is downloaded once into the SDK's folder, verified against its signed manifest, and run by the
- * SDK. No raw weights are needed: the tool writes its JSON lines and nothing else. Once the model is downloaded it
- * runs without a network.
+/* tajweedformer-eval: evaluate the TajweedFormer model on your own recordings, on your own machine (SDK 4.0; Windows
+ * and Linux). It uses the public C API only (include/tajweedformer.h) with an app's desktop key, as any app does: the
+ * model is downloaded once, installed encrypted for this install and run inside Quran Lab's Core. No raw weights are
+ * needed and none are written: the tool writes its JSON lines and nothing else. Once the model is installed it runs
+ * without a network while the install's lease is valid (24 hours on a desktop, renewed whenever it is online).
  *
  *   tajweedformer-eval [--key KEY] --app-id ID <input> [--refs FILE] [--context C] [--threads N] [--heads LIST]
  *                      [--out FILE] [--storage DIR] [--version X.Y.Z]
@@ -1626,7 +1626,7 @@ static int ev_main(int argc, char **argv, TfClient *given) {
       goto end;
     }
   }
-  /* the model: downloaded once (with its progress), then from the SDK's folder, with or without a network */
+  /* the model: downloaded once (with its progress), then from the install, offline while the lease is valid */
   const char *st = tf_client_storage_json(c);
   if (st && strstr(st, "\"models\":[]")) {
     fprintf(stderr, "tajweedformer-eval: downloading the model (once)\n");

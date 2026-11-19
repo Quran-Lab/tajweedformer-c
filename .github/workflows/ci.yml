@@ -1,5 +1,11 @@
 name: CI
 
+# SDK 4.0: the library over the Quran Lab Core. Nothing here builds the Core: each job downloads the Core's binary for
+# its target from this release's folder on cdn.quranlab.ai (the archive the README's Install names), checks it against
+# core/CORE_RELEASE, and builds and tests the library against it. The tests that need the contract's vectors are not
+# registered without them (TF_CONTRACT empty); the production pins run (TF_CORE_PRODUCTION: the Core's SHA-256, its
+# version, every function of core/qlcore.h exported).
+
 on:
   push:
   pull_request:
@@ -13,27 +19,52 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-latest]
+        include:
+          - os: ubuntu-24.04
+            target: linux-x64
+            archive: tar.gz
+            binary: qlcore.so
+          - os: windows-latest
+            target: windows-x64
+            archive: zip
+            binary: qlcore.dll
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     defaults:
       run:
         shell: bash
+    env:
+      VERSION: "4.0.0"
     steps:
       - uses: actions/checkout@v4
-      - name: Engine submodule
+      - name: The Quran Lab Core for ${{ matrix.target }} (this release's folder on cdn.quranlab.ai, checked against core/CORE_RELEASE)
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash scripts/ci-engine.sh vendor/zipformer-sdk
+          TARGET: ${{ matrix.target }}
+          ARCHIVE: ${{ matrix.archive }}
+          BINARY: ${{ matrix.binary }}
+        run: |
+          name="qlcore-$VERSION-$TARGET.$ARCHIVE"
+          # forward slashes on Windows too (Git Bash's cygpath), for CMake's QLCORE_DIR below
+          tmp="$RUNNER_TEMP"; command -v cygpath > /dev/null && tmp=$(cygpath -m "$RUNNER_TEMP")
+          dir="$tmp/qlcore"
+          mkdir -p "$dir"
+          curl --fail --retry 3 --retry-delay 10 -sSL -o "$RUNNER_TEMP/$name" "https://cdn.quranlab.ai/sdk/native/$VERSION/$name"
+          if [ "$ARCHIVE" = zip ]; then unzip -q -o "$RUNNER_TEMP/$name" -d "$dir"; else tar -xzf "$RUNNER_TEMP/$name" -C "$dir"; fi
+          bin=$(find "$dir" -type f -name "$BINARY" | head -n 1)
+          [ -n "$bin" ] || { echo "::error::$name has no $BINARY"; exit 1; }
+          want=$(awk -v t="$TARGET" '$1 == t { print $3 }' core/CORE_RELEASE)
+          # from stdin: on Windows the path has backslashes, and sha256sum then escapes its line with a leading "\"
+          got=$(sha256sum < "$bin" | cut -d ' ' -f 1)
+          [ -n "$want" ] && [ "$got" = "$want" ] || { echo "::error::$BINARY is $got; core/CORE_RELEASE names ${want:-nothing} for $TARGET"; exit 1; }
+          echo "$(head -n 1 core/CORE_RELEASE), $TARGET: $got"
+          echo "QLCORE_DIR=$(dirname "$bin")" >> "$GITHUB_ENV"
       - name: Ninja (Windows)
         if: runner.os == 'Windows'
         run: choco install ninja -y --no-progress
-      - name: Ninja and libcurl (Linux)
+      - name: Ninja, libcurl and OpenSSL 3 (Linux)
         if: runner.os == 'Linux'
-        # Only what the runner does not already have is installed (it ships ninja and libssl-dev; libcurl's
-        # headers are what is usually missing). The Ubuntu archive's hosts were unreachable from the runners for
-        # hours on 2026-11-11 (their names did not resolve), so after a failed try a mirror outside ubuntu.com is
-        # added to the runner's mirror list. Packages stay verified by the archive's signature, whichever
-        # mirror serves them.
+        # Only what the runner does not already have is installed. After a failed try a mirror outside ubuntu.com is
+        # added to the runner's mirror list; packages stay verified by the archive's signature.
         run: |
           need=""
           command -v ninja >/dev/null || need="$need ninja-build"
@@ -53,18 +84,22 @@ jobs:
           done
           echo "::error::no package mirror answered in three tries; not installed:$need"
           exit 1
-      - name: Build
+      - name: Build (the library, the CLI, the eval tool and the tests, over the Core)
         run: |
           X=""; if [ "$RUNNER_OS" = Windows ]; then X="-DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++"; fi
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release $X
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DQLCORE_DIR="$QLCORE_DIR" -DTF_CORE_PRODUCTION="$QLCORE_DIR" $X
           cmake --build build
-      - name: Tests (the kernels against the engine, the library without model data; a time limit on each)
+      - name: Tests (the library without a model, and the Core's production pins; a time limit on each)
         run: ctest --test-dir build --output-on-failure --timeout 600 -j4
-      - name: The README's quick start is examples/quickstart.c (which the build above compiled)
+      - name: The library as shipped (Linux; exports, dependencies, the Core found beside it)
+        if: runner.os == 'Linux'
         run: |
-          PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
-          $PY test/quickstart_check.py
-      - name: The README's install (its CMakeLists with this repository as a subproject), and the program starts
+          L=build/libtajweedformer.so
+          if nm -D --defined-only "$L" | awk '{print $3}' | grep -v '^tf_'; then echo "::error::an export that is not tf_"; exit 1; fi
+          echo "exports: $(nm -D --defined-only "$L" | grep -c ' tf_')"
+          readelf -d "$L" | grep -E 'NEEDED|RUNPATH|RPATH'
+          ./build/tajweedformer --help
+      - name: The README's install (its CMakeLists with this repository as a subproject, over the same Core), and the program starts
         run: |
           # the README's first CMake block is the app's CMakeLists; FetchContent takes this checkout instead of the tag
           mkdir -p "$RUNNER_TEMP/app"
@@ -73,15 +108,8 @@ jobs:
           cp examples/quickstart.c "$RUNNER_TEMP/app/quickstart.c"
           X=""; if [ "$RUNNER_OS" = Windows ]; then X="-DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++"; fi
           cmake -S "$RUNNER_TEMP/app" -B "$RUNNER_TEMP/app/build" -G Ninja -DCMAKE_BUILD_TYPE=Release $X \
-            -DFETCHCONTENT_SOURCE_DIR_TAJWEEDFORMER="$GITHUB_WORKSPACE"
+            -DFETCHCONTENT_SOURCE_DIR_TAJWEEDFORMER="$GITHUB_WORKSPACE" -DQLCORE_DIR="$QLCORE_DIR"
           cmake --build "$RUNNER_TEMP/app/build"
           code=0; "$RUNNER_TEMP/app/build/quickstart" || code=$?
-          # without a key it prints its usage and exits 2: it linked, and the library loaded
+          # without a key it prints its usage and exits 2: it linked, and the library and the Core loaded
           [ "$code" -eq 2 ] || { echo "::error::the quick start exited $code, 2 expected"; exit 1; }
-      - name: The example app (examples/CMakeLists.txt) builds and starts
-        run: |
-          X=""; if [ "$RUNNER_OS" = Windows ]; then X="-DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++"; fi
-          cmake -S examples -B "$RUNNER_TEMP/example" -G Ninja -DCMAKE_BUILD_TYPE=Release $X
-          cmake --build "$RUNNER_TEMP/example" --target quickstart
-          code=0; "$RUNNER_TEMP/example/quickstart" || code=$?
-          [ "$code" -eq 2 ] || { echo "::error::the example exited $code, 2 expected"; exit 1; }

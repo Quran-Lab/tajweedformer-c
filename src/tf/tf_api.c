@@ -116,14 +116,6 @@ TfClient *tf_client_create(const TfClientOptions *options) {
     tf__fail(TF_ERR_INVALID_ARGUMENT, "TfClientOptions.app_id is required (the app's id as registered for the key)");
     return NULL;
   }
-  if (options->audience && strcmp(options->audience, "general") && strcmp(options->audience, "children")) {
-    tf__fail(TF_ERR_INVALID_ARGUMENT, "audience %s is not general or children", options->audience);
-    return NULL;
-  }
-  if (options->analytics != TF_ANALYTICS_ON && options->analytics != TF_ANALYTICS_OFF) {
-    tf__fail(TF_ERR_INVALID_ARGUMENT, "analytics is not TF_ANALYTICS_ON or TF_ANALYTICS_OFF");
-    return NULL;
-  }
   /* one Client per process (and so one upload queue on one storage folder) */
   spin_lock();
   if (g_client) {
@@ -139,8 +131,6 @@ TfClient *tf_client_create(const TfClientOptions *options) {
   cfg.app_id = options->app_id;
   cfg.app_version = options->app_version;
   cfg.storage_dir = own ? own : options->storage;
-  cfg.telemetry = options->analytics == TF_ANALYTICS_OFF ? 0 : 1;
-  cfg.children = options->audience && !strcmp(options->audience, "children");
   cfg.language = options->language;
   cfg.on_consent = options->on_consent;
   cfg.user = options->user;
@@ -244,6 +234,7 @@ TfModel *tf_client_model(TfClient *c, const TfModelOptions *options) {
   TfModelOpen open;
   memset(&open, 0, sizeof open);
   TfModel *m = NULL;
+  tf__app_call++; /* its failures reach the app and are reported there (24.1) */
   if (tf__store_fetch(c, &f, dir, sizeof dir, &open) == 0) {
     if (options) {
       open.threads = options->threads;
@@ -258,6 +249,7 @@ TfModel *tf_client_model(TfClient *c, const TfModelOptions *options) {
   } else {
     fail(c, -1);
   }
+  tf__app_call--;
   api_unlock(a);
   return m;
 }
@@ -278,7 +270,9 @@ int tf_client_prefetch(TfClient *c, const TfPrefetchOptions *options) {
   api_lock(a);
   /* the failure is recorded on the Client before the lock is let go: a tf_client_destroy on another thread ends
    * a download in flight (3.1.3), waits for this lock and then frees the Client */
+  tf__app_call++;
   const int rc = fail(c, tf__store_fetch(c, &f, dir, sizeof dir, NULL));
+  tf__app_call--;
   api_unlock(a);
   return rc;
 }
@@ -324,6 +318,7 @@ int tf_client_background(TfClient *c) {
   tf__clear_error();
   if (!api(c)) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
   tf__client_background(c); /* sends the telemetry counted so far; closes the recording that waits for a take */
+  tf__sharing_background(c); /* an ask in hand goes (a card on screen is Not now: SHARE_ASK_40.md 20.6) */
   tf__clear_error();        /* a send that failed stays queued: not the app's error */
   return 0;
 }
@@ -331,8 +326,10 @@ int tf_client_background(TfClient *c) {
 int tf_client_foreground(TfClient *c) {
   tf__clear_error();
   if (!api(c)) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
+  tf__rep_foreground(1);
   /* portal changes apply within a minute of use: the config is asked again (a conditional request) */
   tf__client_refresh_config(c);
+  tf__sharing_foreground(c); /* back after 30 minutes or more: a new app session (SHARE_ASK_40.md 20.2) */
   tf__clear_error();
   return 0;
 }
@@ -447,6 +444,45 @@ int tf_client_diagnose(TfClient *c, TfDiagnosis *out) {
   tf_buf_puts(&b, ",\"downloadProtocol\":");
   if (a->d_protocol[0]) tf_buf_json_str(&b, a->d_protocol);
   else tf_buf_puts(&b, "null");
+  /* 4.0: the protected model's state, without a key, a path or an identifier: which key store holds the install's
+   * keys, whether the Core holds a valid lease and until when, and the Core's release */
+  {
+    TfPm *pm = tf__pm(c);
+    qlc_lease_status ls;
+    tf__pm_status(pm, &ls);
+    long long grace_until = 0;
+    const int in_grace = pm && !ls.stopped && !ls.valid && tf__pm_grace(pm, &grace_until);
+    const char *lease = !pm                         ? "none"
+                        : ls.stopped                  ? "stopped"
+                        : ls.valid                    ? "valid"
+                        : in_grace                    ? "grace" /* 18.4.7.1: expired, opened while Quran Lab cannot be reached */
+                        : ls.has_lease                ? "expired"
+                                                      : "none";
+    tf_buf_printf(&b, ",\"protected\":{\"keyStore\":\"%s\",\"lease\":\"%s\",\"leaseExpires\":", tf__ikey_kind_name(tf__pm_ikey(pm)), lease);
+    if (pm && ls.has_lease && ls.exp > 0) tf_buf_printf(&b, "%lld", (long long)ls.exp);
+    else tf_buf_puts(&b, "null");
+    /* contract sdk_4.0.0 DIAGNOSIS_40 (section 25): the class from the lease's flags bit 3 (18.4.6: accelerator
+     * programs, the 7-day class), never from exp - iat (18.4.7.2); the refresh time; the grace's end (18.4.7.1) */
+    const int held = pm && ls.has_lease && !ls.stopped && strcmp(lease, "none") != 0;
+    int accel = -1;
+    if (held) {
+      tf__pm_lock(pm);
+      accel = qlc_accel_allowed(tf__pm_core(pm));
+      tf__pm_unlock(pm);
+    }
+    tf_buf_puts(&b, ",\"leaseClass\":");
+    tf_buf_puts(&b, accel == 1 ? "\"7d\"" : accel == 0 ? "\"24h\"" : "null");
+    tf_buf_puts(&b, ",\"refreshAfter\":");
+    if (held && ls.refresh_after > 0) tf_buf_printf(&b, "%lld", (long long)ls.refresh_after);
+    else tf_buf_puts(&b, "null");
+    tf_buf_puts(&b, ",\"graceUntil\":");
+    if (in_grace && grace_until > 0) tf_buf_printf(&b, "%lld", grace_until);
+    else tf_buf_puts(&b, "null");
+    tf_buf_puts(&b, ",\"core\":");
+    tf_buf_json_str(&b, qlc_version());
+    tf_buf_puts(&b, "}");
+    tf__clear_error();
+  }
   tf_buf_puts(&b, "}");
   free(storage);
   free(a->diag_json);

@@ -1,122 +1,64 @@
 cmake_minimum_required(VERSION 3.24)
-project(tajweedformer_native C CXX)
+project(tajweedformer_native C)
 
-# The engine (vendor/zipformer-sdk, which becomes tajweedformer-sdk) built by its own CMake, in its
-# exact configuration, with the native int8 hook linked into everything that runs it:
-#   - NEON emulation on x86 (the engine's exact paths exist only in NEON form; zf/neon_emu.h)
-#   - ZF_QUANT_DIVIDE=1, which exactness requires (the release build sets it itself)
-#   - no floating-point contraction anywhere (the engine adds -ffp-contract=off; so do we)
-# GCC (MinGW-w64 on Windows) or clang. MSVC cl.exe cannot build the engine (GNU vector extensions).
+# SDK 4.0: the TajweedFormer C library (include/tajweedformer.h, src/tf) over Quran Lab's closed Core, which is
+# linked as a prebuilt library and never built here (PROTECTED_MODEL.md 18.5.1): the engine, the model formats, the
+# keys and the recited-ayah detector are inside it. This repository holds the wrappers only: the API, networking,
+# the install key store, telemetry and sharing.
+#
+#   QLCORE_DIR   a folder with the Core's shipped binary for this target: qlcore.dll (Windows x64, MinGW-w64 GCC) or
+#                qlcore.so (Linux x86-64). core/qlcore.h is its interface (copied unchanged; core/CORE_VERSION names
+#                the Core commit it came from).
+#
+# Toolchain (tajweedformer-sdk docs/windows.md): MinGW-w64 GCC 13 (Strawberry Perl's c\bin) and Ninja on Windows;
+# GCC or clang on Linux. tools/build.py drives a whole build, the tests and the shipped files.
 set(CMAKE_C_STANDARD 11)
-# everything is position independent, so the engine and the kernels can go into the shared library
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-add_compile_options($<$<COMPILE_LANGUAGE:C>:-ffp-contract=off>)
-# MinGW-w64 GCC keeps the stack only 16-byte aligned on Windows x64 but spills 32- and 64-byte vectors (the
-# AVX2 / AVX-VNNI / AVX-512 kernels' __m256i / __m512i locals) with ALIGNED moves (GCC bug 54412): a crash on a
-# CPU whose tier uses them. The assembler turns every aligned vector move into its unaligned form (binutils
-# 2.38 or newer; no change in the arithmetic). clang realigns the stack itself and needs nothing.
-if(WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
-  add_compile_options($<$<COMPILE_LANGUAGE:C>:-Wa,-muse-unaligned-vector-move>)
+
+set(QLCORE_DIR "" CACHE PATH "the Core's prebuilt library folder (qlcore.dll or qlcore.so)")
+if(WIN32)
+  find_file(QLCORE_BIN NAMES qlcore.dll PATHS "${QLCORE_DIR}" NO_DEFAULT_PATH NO_CACHE)
+else()
+  find_file(QLCORE_BIN NAMES qlcore.so libqlcore.so PATHS "${QLCORE_DIR}" NO_DEFAULT_PATH NO_CACHE)
+endif()
+if(NOT QLCORE_BIN)
+  message(FATAL_ERROR "QLCORE_DIR (${QLCORE_DIR}) has no Core binary for this target: build or download quranlab-core first")
+endif()
+add_library(qlcore SHARED IMPORTED GLOBAL)
+set_target_properties(qlcore PROPERTIES IMPORTED_LOCATION "${QLCORE_BIN}" INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/core")
+if(WIN32)
+  # MinGW's linker takes a DLL as its own import library
+  set_target_properties(qlcore PROPERTIES IMPORTED_IMPLIB "${QLCORE_BIN}")
+else()
+  # linked by its path: the Core's SONAME is qlcore.so, so that is what the library and the tests NEED, found beside
+  # them ($ORIGIN) or through the tests' rpath (IMPORTED_NO_SONAME would link -lqlcore, a libqlcore.so the Core does not
+  # ship as)
+  set_target_properties(qlcore PROPERTIES IMPORTED_SONAME "qlcore.so")
 endif()
 
-# As a subproject (FetchContent or add_subdirectory in an app's own CMake project): nothing here is built unless
-# the app links it, and the engine's release configuration is the default, since the app ships what it builds.
-# A top-level build (the presets, CI) builds everything and sets the configuration itself.
-set(_tf_release_default OFF)
+# As a subproject: nothing is built unless the app links it.
 if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   set_property(DIRECTORY PROPERTY EXCLUDE_FROM_ALL ON)
-  set(_tf_release_default ON)
-endif()
-option(ZF_NATIVE_RELEASE "The engine's release configuration (ZF_RELEASE: exact only, ZF_* environment ignored)" ${_tf_release_default})
-set(ZF_NEON_EMU ON CACHE BOOL "Emulate ARMv7 NEON in portable C (required on x86)")
-if(ZF_NATIVE_RELEASE)
-  set(ZF_RELEASE ON CACHE BOOL "" FORCE)
-else()
-  add_compile_definitions(ZF_QUANT_DIVIDE=1)
 endif()
 
-# The engine's source tree: the vendor/zipformer-sdk submodule, or another checkout of the engine (TF_ENGINE_DIR).
-set(TF_ENGINE_DIR "" CACHE PATH "The engine's source tree; empty: the vendor/zipformer-sdk submodule")
-if(TF_ENGINE_DIR)
-  set(SDK "${TF_ENGINE_DIR}")
-else()
-  set(SDK "${CMAKE_CURRENT_SOURCE_DIR}/vendor/zipformer-sdk")
-  if(NOT EXISTS "${SDK}/engine/src/kernels.c")
-    execute_process(COMMAND git submodule update --init WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
-  endif()
-endif()
-# The engine looks for the ONNX Runtime C API headers in its own third_party, then in ours.
-# EXCLUDE_FROM_ALL: only the engine targets this project uses are built (its many development
-# harnesses are not all buildable on every Windows toolchain, and are not needed here).
-add_subdirectory("${SDK}" engine EXCLUDE_FROM_ALL)
-
-# --- the native int8 kernels: AVX-512 VNNI, AVX-VNNI, AVX2, scalar; picked at run time ---
-# Compiled at baseline ISA: each kernel carries its own target attribute and a cpuid + xgetbv check
-# selects it, so one binary runs on any x86-64 and uses the widest exact tier present.
-# Each x86 tier is its own translation unit with its own -m flags (the rest stays at the baseline),
-# which every GCC and clang, including clang on the Microsoft runtime, accepts.
-add_library(zf_gemm_vnni STATIC src/zf_gemm_vnni.c)
-target_include_directories(zf_gemm_vnni PUBLIC include)
-target_compile_options(zf_gemm_vnni PRIVATE -O3 -Wall -Wextra)
-if(WIN32)
-  target_compile_definitions(zf_gemm_vnni PRIVATE _CRT_SECURE_NO_WARNINGS)
-endif()
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$")
-  target_sources(zf_gemm_vnni PRIVATE src/int8_avx512.c src/int8_avxvnni.c src/int8_avx2.c)
-  set_source_files_properties(src/int8_avx512.c PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vnni")
-  set_source_files_properties(src/int8_avxvnni.c PROPERTIES COMPILE_OPTIONS "-mavx2;-mavxvnni")
-  set_source_files_properties(src/int8_avx2.c PROPERTIES COMPILE_OPTIONS "-mavx2")
-endif()
-
-# --- the hook: the engine's weak zf_s8_linear_hook, made strong ---
-# An OBJECT library, linked directly into each executable: a strong definition inside a static
-# archive is never pulled (the engine's weak default already satisfies the reference), so the decode
-# would silently stay on the engine's kernel. Linking an object library puts the object itself on the
-# link line, where the strong definition wins. test/hooked_check proves it did.
-add_library(zf_vnni_hook OBJECT src/zf_vnni_hook.c)
-target_include_directories(zf_vnni_hook PUBLIC include "${SDK}/engine/include")
-target_compile_options(zf_vnni_hook PRIVATE -O3 -Wall -Wextra)
-target_link_libraries(zf_vnni_hook PUBLIC zf_gemm_vnni)
-
-# The engine's own harnesses, with the hook: bench/conformance.sh (v3.2) and bench/v4_conformance.sh
-# (V4) then run the whole decode on the native kernels against the engine's expected files.
-add_custom_target(zf_harnesses ALL)
-foreach(t zf_set_rt zf_stream_check zf_stream_concurrent zf_tajweed_check zf_state_check zf_info_check)
-  if(TARGET ${t})
-    target_link_libraries(${t} PRIVATE zf_vnni_hook zf_gemm_vnni)
-    add_dependencies(zf_harnesses ${t})
-  endif()
-endforeach()
-
-# --- the streaming decoder: audio in, phonemes out ---
-add_executable(zf_decode runner/zf_decode.c)
-target_compile_options(zf_decode PRIVATE -O2 -Wall -Wextra)
-target_link_libraries(zf_decode PRIVATE zf_stream zf_vnni_hook zf_gemm_vnni)
-
-
-# --- the TajweedFormer library: include/tajweedformer.h (tf_*) over the engine's inference library ---
-# One shared library (tajweedformer.dll / libtajweedformer.so) exporting exactly the functions of
-# include/tajweedformer.h (a .def file on Windows, a version script on Linux; test/api_scan.py keeps the three
-# equal), and the same as a static library. The engine's header is not part of the public interface: an app
-# includes tajweedformer.h and nothing else.
-if(TARGET zf_tajweed_inference)
-  set_property(TARGET zf_tajweed_inference zf_stream zf_rt zf_ort_ops zf_engine PROPERTY POSITION_INDEPENDENT_CODE ON)
-endif()
 set(TF_SOURCES src/tf/tf_util.c src/tf/tf_crypto.c src/tf/tf_model.c src/tf/tf_heads.c src/tf/tf_session.c src/tf/tf_speech.c
-    src/tf/tf_decode.c src/tf/tf_topk.c src/tf/tf_reference.c src/tf/tf_http.c src/tf/tf_download.c src/tf/tf_store.c
+    src/tf/tf_decode.c src/tf/tf_topk.c src/tf/tf_rank.c src/tf/tf_reference.c src/tf/tf_http.c src/tf/tf_download.c src/tf/tf_store.c
     src/tf/tf_client.c src/tf/tf_api.c src/tf/tf_sharing.c src/tf/tf_copy_deck.c src/tf/tf_ogg.c src/tf/tf_devicekey.c
-    src/tf/tf_inflate.c src/tf/tf_share.c src/tf/tf_share_audio.c)
+    src/tf/tf_inflate.c src/tf/tf_share.c src/tf/tf_share_audio.c src/tf/tf_ikey.c src/tf/tf_platform.c src/tf/tf_lease.c
+    src/tf/tf_recited.c src/tf/tf_learner.c src/tf/tf_flac.c src/tf/tf_share_ask.c src/tf/tf_report.c)
 # libopus for the shared-session upload (cmake/opus.cmake: the pinned 1.6.1 release, float, plain C)
 include(cmake/opus.cmake)
+set(TF_WARN -O2 -Wall -Wextra -Wvla)
 function(tf_library name kind)
-  add_library(${name} ${kind} ${TF_SOURCES} $<TARGET_OBJECTS:zf_vnni_hook>)
-  target_include_directories(${name} PUBLIC include PRIVATE src/tf "${SDK}/tajweed/include" "${SDK}/engine/include")
-  target_compile_options(${name} PRIVATE -O2 -Wall -Wextra)
-  target_link_libraries(${name} PRIVATE zf_tajweed_inference zf_gemm_vnni tf_opus)
+  add_library(${name} ${kind} ${TF_SOURCES})
+  target_include_directories(${name} PUBLIC include PRIVATE src/tf)
+  # no compiler ident, each function in its own section (the unused dropped), no frame-pointer chains: as the Core
+  target_compile_options(${name} PRIVATE ${TF_WARN} -fno-ident -ffunction-sections -fdata-sections)
+  target_link_libraries(${name} PUBLIC qlcore PRIVATE tf_opus)
   set_target_properties(${name} PROPERTIES C_VISIBILITY_PRESET hidden POSITION_INDEPENDENT_CODE ON)
   if(WIN32)
     target_compile_definitions(${name} PRIVATE _CRT_SECURE_NO_WARNINGS)
-    target_link_libraries(${name} PRIVATE winhttp bcrypt crypt32)
+    target_link_libraries(${name} PRIVATE winhttp bcrypt ncrypt crypt32 advapi32)
   else()
     find_package(CURL REQUIRED)
     find_package(OpenSSL 3 REQUIRED)
@@ -126,24 +68,35 @@ endfunction()
 tf_library(tajweedformer SHARED)
 target_compile_definitions(tajweedformer PRIVATE TF_BUILD_DLL=1)
 if(WIN32)
+  # exactly the functions of include/tajweedformer.h (test/api_scan.py keeps the .def, the map and the header equal)
   target_sources(tajweedformer PRIVATE src/tf/tajweedformer.def)
   set_target_properties(tajweedformer PROPERTIES PREFIX "")
+  target_link_options(tajweedformer PRIVATE -Wl,--gc-sections -Wl,--no-insert-timestamp -static-libgcc)
 else()
-  target_link_options(tajweedformer PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/tf/tajweedformer.map")
+  # --exclude-libs: no symbol of a static archive (libopus, a static OpenSSL 3) in the dynamic symbol table, beside the
+  # version script, so the system's libcurl and its OpenSSL 1.1 never bind to them
+  target_link_options(tajweedformer PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/tf/tajweedformer.map" -Wl,--gc-sections
+                      -Wl,--build-id=none "-Wl,-rpath,$ORIGIN" -Wl,--exclude-libs,ALL)
+  # only $ORIGIN, as shipped (CMake would add the build machine's Core folder): the Core goes beside the library
+  set_target_properties(tajweedformer PROPERTIES SKIP_BUILD_RPATH ON)
+  add_custom_command(TARGET tajweedformer POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${QLCORE_BIN}"
+                     "$<TARGET_FILE_DIR:tajweedformer>/qlcore.so")
 endif()
 tf_library(tajweedformer_static STATIC)
 
-# the command-line tool and server tier
+# the command-line tool
 add_executable(tajweedformer_cli cli/tajweedformer.c)
 set_target_properties(tajweedformer_cli PROPERTIES OUTPUT_NAME tajweedformer)
 target_compile_options(tajweedformer_cli PRIVATE -O2 -Wall -Wextra)
 target_link_libraries(tajweedformer_cli PRIVATE tajweedformer)
 if(WIN32)
   target_compile_definitions(tajweedformer_cli PRIVATE TF_USE_DLL=1 _CRT_SECURE_NO_WARNINGS)
+else()
+  target_link_options(tajweedformer_cli PRIVATE "-Wl,-rpath,$ORIGIN")
+  set_target_properties(tajweedformer_cli PROPERTIES SKIP_BUILD_RPATH ON)
 endif()
 
-# tajweedformer-eval: the model on a developer's own recordings, through the public API only (cli/tajweedformer_eval.c;
-# README, "Evaluate the model on your own data")
+# tajweedformer-eval: the model on a developer's own recordings, through the public API only (cli/tajweedformer_eval.c)
 add_executable(tajweedformer_eval cli/tajweedformer_eval.c)
 set_target_properties(tajweedformer_eval PROPERTIES OUTPUT_NAME tajweedformer-eval)
 target_compile_options(tajweedformer_eval PRIVATE -O2 -Wall -Wextra)
@@ -153,115 +106,179 @@ if(WIN32)
   target_link_libraries(tajweedformer_eval PRIVATE shell32)
 else()
   target_link_libraries(tajweedformer_eval PRIVATE m)
+  target_link_options(tajweedformer_eval PRIVATE "-Wl,-rpath,$ORIGIN")
+  set_target_properties(tajweedformer_eval PROPERTIES SKIP_BUILD_RPATH ON)
 endif()
 
-# the example app, whose marked region is the README's quick start: built with everything else so the code in the
-# README always compiles (test/quickstart_check.py keeps the two texts equal). Only in a build of this repository
-# itself: an app that takes it as a subproject has its own program, which may well be called quickstart too
-# (examples/CMakeLists.txt is that app's project file).
-if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-  add_executable(quickstart examples/quickstart.c)
-  target_compile_options(quickstart PRIVATE -O2 -Wall -Wextra)
-  target_link_libraries(quickstart PRIVATE tajweedformer)
-  if(WIN32)
-    target_compile_definitions(quickstart PRIVATE TF_USE_DLL=1 _CRT_SECURE_NO_WARNINGS)
-  endif()
-endif()
-
-# An app that takes this as a subproject gets the libraries and the command-line tool. What follows is this
-# repository's own: its tests, the kernel checks and the optional CUDA tier.
 if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   return()
 endif()
 
-# the library's own tests: the public API, and the internals through src/tf/tf_internal.h and the static library
-add_executable(tf_tests test/tf_tests.c)
-target_include_directories(tf_tests PRIVATE src/tf "${SDK}/tajweed/include" "${SDK}/engine/include")
-target_compile_options(tf_tests PRIVATE -O2 -Wall -Wextra)
-target_link_libraries(tf_tests PRIVATE tajweedformer_static zf_tajweed_inference zf_gemm_vnni tf_opus)
+# the example app, whose marked region is the README's quick start (test/quickstart_check.py)
+add_executable(quickstart examples/quickstart.c)
+target_compile_options(quickstart PRIVATE -O2 -Wall -Wextra)
+target_link_libraries(quickstart PRIVATE tajweedformer)
 if(WIN32)
-  target_compile_definitions(tf_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
-  target_link_libraries(tf_tests PRIVATE winhttp bcrypt crypt32)
-else()
-  target_link_libraries(tf_tests PRIVATE CURL::libcurl OpenSSL::Crypto m pthread)
+  target_compile_definitions(quickstart PRIVATE TF_USE_DLL=1 _CRT_SECURE_NO_WARNINGS)
 endif()
 
+# ------------------------------------------------------------------ tests
+# The Core is a DLL beside every test program (Windows finds it there), with MinGW's winpthread it needs.
 enable_testing()
-foreach(t vnni_check dropin_check hooked_check cpu_detect)
-  add_executable(${t} test/${t}.c)
-  target_include_directories(${t} PRIVATE include "${SDK}/engine/include")
-  add_test(NAME ${t} COMMAND ${t})
-  # every test has a time limit: a test that hangs or runs away is stopped, not left to eat the machine
-  set_tests_properties(${t} PROPERTIES TIMEOUT 300)
-endforeach()
-# the library's tests that need no model data (only test/data): the Ogg muxer and Opus encoder vectors, the deletion
-# crypto, the shared-session upload against a stub server, the platform client against recorded exchanges, the
-# bitrate ladder, consent wording and telemetry deltas, the real signed V4 manifests, takes in a row sharing one
-# recording, and (3.0) the error catalogue, the shared 3.0 vectors and the public API. Each run starts from an
-# empty work directory (the fixture below). The model tests (conformance, sessions, the decoded layer on real
-# heads) need the release data: test/run_tests.sh.
 set(TF_WORK "${CMAKE_CURRENT_BINARY_DIR}/tf_test_work")
 set(TF_DATA "${CMAKE_CURRENT_SOURCE_DIR}/test/data")
 set(TF_VEC "${TF_DATA}/sharing_vectors")
+set(TF_CONTRACT "" CACHE PATH "a quranlab-contract checkout with sdk_4.0.0 (its vectors and tools/protected40.py); empty: those tests are not registered")
 find_package(Python3 COMPONENTS Interpreter)
+function(tf_test_exe name src)
+  add_executable(${name} ${src})
+  target_include_directories(${name} PRIVATE src/tf)
+  target_compile_options(${name} PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(${name} PRIVATE tajweedformer_static tf_opus qlcore)
+  if(WIN32)
+    target_compile_definitions(${name} PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(${name} PRIVATE winhttp bcrypt ncrypt crypt32 advapi32)
+  else()
+    target_link_libraries(${name} PRIVATE CURL::libcurl OpenSSL::Crypto m pthread)
+    # a static OpenSSL 3 stays the program's own: the system's libcurl and libssl 1.1 must not bind to it
+    target_link_options(${name} PRIVATE "-Wl,-rpath,${QLCORE_DIR}" -Wl,--exclude-libs,ALL)
+  endif()
+endfunction()
+tf_test_exe(tf_tests test/tf_tests.c)
+tf_test_exe(tf40_tests test/tf40_tests.c)
+if(WIN32)
+  get_filename_component(_cc_dir "${CMAKE_C_COMPILER}" DIRECTORY)
+  foreach(t tf_tests tf40_tests tajweedformer_cli tajweedformer_eval quickstart)
+    add_custom_command(TARGET ${t} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${QLCORE_BIN}" "$<TARGET_FILE_DIR:${t}>"
+                       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_cc_dir}/libwinpthread-1.dll" "$<TARGET_FILE_DIR:${t}>")
+  endforeach()
+endif()
 add_test(NAME tf_work_clean COMMAND ${CMAKE_COMMAND} -E rm -rf "${TF_WORK}")
 set_tests_properties(tf_work_clean PROPERTIES FIXTURES_SETUP tf_work TIMEOUT 120)
-# 3.1.4: tajweedformer-eval's own parts without a model (test/data/eval: test/make_eval_flac.py)
-add_test(NAME tf_eval_units COMMAND tf_tests eval_units "${TF_DATA}/eval" "${TF_WORK}/eval_units")
+# 4.0: the install key store, the recited fallback, 17.9's arguments, the JSON parser's leak fix
+foreach(t ikey recited outcome json_leak learner)
+  add_test(NAME tf40_${t} COMMAND tf40_tests ${t} - "${TF_WORK}/tf40_${t}")
+endforeach()
+# tajweedformer-eval's own parts (no model): edit distance, references, WAV and FLAC (test/data/eval: test/make_eval_flac.py)
+add_test(NAME tf40_eval_units COMMAND tf40_tests eval_units "${TF_DATA}/eval" "${TF_WORK}/tf40_eval_units")
+# error reports (ERRORS_40.md 24): test/data/sdk_4.0.0/errors_40.json is the contract's vectors/errors_40.json at 1c971ab,
+# byte for byte (tools/errors40.py --check); its codes, queue, telemetry and signatures through this library
+add_test(NAME tf40_errors COMMAND tf40_tests errors "${TF_DATA}/sdk_4.0.0" "${TF_WORK}/tf40_errors")
+# 4.0 with the contract's vectors (TF_CONTRACT, a quranlab-contract checkout; its test keys only): lease, clock,
+# container and attest proof through this library and the Core; the whole flow against a stand-in server whose data
+# test/make_flow40.py makes from the contract's reference (Python 3 with `cryptography`)
+if(TF_CONTRACT)
+  # The vectors and the reference (tools/protected40.py) at a pinned commit of the contract, exported by git at
+  # configure, as the Core does (another agent edits the contract's working tree): c7f6e9b, spec fix 16 with
+  # piece_order.json's four sequences, section 19 (vectors/sharing40) and section 20 (vectors/share_ask.json); the
+  # earlier vectors are byte for byte those of fba80eb, the commit quranlab-core d128af8 pins.
+  set(TF_CONTRACT_COMMIT "1c971ab" CACHE STRING "the quranlab-contract commit whose sdk_4.0.0 vectors and tools the tests read")
+  set(TF_C40 "${CMAKE_BINARY_DIR}/contract-${TF_CONTRACT_COMMIT}/sdk_4.0.0")
+  # TF_CONTRACT is a checkout (the files are exported by git at the pinned commit), or a folder that already holds
+  # that export (CI: no git access to the contract; tools/ci/contract_export.py writes it with a COMMIT file naming
+  # the commit, which must be the pinned one)
+  if(NOT EXISTS "${TF_CONTRACT}/.git" AND EXISTS "${TF_CONTRACT}/COMMIT")
+    file(STRINGS "${TF_CONTRACT}/COMMIT" _have LIMIT_COUNT 1)
+    string(SUBSTRING "${_have}" 0 7 _have7)
+    if(NOT _have7 STREQUAL TF_CONTRACT_COMMIT)
+      message(FATAL_ERROR "TF_CONTRACT (${TF_CONTRACT}) is an export of ${_have}, not of ${TF_CONTRACT_COMMIT}")
+    endif()
+    set(_export ON)
+  else()
+    set(_export OFF)
+  endif()
+  foreach(f vectors/clock.json vectors/container.json vectors/hkdf.json vectors/install_cert.json vectors/keyattest.json vectors/lease.json
+            vectors/manifest_40.json vectors/mark.json vectors/piece.json vectors/proof.json vectors/refusal_signed.json vectors/web_lease.json
+            vectors/piece_order.json vectors/share_ask.json vectors/sharing40/flac_cases.json vectors/sharing40/pcm16.json
+            vectors/sharing40/device_model.json vectors/sharing40/upload_start.json vectors/sharing40/flac16k/expected.json
+            vectors/sharing40/flac16k/seg-00001.oga vectors/sharing40/flac16k/seg-00002.oga vectors/sharing40/flac16k/seg-00003.oga
+            vectors/sharing40/flac16k/seg-00004.oga vectors/grace.json tools/protected40.py tools/share_ask.py tools/sharing40.py)
+    get_filename_component(_d "${TF_C40}/${f}" DIRECTORY)
+    file(MAKE_DIRECTORY "${_d}")
+    if(_export)
+      if(EXISTS "${TF_CONTRACT}/sdk_4.0.0/${f}")
+        file(COPY_FILE "${TF_CONTRACT}/sdk_4.0.0/${f}" "${TF_C40}/${f}")
+        set(_rc 0)
+      else()
+        set(_rc 1)
+      endif()
+    else()
+      execute_process(COMMAND git -C "${TF_CONTRACT}" show "${TF_CONTRACT_COMMIT}:sdk_4.0.0/${f}" OUTPUT_FILE "${TF_C40}/${f}" RESULT_VARIABLE _rc)
+    endif()
+    if(NOT _rc EQUAL 0)
+      message(WARNING "cannot export sdk_4.0.0/${f} at ${TF_CONTRACT_COMMIT} from ${TF_CONTRACT}")
+    endif()
+  endforeach()
+  set(TF_VEC40 "${TF_C40}/vectors")
+  foreach(t lease clock container attest flac share_ask)
+    add_test(NAME tf40_${t} COMMAND tf40_tests ${t} "${TF_VEC40}" "${TF_WORK}/tf40_${t}")
+  endforeach()
+  if(Python3_FOUND)
+    add_test(NAME tf40_flow_data COMMAND ${Python3_EXECUTABLE} -I "${CMAKE_CURRENT_SOURCE_DIR}/test/make_flow40.py" --contract "${TF_C40}"
+             --out "${TF_WORK}/flow40")
+    set_tests_properties(tf40_flow_data PROPERTIES FIXTURES_SETUP tf_flow40 FIXTURES_REQUIRED tf_work TIMEOUT 120)
+    add_test(NAME tf40_flow COMMAND tf40_tests flow "${TF_WORK}/flow40" "${TF_WORK}/tf40_flow")
+    add_test(NAME tf40_switches COMMAND tf40_tests switches "${TF_WORK}/flow40" "${TF_WORK}/tf40_switches")
+    add_test(NAME tf40_share_moments COMMAND tf40_tests share_moments "${TF_WORK}/flow40" "${TF_WORK}/tf40_share_moments")
+    add_test(NAME tf40_share_flac COMMAND tf40_tests share_flac "${TF_WORK}/flow40" "${TF_WORK}/tf40_share_flac")
+    add_test(NAME tf40_errors_flow COMMAND tf40_tests errors_flow "${TF_WORK}/flow40" "${TF_WORK}/tf40_errors_flow")
+    add_test(NAME tf40_lease_clock COMMAND tf40_tests lease_clock "${TF_WORK}/flow40" "${TF_WORK}/tf40_lease_clock")
+    add_test(NAME tf40_grace COMMAND tf40_tests grace "${TF_WORK}/flow40" "${TF_VEC40}" "${TF_WORK}/tf40_grace")
+    add_test(NAME tf40_grace_data COMMAND ${Python3_EXECUTABLE} -I "${CMAKE_CURRENT_SOURCE_DIR}/test/make_grace40.py" --contract "${TF_C40}"
+             --out "${TF_WORK}/grace40")
+    set_tests_properties(tf40_grace_data PROPERTIES FIXTURES_SETUP tf_grace40 FIXTURES_REQUIRED tf_work TIMEOUT 120)
+    add_test(NAME tf40_grace_vectors COMMAND tf40_tests grace_vectors "${TF_VEC40}" "${TF_WORK}/grace40" "${TF_WORK}/tf40_grace_vectors")
+    set_tests_properties(tf40_grace_vectors PROPERTIES FIXTURES_REQUIRED "tf_work;tf_grace40" TIMEOUT 600)
+    set_tests_properties(tf40_flow tf40_switches tf40_share_moments tf40_share_flac tf40_errors_flow tf40_lease_clock tf40_grace PROPERTIES FIXTURES_REQUIRED "tf_work;tf_flow40" TIMEOUT 600)
+  endif()
+endif()
+# Production pins (integration): TF_CORE_PRODUCTION names the folder of the Core release this SDK ships with
+# (core/CORE_RELEASE: 4.0.0-c3, its shipped files' SHA-256). Every test above runs on the TEST release in QLCORE_DIR (the
+# contract's public test root); these check the real one: its SHA-256, its version, that it exports every function of
+# core/qlcore.h, and that it refuses a missing Core. Run on a release machine: the production Core is never copied to
+# the CI runner.
+set(TF_CORE_PRODUCTION "" CACHE PATH "the shipped folder of the production Core release core/CORE_RELEASE names (integration tests)")
+if(TF_CORE_PRODUCTION)
+  if(WIN32)
+    set(_pin_target windows-x64)
+    set(_pin_bin "${TF_CORE_PRODUCTION}/qlcore.dll")
+  else()
+    set(_pin_target linux-x64)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+      set(_pin_target linux-arm64)
+    endif()
+    set(_pin_bin "${TF_CORE_PRODUCTION}/qlcore.so")
+  endif()
+  file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/core/CORE_RELEASE" _pin_line REGEX "^${_pin_target} ")
+  string(REGEX REPLACE "^[^ ]+ [^ ]+ ([0-9a-f]+)$" "\\1" _pin_sha "${_pin_line}")
+  add_executable(tf40_pin test/tf40_pin.c)
+  target_compile_options(tf40_pin PRIVATE -O2 -Wall -Wextra)
+  if(NOT WIN32)
+    target_link_libraries(tf40_pin PRIVATE ${CMAKE_DL_LIBS})
+  endif()
+  add_test(NAME tf40_production_sha256 COMMAND ${CMAKE_COMMAND} -DFILE=${_pin_bin} -DWANT=${_pin_sha} -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_sha256.cmake")
+  add_test(NAME tf40_production_pin COMMAND tf40_pin "${_pin_bin}" "${CMAKE_CURRENT_SOURCE_DIR}/core/CORE_RELEASE"
+           "${CMAKE_CURRENT_SOURCE_DIR}/core/qlcore.h" ${_pin_target})
+  set_tests_properties(tf40_production_sha256 tf40_production_pin PROPERTIES LABELS production TIMEOUT 60)
+endif()
+# the 3.x library tests that need no model (the client, sharing, telemetry, the error catalogue)
 add_test(NAME tf_ogg COMMAND tf_tests ogg "${TF_VEC}/ogg" "${TF_WORK}/ogg")
 add_test(NAME tf_codec COMMAND tf_tests codec "${TF_VEC}" "${TF_WORK}/codec")
 add_test(NAME tf_sharing COMMAND tf_tests sharing "${TF_VEC}" "${TF_DATA}/client-fixtures.json" "${TF_WORK}/sharing")
 add_test(NAME tf_upload COMMAND tf_tests upload "${TF_WORK}/upload")
+add_test(NAME tf_join_window COMMAND tf_tests join_window "${TF_WORK}/join_window")
 add_test(NAME tf_client COMMAND tf_tests client "${TF_DATA}/client-fixtures.json" "${TF_WORK}/client")
 add_test(NAME tf_bitrate COMMAND tf_tests bitrate "${TF_VEC}" "${TF_WORK}/bitrate")
 add_test(NAME tf_consent COMMAND tf_tests consent "${TF_VEC}" "${TF_DATA}/client-fixtures.json" "${TF_WORK}/consent")
 add_test(NAME tf_telemetry COMMAND tf_tests telemetry "${TF_WORK}/telemetry")
 add_test(NAME tf_sdk_latest COMMAND tf_tests sdk_latest "${TF_DATA}/sdk_latest_configs.json" "${TF_WORK}/sdk_latest")
-add_test(NAME tf_manifest COMMAND tf_tests manifest "${TF_DATA}" "${TF_WORK}/manifest")
-add_test(NAME tf_takes COMMAND tf_tests takes "${TF_VEC}" "${TF_WORK}/takes")
 add_test(NAME tf_errors COMMAND tf_tests errors "${TF_DATA}/sdk_3.0.0")
-add_test(NAME tf_vectors30 COMMAND tf_tests vectors30 "${TF_DATA}/sdk_3.0.0" "${TF_WORK}/vectors30")
-add_test(NAME tf_api COMMAND tf_tests api "${TF_WORK}/api" "${TF_DATA}/sdk_3.0.0")
-add_test(NAME tf_share30 COMMAND tf_tests share30 "${TF_DATA}/sdk_3.0.0" "${TF_WORK}/share30")
-# 3.0.1: sharing turned off, or what was shared deleted, while an upload is in flight: the 17 shared situations (12 during an upload, 5 restart) and two own rows, 20 runs each
-add_test(NAME tf_sharing_off COMMAND tf_tests sharing_off "${TF_WORK}/sharing_off")
-set(TF_LIBRARY_TESTS tf_ogg tf_codec tf_sharing tf_upload tf_client tf_bitrate tf_consent tf_telemetry tf_sdk_latest tf_manifest tf_takes
-    tf_errors tf_vectors30 tf_api tf_share30 tf_sharing_off)
-set_tests_properties(${TF_LIBRARY_TESTS} PROPERTIES FIXTURES_REQUIRED tf_work LABELS library TIMEOUT 600)
-# twenty-minute recordings are encoded for the cap cases of the shared vector: a few minutes on a slow runner
-set_tests_properties(tf_share30 PROPERTIES TIMEOUT 1500)
-# 380 runs; the two own rows wait 2 s per run by design
-set_tests_properties(tf_sharing_off PROPERTIES TIMEOUT 1500)
+add_test(NAME tf_crypto COMMAND tf_tests crypto)
+get_property(_all DIRECTORY PROPERTY TESTS)
+list(REMOVE_ITEM _all tf40_production_sha256 tf40_production_pin tf_work_clean tf40_flow tf40_flow_data tf40_switches tf40_share_moments tf40_share_flac tf40_errors_flow tf40_lease_clock tf40_grace tf40_grace_data tf40_grace_vectors)
+set_tests_properties(${_all} PROPERTIES FIXTURES_REQUIRED tf_work LABELS library TIMEOUT 600)
 if(Python3_FOUND)
-  # the public surface is NAMING.md's and nothing else; the README's quick start is the example's marked region
   add_test(NAME tf_api_scan COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test/api_scan.py")
   add_test(NAME tf_quickstart COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test/quickstart_check.py")
   set_tests_properties(tf_api_scan tf_quickstart PROPERTIES TIMEOUT 120)
-  # 3.1.3: the model download through the real HTTP code (WinHTTP, libcurl), which every test above replaces.
-  # The script starts a stand-in model host on 127.0.0.1 (plain HTTP/1.1), runs `tf_tests net` against it and
-  # stops it: the stall limit, the resume inside the call and its bound, a 200 to a range request, refusals, a
-  # slow link, one connection for a download, the cancel, the protocol in the diagnosis.
-  add_test(NAME tf_net COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test/net_stand_in.py" $<TARGET_FILE:tf_tests>
-           "${TF_WORK}/net")
-  set_tests_properties(tf_net PROPERTIES FIXTURES_REQUIRED tf_work LABELS library TIMEOUT 300)
 endif()
-target_link_libraries(vnni_check PRIVATE zf_gemm_vnni)
-target_link_libraries(cpu_detect PRIVATE zf_gemm_vnni)
-# dropin compares the native kernels to the engine's OWN kernel, so it links the engine WITHOUT the hook
-target_link_libraries(dropin_check PRIVATE zf_engine zf_gemm_vnni)
-# hooked runs the engine's entry points through the hook
-target_link_libraries(hooked_check PRIVATE zf_engine zf_vnni_hook zf_gemm_vnni)
-
-# --- optional CUDA int8 tier (needs the CUDA toolkit) ---
-option(ZF_CUDA "Build the CUDA int8 GEMM tier" OFF)
-if(ZF_CUDA)
-  enable_language(CUDA)
-  add_library(zf_gemm_cuda STATIC cuda/zf_gemm_cuda.cu)
-  target_include_directories(zf_gemm_cuda PUBLIC include)
-  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set_target_properties(zf_gemm_cuda PROPERTIES CUDA_ARCHITECTURES "75;80;86;89;90")
-  endif()
-  message(STATUS "CUDA int8 tier: enabled (dp4a; verify against the CPU kernel on the target GPU)")
-endif()
-
-message(STATUS "tajweedformer-native: engine with the native int8 hook (AVX-512 VNNI / AVX-VNNI / AVX2); run ctest")
