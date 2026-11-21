@@ -22,6 +22,7 @@
 int tf__http_opened;
 static TfHttpTransport g_transport;
 static void *g_transport_user;
+const char *tf__http_proxy;
 void tf_http_set_transport(TfHttpTransport t, void *user) {
   g_transport = t;
   g_transport_user = user;
@@ -130,8 +131,10 @@ static long long download_cap(const TfHttpRequest *q, int status) {
   return status == 206 ? q->download_size - q->range_from : q->download_size;
 }
 
-/* resolving, connecting and sending a model request: 30 s each (the stall limit is about the answer) */
+/* resolving and sending a model request: 30 s each (the stall limit is about the answer) */
 #define TF_HTTP_STEP_MS 30000
+/* ENDPOINTS_40.md 28.3 item 6 (SDK 4.0.1): a host has 5 s to connect, on every request; then the next host is asked */
+#define TF_HTTP_CONNECT_MS TF_EP_CONNECT_MS
 
 #ifdef _WIN32
 #include <windows.h>
@@ -182,11 +185,20 @@ static wchar_t *widen(const char *s) {
  * Windows 11 and Server 2022; where the system refuses the pair, HTTP/2 alone is asked for, and where it refuses
  * that too (before Windows 10 1607) the session stays on HTTP/1.1. None of the three is an error. */
 static HINTERNET open_session(int newer) {
-  HINTERNET ses = WinHttpOpen(L"TajweedFormer-native/" TF_SDK_VERSION, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
-                              WINHTTP_NO_PROXY_BYPASS, 0);
+  HINTERNET ses;
+  if (tf__http_proxy && *tf__http_proxy) {
+    /* a test program's proxy (tf__http_proxy): every request through it, https by CONNECT, nothing bypasses it */
+    wchar_t px[160];
+    if (!MultiByteToWideChar(CP_UTF8, 0, tf__http_proxy, -1, px, (int)(sizeof px / sizeof px[0]))) return NULL;
+    ses = WinHttpOpen(L"TajweedFormer-native/" TF_SDK_VERSION, WINHTTP_ACCESS_TYPE_NAMED_PROXY, px, WINHTTP_NO_PROXY_BYPASS, 0);
+  } else {
+    ses = WinHttpOpen(L"TajweedFormer-native/" TF_SDK_VERSION, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+                      WINHTTP_NO_PROXY_BYPASS, 0);
+  }
   if (ses) tf__http_opened++;
   if (ses && newer) {
-    DWORD flags = WINHTTP_PROTOCOL_FLAG_HTTP2 | WINHTTP_PROTOCOL_FLAG_HTTP3;
+    /* HTTP/3 is QUIC over UDP, which no CONNECT proxy carries: with a test proxy, HTTP/2 at most */
+    DWORD flags = tf__http_proxy && *tf__http_proxy ? WINHTTP_PROTOCOL_FLAG_HTTP2 : WINHTTP_PROTOCOL_FLAG_HTTP2 | WINHTTP_PROTOCOL_FLAG_HTTP3;
     if (!WinHttpSetOption(ses, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, &flags, sizeof flags)) {
       flags = WINHTTP_PROTOCOL_FLAG_HTTP2;
       WinHttpSetOption(ses, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, &flags, sizeof flags);
@@ -200,30 +212,91 @@ static HINTERNET open_session(int newer) {
  * handle is closed: the session and the connection of a kept connection stay for whoever opened them. */
 typedef struct {
   HINTERNET h;
-  volatile int *cancel;
+  volatile int *cancel; /* may be NULL: a slot for the headers' bound alone */
+  double head_by;       /* 4.0.1 (28.3 item 6): tf__now_s by which the headers must be in; 0 for none (or they are) */
+  int head_late;        /* the watchdog closed the handle for it */
 } CancelSlot;
 static CancelSlot g_slots[32];
 static SRWLOCK g_slot_lock = SRWLOCK_INIT;
-static int slot_add(HINTERNET h, volatile int *cancel) {
-  int at = -1;
+static int g_watchdog; /* the watchdog thread runs (under the lock) */
+/* The headers' bound: one thread looks at the slots every 100 ms and closes the handle of a request whose headers are
+ * late, which makes its synchronous call fail at once, as a cancel does. It ends when no request has a bound, so a
+ * library that is unloaded leaves no thread of its own running for long. */
+static DWORD WINAPI watchdog(LPVOID p) {
+  (void)p;
+  int idle = 0;
+  for (;;) {
+    Sleep(100);
+    const double now = tf__now_s();
+    int pending = 0;
+    AcquireSRWLockExclusive(&g_slot_lock);
+    for (int i = 0; i < 32; ++i) {
+      if (!g_slots[i].h || g_slots[i].head_by <= 0) continue;
+      if (now >= g_slots[i].head_by) {
+        WinHttpCloseHandle(g_slots[i].h);
+        g_slots[i].h = NULL;
+        g_slots[i].head_late = 1;
+      } else {
+        pending = 1;
+      }
+    }
+    idle = pending ? 0 : idle + 1;
+    if (idle >= 10) {
+      g_watchdog = 0;
+      ReleaseSRWLockExclusive(&g_slot_lock);
+      return 0;
+    }
+    ReleaseSRWLockExclusive(&g_slot_lock);
+  }
+}
+/* the request's slot: its index; -1 when it is cancelled already; -2 when every slot is taken (no cancel, no bound) */
+static int slot_add(HINTERNET h, volatile int *cancel, double head_by) {
+  int at = -2;
   AcquireSRWLockExclusive(&g_slot_lock);
-  if (!*cancel)
+  if (cancel && *cancel) {
+    at = -1;
+  } else {
     for (int i = 0; i < 32; ++i)
-      if (!g_slots[i].h) {
+      if (!g_slots[i].h && !g_slots[i].head_late) {
         g_slots[i].h = h;
         g_slots[i].cancel = cancel;
+        g_slots[i].head_by = head_by;
         at = i;
         break;
       }
+  }
+  if (at >= 0 && head_by > 0 && !g_watchdog) {
+    HANDLE t = CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
+    if (t) {
+      g_watchdog = 1;
+      CloseHandle(t);
+    }
+  }
   ReleaseSRWLockExclusive(&g_slot_lock);
   return at;
 }
-/* 1: the caller still owns the handle (close it); 0: the canceller closed it */
+/* the headers are in: the bound is met */
+static void slot_head_done(int at) {
+  if (at < 0) return;
+  AcquireSRWLockExclusive(&g_slot_lock);
+  g_slots[at].head_by = 0;
+  ReleaseSRWLockExclusive(&g_slot_lock);
+}
+static int slot_head_late(int at) {
+  if (at < 0) return 0;
+  AcquireSRWLockExclusive(&g_slot_lock);
+  const int late = g_slots[at].head_late;
+  ReleaseSRWLockExclusive(&g_slot_lock);
+  return late;
+}
+/* 1: the caller still owns the handle (close it); 0: the canceller or the watchdog closed it */
 static int slot_remove(int at) {
   AcquireSRWLockExclusive(&g_slot_lock);
   const int mine = g_slots[at].h != NULL;
   g_slots[at].h = NULL;
   g_slots[at].cancel = NULL;
+  g_slots[at].head_by = 0;
+  g_slots[at].head_late = 0;
   ReleaseSRWLockExclusive(&g_slot_lock);
   return mine;
 }
@@ -339,14 +412,15 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
      * WinHTTP looks at its waits about every four seconds, so a stalled request ends up to four seconds after
      * the limit, never before it. Measured on Windows 11 with test/net_stand_in.py (TF_NET_PROBE_STALL_MS): limits
      * of 0.5, 1.5, 5 and 10 s ended a stalled request after 4, 4, 8 and 12 s. With 30 s that is 30 to 34 s. */
-    WinHttpSetTimeouts(req, TF_HTTP_STEP_MS, TF_HTTP_STEP_MS, TF_HTTP_STEP_MS, q->stall_ms);
+    WinHttpSetTimeouts(req, TF_HTTP_STEP_MS, TF_HTTP_CONNECT_MS, TF_HTTP_STEP_MS, q->stall_ms);
   } else {
     const int to = (q->timeout_s > 0 ? q->timeout_s : 60) * 1000;
-    WinHttpSetTimeouts(req, to, to, to, to);
+    WinHttpSetTimeouts(req, to, to < TF_HTTP_CONNECT_MS ? to : TF_HTTP_CONNECT_MS, to, to);
   }
-  if (q->cancel) {
-    slot = slot_add(req, q->cancel);
-    if (slot < 0) {
+  if (q->cancel || q->head_ms > 0) {
+    /* 4.0.1 (28.3 item 6): the headers within head_ms of the request's start, whatever stage it stalls in */
+    slot = slot_add(req, q->cancel, q->head_ms > 0 ? tf__now_s() + q->head_ms / 1000.0 : 0);
+    if (slot == -1) {
       tf__fail(TF__ERR_NETWORK, "cancelled");
       goto done;
     }
@@ -380,9 +454,16 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
   }
   if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0, (LPVOID)body, (DWORD)body_n, (DWORD)body_n, 0) ||
       !WinHttpReceiveResponse(req, NULL)) {
-    fail_winhttp(q, "the request failed");
+    if (slot_head_late(slot)) {
+      /* no answer within the headers' bound: a timeout before any answer (24.3 network), the next host is asked */
+      tf__http_note(TF__FAIL_TIMEOUT, "ERROR_WINHTTP_TIMEOUT", (long)ERROR_WINHTTP_TIMEOUT);
+      tf__fail(TF__ERR_NETWORK, "no answer within %d ms", q->head_ms);
+    } else {
+      fail_winhttp(q, "the request failed");
+    }
     goto done;
   }
+  slot_head_done(slot);
   DWORD st = 0, sz = sizeof st;
   WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &st, &sz,
                       WINHTTP_NO_HEADER_INDEX);
@@ -459,6 +540,7 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
         goto done;
       }
       in_file += take;
+      if (take && q->on_data) q->on_data(q->bytes_user, buf, (size_t)take);
       if (take && q->on_bytes) q->on_bytes(q->bytes_user, (long long)take);
       if (past) {
         tf_buf_free(&b);
@@ -519,6 +601,7 @@ typedef struct {
   int too_long;       /* the body ran past the file's size: cut off there */
   long long cap, in_file; /* how many bytes the file may take (-1: no limit), and has taken */
   int stalled;        /* the stall limit ended the transfer */
+  int head_late;      /* 4.0.1: no byte of the answer within the request's head_ms */
   int answering;      /* the request is on its way: the stall clock runs */
   double start, last; /* when the transfer began; when the last byte of the answer arrived (tf__now_s) */
 } CurlCtx;
@@ -568,6 +651,7 @@ static size_t on_body(char *p, size_t s, size_t n, void *u) {
     }
     const size_t w = take ? fwrite(p, 1, take, c->file) : 0;
     c->in_file += (long long)w;
+    if (w && c->q->on_data) c->q->on_data(c->q->bytes_user, p, w);
     if (w && c->q->on_bytes) c->q->on_bytes(c->q->bytes_user, (long long)w);
     if (w != take) c->io_failed = 1;
     return c->too_long || c->io_failed ? 0 : s * n;
@@ -584,6 +668,12 @@ static int on_progress(void *u, curl_off_t a, curl_off_t b, curl_off_t c2, curl_
   (void)a, (void)b, (void)c2, (void)d;
   CurlCtx *c = (CurlCtx *)u;
   if (c->q->cancel && __atomic_load_n(c->q->cancel, __ATOMIC_SEQ_CST)) return 1;
+  /* 4.0.1 (28.3 item 6): the answer's first byte within head_ms of the start (the connect, TLS and a proxy have the
+   * connect timeout's 5 s inside it) */
+  if (c->q->head_ms > 0 && !c->got_byte && (tf__now_s() - c->start) * 1000.0 > c->q->head_ms) {
+    c->head_late = 1;
+    return 1;
+  }
   if (c->q->stall_ms > 0) {
     /* The stall limit: the time since the last byte of the answer arrived (a header line or a piece of the
      * body), and before the first byte the time since the connection was ready for the request (connecting has
@@ -662,14 +752,22 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
 #else
   curl_easy_setopt(h, CURLOPT_REDIR_PROTOCOLS, 0L);
 #endif
-  curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, (long)(TF_HTTP_STEP_MS / 1000));
+  if (tf__http_proxy && *tf__http_proxy) { /* a test program's proxy: https through it by CONNECT */
+    curl_easy_setopt(h, CURLOPT_PROXY, tf__http_proxy);
+    curl_easy_setopt(h, CURLOPT_HTTPPROXYTUNNEL, 1L);
+  }
+  /* the connect (TCP and TLS) has 5 s (28.3 item 6), never more than the whole request */
+  {
+    const long whole = q->stall_ms > 0 ? 0 : (long)(q->timeout_s > 0 ? q->timeout_s : 600) * 1000;
+    curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, whole && whole < TF_HTTP_CONNECT_MS ? whole : (long)TF_HTTP_CONNECT_MS);
+  }
   /* with a stall limit there is no limit on the whole transfer (on_progress ends a stalled one) */
   curl_easy_setopt(h, CURLOPT_TIMEOUT, q->stall_ms > 0 ? 0L : (long)(q->timeout_s > 0 ? q->timeout_s : 600));
   curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, on_header);
   curl_easy_setopt(h, CURLOPT_HEADERDATA, &c);
   curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, on_body);
   curl_easy_setopt(h, CURLOPT_WRITEDATA, &c);
-  if (q->cancel || q->stall_ms > 0) {
+  if (q->cancel || q->stall_ms > 0 || q->head_ms > 0) { /* 4.0.1: the headers' bound is checked there too */
     curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, on_progress);
     curl_easy_setopt(h, CURLOPT_XFERINFODATA, &c);
     curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
@@ -724,8 +822,9 @@ static int http_native(const TfHttpRequest *q, TfHttpResponse *r) {
       tf__http_note(TF__FAIL_CANCELLED, "CURLE_ABORTED_BY_CALLBACK", (long)cc);
       return tf__fail(TF__ERR_NETWORK, "cancelled");
     }
-    tf__http_note(c.stalled || cc == CURLE_OPERATION_TIMEDOUT ? TF__FAIL_TIMEOUT : TF__FAIL_NETWORK, curl_name(cc), (long)cc);
+    tf__http_note(c.stalled || c.head_late || cc == CURLE_OPERATION_TIMEDOUT ? TF__FAIL_TIMEOUT : TF__FAIL_NETWORK, curl_name(cc), (long)cc);
     if (c.stalled) return tf__fail(TF__ERR_NETWORK, "the request failed: no byte for %d ms", q->stall_ms);
+    if (c.head_late) return tf__fail(TF__ERR_NETWORK, "no answer within %d ms", q->head_ms);
     return tf__fail(TF__ERR_NETWORK, "%s", curl_easy_strerror(cc));
   }
   r->body_n = c.body.n;
@@ -762,6 +861,22 @@ unsigned tf__http_answer(int *status, int *api_error) {
 void tf__http_answer_none(void) {
   t_ans_seq++;
   t_ans_status = t_ans_api_error = 0;
+}
+/* the thread's record of its last request (the failure and the answer), saved and put back: a request asked of several
+ * hosts (tf_endpoints.c) ends as the answer it was taken on, or, when every host was unreachable, as the first host's */
+void tf__http_state_save(TfHttpState *s) {
+  s->kind = t_fail_kind;
+  memcpy(s->name, t_fail_name, sizeof s->name);
+  memcpy(s->code, t_fail_code, sizeof s->code);
+  s->status = t_ans_status;
+  s->api_error = t_ans_api_error;
+}
+void tf__http_state_restore(const TfHttpState *s) {
+  t_fail_kind = s->kind;
+  memcpy(t_fail_name, s->name, sizeof s->name);
+  memcpy(t_fail_code, s->code, sizeof s->code);
+  t_ans_status = s->status;
+  t_ans_api_error = s->api_error;
 }
 int tf_http(const TfHttpRequest *q, TfHttpResponse *r) {
   tf__http_note(TF__FAIL_NETWORK, NULL, 0);

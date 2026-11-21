@@ -897,6 +897,8 @@ static void rec_crash(Share *s, Rec *o) {
 }
 
 uint32_t tf__share_serial; /* tests: the Ogg serial of the next recordings (0: random) */
+void (*tf__share_test_opened)(const char *id);           /* tests: a new recording's folder and session.json are written */
+void (*tf__share_test_looked)(const char *id, int active); /* tests: an upload pass looked whether a capture owns a folder */
 
 /* a new recording: its folder, session JSON, capture.json and first marker, the encoder and the stream's headers */
 static Rec *rec_open(TfClient *c, Share *s, int rate, const char *route, const char *revision, const char *contributor,
@@ -933,7 +935,14 @@ static Rec *rec_open(TfClient *c, Share *s, int rate, const char *route, const c
   long long take_seq, gap_prev;
   seq_next(c, start_wall, &take_seq, &gap_prev);
   char *body = session_json(contributor, key, rhash, cv, ch, rate, route, revision, take_seq, gap_prev, x->flac);
+  /* active before its folder exists, so an upload pass that can see the folder knows that a capture owns it. It
+   * was marked after the folder and session.json: a pass that looked in between took the opening recording for
+   * one a crash left, closed it at its last whole page, and once those segments were up deleted the folder under
+   * the capture, whose next write failed and lost the take (4.0.0 to 4.0.1; found in CI, 2026-11-21). The pass's
+   * sweep could also delete such a folder before its stamp was written. */
+  set_active(s, x->id, 1);
   if (!dir || !body || tf_mkdirs(dir) || write_text(s, x->id, "stamp", stamp) || write_text(s, x->id, "session.json", body)) {
+    set_active(s, x->id, 0);
     free(dir);
     free(body);
     free(x);
@@ -941,7 +950,7 @@ static Rec *rec_open(TfClient *c, Share *s, int rate, const char *route, const c
     return NULL;
   }
   free(body);
-  set_active(s, x->id, 1);
+  if (tf__share_test_opened) tf__share_test_opened(x->id);
   uint32_t serial;
   tf_random_bytes((uint8_t *)&serial, sizeof serial);
   if (tf__share_serial) serial = tf__share_serial;
@@ -1967,6 +1976,7 @@ static int step(TfClient *c, Share *s, const char *id) {
   tf_mutex_lock(&s->m);
   const int active = is_active(s, id);
   tf_mutex_unlock(&s->m);
+  if (tf__share_test_looked) tf__share_test_looked(id, active);
   if (!live(c, s)) return 1; /* 3.0.1: a stop since the pass began */
   if (stale(c, s, id)) {
     /* begun before a stop that could not delete it (or whose deletion never ran): never uploaded. It is deleted
@@ -1995,7 +2005,11 @@ static int step(TfClient *c, Share *s, const char *id) {
       char *p = sess_path(s, id, "session.json");
       const int has_session = p && tf_file_exists(p);
       free(p);
-      if (!has_session) live_remove(c, s, id); /* a folder with no session at all */
+      /* a folder with no session at all, unless a capture took it up since the look above */
+      if (!has_session && live_lock(c, s)) {
+        if (!is_active(s, id)) remove_session(s, id);
+        tf_mutex_unlock(&s->m);
+      }
     }
     return 0;
   }
@@ -2006,6 +2020,11 @@ static int step(TfClient *c, Share *s, const char *id) {
     if (!live_lock(c, s)) {
       tf_json_free(cap);
       return 1;
+    }
+    if (is_active(s, id)) { /* a capture took it up since the look above: it is being recorded, not left */
+      tf_mutex_unlock(&s->m);
+      tf_json_free(cap);
+      return 0;
     }
     recover(s, id, cap);
     tf_mutex_unlock(&s->m);

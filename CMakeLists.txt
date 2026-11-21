@@ -45,7 +45,8 @@ set(TF_SOURCES src/tf/tf_util.c src/tf/tf_crypto.c src/tf/tf_model.c src/tf/tf_h
     src/tf/tf_decode.c src/tf/tf_topk.c src/tf/tf_rank.c src/tf/tf_reference.c src/tf/tf_http.c src/tf/tf_download.c src/tf/tf_store.c
     src/tf/tf_client.c src/tf/tf_api.c src/tf/tf_sharing.c src/tf/tf_copy_deck.c src/tf/tf_ogg.c src/tf/tf_devicekey.c
     src/tf/tf_inflate.c src/tf/tf_share.c src/tf/tf_share_audio.c src/tf/tf_ikey.c src/tf/tf_platform.c src/tf/tf_lease.c
-    src/tf/tf_recited.c src/tf/tf_learner.c src/tf/tf_flac.c src/tf/tf_share_ask.c src/tf/tf_report.c)
+    src/tf/tf_recited.c src/tf/tf_learner.c src/tf/tf_flac.c src/tf/tf_share_ask.c src/tf/tf_report.c src/tf/tf_endpoints.c
+    src/tf/tf_qos.c)
 # libopus for the shared-session upload (cmake/opus.cmake: the pinned 1.6.1 release, float, plain C)
 include(cmake/opus.cmake)
 set(TF_WARN -O2 -Wall -Wextra -Wvla)
@@ -146,6 +147,11 @@ function(tf_test_exe name src)
 endfunction()
 tf_test_exe(tf_tests test/tf_tests.c)
 tf_test_exe(tf40_tests test/tf40_tests.c)
+# 4.0.1: the loopback stand-in server of tf40_tests loopback (test/tf_loopback.c: 127.0.0.1 only)
+target_sources(tf40_tests PRIVATE test/tf_loopback.c)
+if(WIN32)
+  target_link_libraries(tf40_tests PRIVATE ws2_32)
+endif()
 if(WIN32)
   get_filename_component(_cc_dir "${CMAKE_C_COMPILER}" DIRECTORY)
   foreach(t tf_tests tf40_tests tajweedformer_cli tajweedformer_eval quickstart)
@@ -161,7 +167,7 @@ foreach(t ikey recited outcome json_leak learner)
 endforeach()
 # tajweedformer-eval's own parts (no model): edit distance, references, WAV and FLAC (test/data/eval: test/make_eval_flac.py)
 add_test(NAME tf40_eval_units COMMAND tf40_tests eval_units "${TF_DATA}/eval" "${TF_WORK}/tf40_eval_units")
-# error reports (ERRORS_40.md 24): test/data/sdk_4.0.0/errors_40.json is the contract's vectors/errors_40.json at 1c971ab,
+# error reports (ERRORS_40.md 24): test/data/sdk_4.0.0/errors_40.json is the contract's vectors/errors_40.json at 564c144,
 # byte for byte (tools/errors40.py --check); its codes, queue, telemetry and signatures through this library
 add_test(NAME tf40_errors COMMAND tf40_tests errors "${TF_DATA}/sdk_4.0.0" "${TF_WORK}/tf40_errors")
 # 4.0 with the contract's vectors (TF_CONTRACT, a quranlab-contract checkout; its test keys only): lease, clock,
@@ -172,7 +178,9 @@ if(TF_CONTRACT)
   # configure, as the Core does (another agent edits the contract's working tree): c7f6e9b, spec fix 16 with
   # piece_order.json's four sequences, section 19 (vectors/sharing40) and section 20 (vectors/share_ask.json); the
   # earlier vectors are byte for byte those of fba80eb, the commit quranlab-core d128af8 pins.
-  set(TF_CONTRACT_COMMIT "1c971ab" CACHE STRING "the quranlab-contract commit whose sdk_4.0.0 vectors and tools the tests read")
+  # 4.0.1: 564c144, sections 27 (app_version and app_build, tf_client_create2) and 28 (endpoint sets, four hosts a role),
+  # and ERRORS_40 24.3's Core status at the model open (vectors/endpoints_40.json, errors_40.json, standby_40.json).
+  set(TF_CONTRACT_COMMIT "564c144" CACHE STRING "the quranlab-contract commit whose sdk_4.0.0 vectors and tools the tests read")
   set(TF_C40 "${CMAKE_BINARY_DIR}/contract-${TF_CONTRACT_COMMIT}/sdk_4.0.0")
   # TF_CONTRACT is a checkout (the files are exported by git at the pinned commit), or a folder that already holds
   # that export (CI: no git access to the contract; tools/ci/contract_export.py writes it with a COMMIT file naming
@@ -192,7 +200,8 @@ if(TF_CONTRACT)
             vectors/piece_order.json vectors/share_ask.json vectors/sharing40/flac_cases.json vectors/sharing40/pcm16.json
             vectors/sharing40/device_model.json vectors/sharing40/upload_start.json vectors/sharing40/flac16k/expected.json
             vectors/sharing40/flac16k/seg-00001.oga vectors/sharing40/flac16k/seg-00002.oga vectors/sharing40/flac16k/seg-00003.oga
-            vectors/sharing40/flac16k/seg-00004.oga vectors/grace.json tools/protected40.py tools/share_ask.py tools/sharing40.py)
+            vectors/sharing40/flac16k/seg-00004.oga vectors/grace.json tools/protected40.py tools/share_ask.py tools/sharing40.py
+            vectors/endpoints_40.json vectors/errors_40.json vectors/standby_40.json)
     get_filename_component(_d "${TF_C40}/${f}" DIRECTORY)
     file(MAKE_DIRECTORY "${_d}")
     if(_export)
@@ -209,8 +218,18 @@ if(TF_CONTRACT)
       message(WARNING "cannot export sdk_4.0.0/${f} at ${TF_CONTRACT_COMMIT} from ${TF_CONTRACT}")
     endif()
   endforeach()
+  # the error catalogue at the same commit (sdk_3.0.0/errors.json): tf_errors compares the embedded bytes with it
+  set(TF_C30_ERRORS "${CMAKE_BINARY_DIR}/contract-${TF_CONTRACT_COMMIT}/sdk_3.0.0/errors.json")
+  file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/contract-${TF_CONTRACT_COMMIT}/sdk_3.0.0")
+  if(_export)
+    if(EXISTS "${TF_CONTRACT}/sdk_3.0.0/errors.json")
+      file(COPY_FILE "${TF_CONTRACT}/sdk_3.0.0/errors.json" "${TF_C30_ERRORS}")
+    endif()
+  else()
+    execute_process(COMMAND git -C "${TF_CONTRACT}" show "${TF_CONTRACT_COMMIT}:sdk_3.0.0/errors.json" OUTPUT_FILE "${TF_C30_ERRORS}" RESULT_VARIABLE _rc)
+  endif()
   set(TF_VEC40 "${TF_C40}/vectors")
-  foreach(t lease clock container attest flac share_ask)
+  foreach(t lease clock container attest flac share_ask qos)
     add_test(NAME tf40_${t} COMMAND tf40_tests ${t} "${TF_VEC40}" "${TF_WORK}/tf40_${t}")
   endforeach()
   if(Python3_FOUND)
@@ -218,18 +237,25 @@ if(TF_CONTRACT)
              --out "${TF_WORK}/flow40")
     set_tests_properties(tf40_flow_data PROPERTIES FIXTURES_SETUP tf_flow40 FIXTURES_REQUIRED tf_work TIMEOUT 120)
     add_test(NAME tf40_flow COMMAND tf40_tests flow "${TF_WORK}/flow40" "${TF_WORK}/tf40_flow")
+    add_test(NAME tf40_lanes COMMAND tf40_tests lanes "${TF_WORK}/flow40" "${TF_WORK}/tf40_lanes")
     add_test(NAME tf40_switches COMMAND tf40_tests switches "${TF_WORK}/flow40" "${TF_WORK}/tf40_switches")
     add_test(NAME tf40_share_moments COMMAND tf40_tests share_moments "${TF_WORK}/flow40" "${TF_WORK}/tf40_share_moments")
     add_test(NAME tf40_share_flac COMMAND tf40_tests share_flac "${TF_WORK}/flow40" "${TF_WORK}/tf40_share_flac")
-    add_test(NAME tf40_errors_flow COMMAND tf40_tests errors_flow "${TF_WORK}/flow40" "${TF_WORK}/tf40_errors_flow")
+    add_test(NAME tf40_errors_flow COMMAND tf40_tests errors_flow "${TF_WORK}/flow40" "${TF_WORK}/tf40_errors_flow" "${TF_DATA}/sdk_4.0.0")
     add_test(NAME tf40_lease_clock COMMAND tf40_tests lease_clock "${TF_WORK}/flow40" "${TF_WORK}/tf40_lease_clock")
+    # 4.0.1: section 27 (app_version and app_build, tf_client_create2), section 28's vectors replayed on this SDK's code,
+    # and 28.8's checks on the real HTTP code against stand-in servers on 127.0.0.1
+    add_test(NAME tf40_app27 COMMAND tf40_tests app27 "${TF_WORK}/flow40" "${TF_WORK}/tf40_app27")
+    add_test(NAME tf40_endpoints COMMAND tf40_tests endpoints "${TF_VEC40}" "${TF_WORK}/flow40" "${TF_WORK}/tf40_endpoints")
+    add_test(NAME tf40_loopback COMMAND tf40_tests loopback "${TF_WORK}/flow40" "${TF_WORK}/tf40_loopback")
     add_test(NAME tf40_grace COMMAND tf40_tests grace "${TF_WORK}/flow40" "${TF_VEC40}" "${TF_WORK}/tf40_grace")
     add_test(NAME tf40_grace_data COMMAND ${Python3_EXECUTABLE} -I "${CMAKE_CURRENT_SOURCE_DIR}/test/make_grace40.py" --contract "${TF_C40}"
              --out "${TF_WORK}/grace40")
     set_tests_properties(tf40_grace_data PROPERTIES FIXTURES_SETUP tf_grace40 FIXTURES_REQUIRED tf_work TIMEOUT 120)
     add_test(NAME tf40_grace_vectors COMMAND tf40_tests grace_vectors "${TF_VEC40}" "${TF_WORK}/grace40" "${TF_WORK}/tf40_grace_vectors")
     set_tests_properties(tf40_grace_vectors PROPERTIES FIXTURES_REQUIRED "tf_work;tf_grace40" TIMEOUT 600)
-    set_tests_properties(tf40_flow tf40_switches tf40_share_moments tf40_share_flac tf40_errors_flow tf40_lease_clock tf40_grace PROPERTIES FIXTURES_REQUIRED "tf_work;tf_flow40" TIMEOUT 600)
+    set_tests_properties(tf40_flow tf40_lanes tf40_switches tf40_share_moments tf40_share_flac tf40_errors_flow tf40_lease_clock tf40_grace
+                         tf40_app27 tf40_endpoints tf40_loopback PROPERTIES FIXTURES_REQUIRED "tf_work;tf_flow40" TIMEOUT 600)
   endif()
 endif()
 # Production pins (integration): TF_CORE_PRODUCTION names the folder of the Core release this SDK ships with
@@ -273,9 +299,14 @@ add_test(NAME tf_consent COMMAND tf_tests consent "${TF_VEC}" "${TF_DATA}/client
 add_test(NAME tf_telemetry COMMAND tf_tests telemetry "${TF_WORK}/telemetry")
 add_test(NAME tf_sdk_latest COMMAND tf_tests sdk_latest "${TF_DATA}/sdk_latest_configs.json" "${TF_WORK}/sdk_latest")
 add_test(NAME tf_errors COMMAND tf_tests errors "${TF_DATA}/sdk_3.0.0")
+if(TF_C30_ERRORS AND EXISTS "${TF_C30_ERRORS}")
+  # the catalogue of the pinned contract, not a checkout's working tree
+  set_tests_properties(tf_errors PROPERTIES ENVIRONMENT "TF_CONTRACT_ERRORS=${TF_C30_ERRORS}")
+endif()
 add_test(NAME tf_crypto COMMAND tf_tests crypto)
 get_property(_all DIRECTORY PROPERTY TESTS)
-list(REMOVE_ITEM _all tf40_production_sha256 tf40_production_pin tf_work_clean tf40_flow tf40_flow_data tf40_switches tf40_share_moments tf40_share_flac tf40_errors_flow tf40_lease_clock tf40_grace tf40_grace_data tf40_grace_vectors)
+list(REMOVE_ITEM _all tf40_production_sha256 tf40_production_pin tf_work_clean tf40_flow tf40_lanes tf40_flow_data tf40_switches tf40_share_moments tf40_share_flac tf40_errors_flow tf40_lease_clock tf40_grace tf40_grace_data tf40_grace_vectors
+            tf40_app27 tf40_endpoints tf40_loopback)
 set_tests_properties(${_all} PROPERTIES FIXTURES_REQUIRED tf_work LABELS library TIMEOUT 600)
 if(Python3_FOUND)
   add_test(NAME tf_api_scan COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test/api_scan.py")

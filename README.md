@@ -13,7 +13,7 @@
 <p align="center">
   <img alt="platform: Linux, Windows" src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-1c1b19?style=flat-square">
   <img alt="bit-exact: 35 of 35 parity clips" src="https://img.shields.io/badge/bit--exact-35%2F35%20parity%20clips-2a3b8f?style=flat-square">
-  <img alt="version: 4.0.0" src="https://img.shields.io/badge/version-4.0.0-2a3b8f?style=flat-square">
+  <img alt="version: 4.0.1" src="https://img.shields.io/badge/version-4.0.1-2a3b8f?style=flat-square">
   <img alt="model licence: NPL-1.2" src="https://img.shields.io/badge/model%20licence-NPL--1.2-1c1b19?style=flat-square">
 </p>
 
@@ -80,8 +80,8 @@ Copy the setup prompt from [sdk.quranlab.ai](https://sdk.quranlab.ai/go/gh-tajwe
 
 The library builds from this repository's tag inside your project, over the Quran Lab Core, which is not built from
 source: download the Core's binary for your target from the release's folder,
-`https://cdn.quranlab.ai/sdk/native/4.0.0/` (`qlcore-4.0.0-windows-x64.zip` with `qlcore.dll` and
-`libwinpthread-1.dll`, or `qlcore-4.0.0-linux-x64.tar.gz` with `qlcore.so`; `SHA256SUMS` beside them), and unpack
+`https://cdn.quranlab.ai/sdk/native/4.0.1/` (`qlcore-4.0.1-windows-x64.zip` with `qlcore.dll` and
+`libwinpthread-1.dll`, or `qlcore-4.0.1-linux-x64.tar.gz` with `qlcore.so`; `SHA256SUMS` beside them), and unpack
 it into a folder of your project, here `qlcore/`. `CMakeLists.txt`:
 
 ```cmake
@@ -92,7 +92,7 @@ include(FetchContent)
 set(QLCORE_DIR "${CMAKE_SOURCE_DIR}/qlcore" CACHE PATH "the Core's binary for this target")
 FetchContent_Declare(tajweedformer
   GIT_REPOSITORY https://github.com/Quran-Lab/tajweedformer-c.git
-  GIT_TAG        4.0.0)
+  GIT_TAG        4.0.1)
 FetchContent_MakeAvailable(tajweedformer)
 
 add_executable(quickstart quickstart.c)
@@ -124,7 +124,7 @@ checks its own code, and a changed Core gets no lease.
 | **Libraries** | Linux: the development files of libcurl and OpenSSL 3 (`libcurl4-openssl-dev libssl-dev` on Debian and Ubuntu). Windows: none. The build downloads libopus 1.6.1 once and checks its hash. |
 | **Microphone** | The library takes samples; capturing them is your program's part. The quick start pipes the system's recorder in. |
 | **Download** | The model is 56.2 MB for the default context (69.1 MB on disk), encrypted, downloaded once by `tf_client_model` into the SDK's folder; every context together is 58.5 MB. The first run needs a connection. |
-| **Offline** | The model opens under a lease of 24 hours that Quran Lab signs for this install, renewed in the background while the machine is online. When the lease has ended and Quran Lab cannot be reached, the model keeps opening for up to 24 hours more; a refusal ends that at once. A model that is open keeps running. |
+| **Offline** | The first run needs a connection. After that the model works offline, and the SDK keeps itself up to date in the background when the machine is online. When it needs Quran Lab to continue, `tf_client_model` answers `TF_ERR_NEEDS_CONNECTION`. A model that is open keeps running. |
 | **Analytics** | Anonymous counts and durations (never audio, text, names or device identifiers) and reports of the failures your learners hit are always sent; you find them at sdk.quranlab.ai under your app, Problems included. |
 | **Takes** | One Client per process, and one take at a time. A server runs one worker process per take. |
 
@@ -149,7 +149,7 @@ static int recite(const char *key) {
 
 Put your app's id where the example says `com.example.quickstart`: a key works for the first app id that used
 it. `tf_client_model` downloads the model once, verifies every file, installs it encrypted for
-this install, gets its lease, opens it and warms the engine. Each chunk (320 ms of audio) prints what the model heard so far; the take ends by itself after
+this install, gets the key that opens it on this install, opens it and warms the engine. Each chunk (320 ms of audio) prints what the model heard so far; the take ends by itself after
 1.5 s of silence following speech (`end_on_silence_ms`). In a noisy room a take may not end on silence, so keep
 a way to stop (here the end of the input; an app calls `tf_session_finish`); the 20-minute limit ends it in any
 case. Values under 1000 can end a take in a breath pause between two words. A call on a NULL object fails and keeps the first error, so one check at the
@@ -182,9 +182,8 @@ never audio, text, names or device identifiers.
 the transcript (units, text and word timings), a summary of each tajweed head, the processing time and, with
 references, the unit and word error rates. It uses the public C API only, with your app's desktop key: the model is
 downloaded once and runs inside the Core as in any app. **The raw weights are not needed to evaluate the model**, and
-the tool never writes model files or plaintext. Once the model is installed it runs with no network while the
-install's lease is valid (24 hours on a desktop, renewed whenever it is online, and 24 hours more while Quran Lab
-cannot be reached).
+the tool never writes model files or plaintext. The first run needs a connection; after that it works offline, and it
+keeps itself up to date in the background when the machine is online.
 
 It ships beside the library (`tajweedformer-eval.exe` with `tajweedformer.dll`, `qlcore.dll` and
 `libwinpthread-1.dll` on Windows; `tajweedformer-eval` with `libtajweedformer.so` and `qlcore.so` on Linux), and every
@@ -252,7 +251,7 @@ where it says `...`. The output is plain ASCII: the units' letters are `\u` esca
 The last line holds the totals:
 
 ```json
-{"total":{"files":6,"evaluated":6,"failed":0,"with_reference":6,"audio_s":27.507,"processing_s":7.804,"rtf":0.2837,"units":{"ref":138,"hyp":143,"sub":3,"del":0,"ins":5,"rate":0.057971},"words":{"ref":25,"wrong":2,"rate":0.080000},"sdk":"4.0.0","model":"4.1.0","context":"c16_l64","threads":2}}
+{"total":{"files":6,"evaluated":6,"failed":0,"with_reference":6,"audio_s":27.507,"processing_s":7.804,"rtf":0.2837,"units":{"ref":138,"hyp":143,"sub":3,"del":0,"ins":5,"rate":0.057971},"words":{"ref":25,"wrong":2,"rate":0.080000},"sdk":"4.0.1","model":"4.1.0","context":"c16_l64","threads":2}}
 ```
 
 `transcript` is what the public API gives: the decoded text, each unit with its id, time and confidence, and the

@@ -948,6 +948,10 @@ qlc_stream *tf__model_stream(TfModel *m, const char *context, int rate) {
     tf__fail(TF_ERR_SESSION_OPEN, NULL);
     return NULL;
   }
+  /* 4.0.1: the threads the Core makes for the engine (at its open and the stream's) are never power-throttled */
+  TfThreadSnap before;
+  const int making = !m->zm || strcmp(m->eng_context, context) || m->eng_rate != rate || !m->zs;
+  if (making) tf__qos_snapshot(&before);
   if (!m->zm || strcmp(m->eng_context, context) || m->eng_rate != rate) {
     engine_close(m);
     if (engine_files(m, context)) return NULL;
@@ -985,6 +989,7 @@ qlc_stream *tf__model_stream(TfModel *m, const char *context, int rate) {
       return NULL;
     }
   }
+  if (making) tf__qos_mark_new(&before);
   return m->zs;
 }
 

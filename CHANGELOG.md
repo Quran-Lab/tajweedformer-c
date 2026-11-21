@@ -1,9 +1,32 @@
 # Changelog
 
+## 4.0.1
+
+A faster first start, backup servers, and room for new options without a rebuild. No result changes by a bit.
+
+- **Backup servers.** If Quran Lab's main servers can't be reached, the SDK uses backup servers automatically.
+- **A faster first download.** The model's files download up to four at a time, the largest first, and are checked as
+  they arrive, so no file is read again. They start while the install is set up and its model key is asked for;
+  nothing is installed before that key, and nothing is kept without one. Resuming, and the size and SHA-256 checks, are as
+  before.
+- **Windows: the engine is never power-throttled.** Its threads stay on the performance cores of a hybrid CPU when the
+  app is in the background or has no window.
+- **Added: `tf_client_create2` and `TfClientOptionsExt`.** `TfClientOptions` keeps its 4.0.0 fields, so an app built
+  against any 4.0 header runs with any later 4.0 library. New options go in `TfClientOptionsExt`, which starts with
+  its own `size`. Its first field, `app_build`, is the app's build number: with `app_version` it lets the model
+  version rules set for the app on sdk.quranlab.ai give older releases of the app the model they were built for.
+- **Changed: `app_version`** is kept to the ASCII letters, digits, `.`, `+` and `-` (at most 32 characters, no
+  leading `.`, `+` or `-`) before it is sent.
+- **Changed: the diagnose report's `protected.leaseClass`** is `"attested"` or `"standard"`.
+- **Fixed: sharing turned on in a running app** uploads in that process. It waited for the app's next launch.
+- **Fixed: a shared recording could be lost** if the background uploader looked at it in the moment it began. It now
+  goes up whole.
+- **Changed: error reports** name the engine's status when a model cannot be opened.
+
 ## 4.0.0
 
 The model is protected. The engine, the model's formats and its keys move into the Quran Lab Core, a closed binary
-beside this library, and the model opens only inside it, under a lease for each install. The calls of a take stay as
+beside this library, and the model opens only inside it, with a key for each install. The calls of a take stay as
 they were. Moving from 3.x: [docs/migrating-to-4.md](docs/migrating-to-4.md).
 
 - **Changed: the build.** The library links the Core's binary, published with each release in
@@ -18,9 +41,9 @@ they were. Moving from 3.x: [docs/migrating-to-4.md](docs/migrating-to-4.md).
   law is the app's and the app store's. A learner who said yes before keeps that yes and is never asked again.
 - **Removed: the int8 kernel headers, the CUDA tier and the server runner.** The engine is the Core's; desktops run
   its CPU engine.
-- **The lease.** The model opens under a 24-hour lease for the install, renewed in the background. Offline within it,
-  the model opens. When it has ended and Quran Lab cannot be reached, the model keeps opening for 24 hours more; a
-  refusal ends that at once. `tf_client_diagnose_json` says the lease's state.
+- **Online and offline.** The first run needs a connection; after that the model works offline, and the SDK keeps
+  itself up to date in the background when the machine is online. `TF_ERR_NEEDS_CONNECTION` means it needs Quran Lab
+  to continue. `tf_client_diagnose_json` says the state of the install's model key.
 - **The first start after the upgrade downloads the model once more**, encrypted, so it needs a connection once.
 - **Linux:** one library for Debian 10, Ubuntu 20.04 and later (glibc 2.25 and `libcurl.so.4`).
 - **Error reports.** Every error your app gets (except misuse of the API) and every failure the SDK goes on from

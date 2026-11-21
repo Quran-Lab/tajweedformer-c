@@ -54,6 +54,17 @@ const char *tf__error_text(void);/* the message as set */
 int tf__error_as(int code);
 /* tf__raise without a report: the same failure handed to the app again (a failed take's heads asked for) */
 int tf__raise_again(int rc);
+/* 4.0.1: a thread's error (its code, message, fix and the cause it carries), taken on the thread that failed and put
+ * on another (a download lane's failure becomes the call's, on the caller's thread) */
+typedef struct {
+  int code;
+  char msg[640], fix[640], raw[512];
+  unsigned char cause[192];
+} TfErrState;
+void tf__err_save(TfErrState *s);
+void tf__err_restore(const TfErrState *s);
+void tf__cause_save(void *out, size_t n);       /* tf_report.c: the thread's cause into n bytes (n >= its size) */
+void tf__cause_restore(const void *in, size_t n);
 
 /* ---- error reports (tf_report.c; contract sdk_4.0.0 ERRORS_40.md, section 24) ---- */
 enum { TF_REP_NONE = 0, TF_REP_PARTIAL = 1, TF_REP_COMPLETE = 2 }; /* what of the build the call needs is on the device */
@@ -99,6 +110,8 @@ typedef struct {
   char day[11], stage[16], reason[33], code[33], sig[33];
   int status, count, first_report, first_launch, retries, answer;
   char name[49], ecode[33], ram[8], free_[8], revision[24], build[41];
+  char role[8];  /* 4.0.1 (28.7): host_role, "" for none */
+  int fallback;  /* 4.0.1: 0 none, 1 false, 2 true */
 } TfRepItem;
 typedef struct {
   TfRepItem q[TF_REP_QUEUE + 1];
@@ -118,6 +131,8 @@ typedef struct {
   const char *stage, *reason, *code;
   int status, first_launch, retries;
   const char *name, *ecode, *ram, *free_, *revision, *build;
+  const char *role; /* 4.0.1: host_role (NULL: none) */
+  int fallback;     /* 4.0.1: 0 none, 1 false, 2 true */
 } TfRepOcc;
 typedef int (*TfRepPost)(void *user, const TfRepItem *it); /* the answer's status; 0 none; -1 stop (tests) */
 int tf__rep_occur(TfRepState *r, const char *day, const TfRepOcc *o);
@@ -130,7 +145,7 @@ const unsigned char *tf__errors_json(size_t *n);
 const char *tf__errors_sha256(void);
 
 /* a model file's URL under a download base (tf_download.c) */
-int tf__model_url(char *out, size_t n, const char *base, const char *repo, const char *revision, const char *folder, const char *rel);
+int tf__model_folder(char *out, size_t n, const char *prefix, const char *repo, const char *revision, const char *folder);
 
 /* ---- growable text buffer ---- */
 typedef struct {
@@ -241,6 +256,10 @@ typedef struct {
   int timeout_s;        /* the limit of the whole request (and of each of its steps); not used with stall_ms */
   int stall_ms;         /* > 0: the request ends when no byte of the answer arrives for this long, and has no
                            limit on its whole time (resolving, connecting and sending keep 30 s each) */
+  int head_ms;          /* > 0: the answer's status and headers must arrive within this long of the request's start
+                           (resolving, connecting, TLS, a proxy's CONNECT, sending, the server's wait); then the
+                           request fails as no answer. Apart from the stall limit and the whole time, which go on
+                           after the headers as before. 4.0.1: TF_EP_HEAD_MS on every request to Quran Lab's hosts */
   TfHttpConn *conn;     /* optional: the kept connection this request goes on */
   volatile int *cancel; /* optional: tf__http_cancel(cancel) from another thread aborts the request */
   int (*accept)(void *user, const TfHttpResponse *r); /* optional: asked when the status and the headers are
@@ -249,7 +268,10 @@ typedef struct {
   void (*on_head)(void *user, const TfHttpResponse *r); /* optional: the status and the headers are in; for a
                            download the file is open (emptied by a 200) and no byte of the body is written yet */
   void (*on_bytes)(void *user, long long n); /* optional: called as bytes of a download reach its file */
-  void *bytes_user;     /* the user pointer of on_head and on_bytes */
+  void (*on_data)(void *user, const void *p, size_t n); /* optional (4.0.1): the same bytes, as they were written
+                           to the file, in order (the download is hashed as it comes); a test's transport may
+                           not call it */
+  void *bytes_user;     /* the user pointer of on_head, on_bytes and on_data */
 } TfHttpRequest;
 /* Sets *flag and aborts every request in flight that carries it (WinHTTP: its handle is closed; libcurl: the
  * progress callback stops the transfer). */
@@ -270,6 +292,98 @@ int tf__http_native(const TfHttpRequest *req, TfHttpResponse *resp);
 /* Tests: replace the transport. */
 typedef int (*TfHttpTransport)(const TfHttpRequest *req, TfHttpResponse *resp, void *user);
 void tf_http_set_transport(TfHttpTransport t, void *user);
+/* Test programs only (an app never sets it): "host:port" of an HTTP proxy every request goes through (https by
+ * CONNECT), so a test can block hosts for its own process; NULL: the system's proxy settings, as always */
+extern const char *tf__http_proxy;
+/* the thread's record of its last request (why it failed, the answer it got), saved and put back */
+typedef struct {
+  int kind, status, api_error;
+  char name[48], code[16];
+} TfHttpState;
+void tf__http_state_save(TfHttpState *s);
+void tf__http_state_restore(const TfHttpState *s);
+/* the thread's error (code and texts), saved and put back (tf__error_restore frees it when asked) */
+typedef struct TfErrSave TfErrSave;
+TfErrSave *tf__error_save(void);
+void tf__error_restore(TfErrSave *s, int free_it);
+
+/* ---- endpoint sets: more than one host per role, and failover (ENDPOINTS_40.md, section 28; tf_endpoints.c) ---- */
+enum { TF_EP_API = 0, TF_EP_MODELS = 1 };
+enum { TF_EP_TAKEN = 0, TF_EP_REFUSED = 1, TF_EP_SLOW = 2, TF_EP_UNREACHABLE = 3 }; /* 28.3 item 3 */
+#define TF_EP_MAX 8            /* hosts of a role: a config's list has at most 8 (28.2) */
+#define TF_EP_HOST 254         /* a host name and its NUL (253 characters at most, 28.1) */
+#define TF_EP_PROBE_S 1800     /* 28.3 item 1: 30 minutes after P became preferred, the first host is asked first */
+#define TF_EP_CONNECT_MS 5000  /* 28.3 item 6: a host's time to connect (TCP; libcurl: TCP, TLS and a proxy) */
+#define TF_EP_HEAD_MS 10000    /* 28.3 item 6: a host's time to the answer's headers, from the request's start: WinHTTP
+                                  cannot bound TLS or a proxy's CONNECT alone, so a host that accepts and then says
+                                  nothing has 10 s, then the next host is asked */
+typedef struct TfEndpoints TfEndpoints;
+/* 28.1: a host of Quran Lab's allow-list (n bytes of h; ASCII labels, one of the three domains or under one) */
+int tf__ep_host_allowed(const char *h, size_t n);
+/* 28.4: a lease's base split into its host (lowercase) and its path (starting and ending with '/'); 0 when it is no
+ * base of 28.4 */
+int tf__ep_base_parts(const char *base, char host[TF_EP_HOST], char *path, size_t cap);
+/* 28.2: a role's hosts from a config's `endpoints` (NULL: none) while that config is in force; the count */
+int tf__ep_role_list(int role, const TfJson *endpoints, int in_force, char out[TF_EP_MAX][TF_EP_HOST]);
+/* The Client's endpoint set. api_url, cdn_url: a test build's overrides, each its role's one host (NULL: the built-in
+ * lists); cdn_url's path is the models folder's prefix ("/models" by default). */
+TfEndpoints *tf__ep_new(const char *api_url, const char *cdn_url);
+void tf__ep_free(TfEndpoints *e);
+/* the config in force (its JSON text, NULL for none): the lists of 28.2; a list that changes starts at its first host */
+void tf__ep_set_config(TfEndpoints *e, const char *config_json, int in_force);
+void tf__ep_set_lists(TfEndpoints *e, int role, char hosts[][TF_EP_HOST], int n); /* tests: a list in force */
+const char *tf__ep_prefix(const TfEndpoints *e);
+typedef struct {
+  int n, probe;
+  char host[TF_EP_MAX + 1][TF_EP_HOST];
+} TfEpOrder;
+/* 28.3 item 1: the hosts a request starting now asks, in order; `first` (may be NULL): a lease base's host, asked
+ * before them when it is not one of the role's (28.4) */
+void tf__ep_order(TfEndpoints *e, int role, const char *first, TfEpOrder *o);
+/* where a host is reached: https://<host>, a test's override, or a test's stand-in (tf__ep_test_origin) */
+void tf__ep_origin(const TfEndpoints *e, int role, const char *host, char *out, size_t n);
+/* 28.3 item 5: the host an answer was taken, refused or slowed down on becomes P */
+void tf__ep_settle(TfEndpoints *e, int role, const char *host, int probe);
+/* 28.7 lastFailover: a request found its first host unreachable (to: NULL when no host answered) */
+void tf__ep_failed_over(TfEndpoints *e, int role, const char *from, const char *to, const char *reason, int status);
+void tf__ep_preferred(TfEndpoints *e, int role, char out[TF_EP_HOST]); /* the preferred host P of a role (28.3) */
+char *tf__ep_diag_json(TfEndpoints *e); /* the diagnosis's `endpoints` object; caller frees */
+/* one request across a role's hosts */
+typedef struct {
+  int role;
+  const char *path;       /* what follows the origin: the path and the query */
+  const char *first;      /* a lease base's host that is not one of the role's, asked first (28.4); NULL */
+  const char *stage;      /* the 24.3 stage of the request, for the silent failover report (NULL: none) */
+  int not_modified_ok;    /* a 304 is taken (a config request with If-None-Match) */
+  /* a 2xx: 1 when it is the answer the route asks for (taken), 0 when not (unreachable: the next host). NULL: a body
+   * that is empty or JSON */
+  int (*taken)(void *user, const TfHttpResponse *r);
+  void *user;
+  double deadline;        /* tf__now_s after which no host is asked (18.4.7.1's 10 s); 0 for none */
+} TfEpReq;
+typedef struct {
+  int cls;                /* TF_EP_TAKEN, TF_EP_REFUSED, TF_EP_SLOW, TF_EP_UNREACHABLE */
+  int asked, fallback;    /* the hosts asked; more than one */
+  char by[TF_EP_HOST];    /* the host the request ended on ("" when every host was unreachable) */
+  char first_reason[20];  /* the first host's 24.3 reason when it was unreachable ("" when not) */
+  int first_status;       /* its status, 0 for none */
+} TfEpOut;
+int tf__ep_class(const TfEpReq *er, int rc, const TfHttpResponse *r);
+const char *tf__ep_reason(int rc, const TfHttpResponse *r); /* an unreachable answer's 24.3 reason */
+/* 28.3: q (its url is set here for each host) asked of the hosts in order until one answer is not unreachable. The
+ * request ends as that answer (rc, r), or, when every host was unreachable, as the FIRST host's, with the largest
+ * Retry-After any host gave. out may be NULL. */
+int tf__ep_http(TfEndpoints *e, const TfEpReq *er, TfHttpRequest *q, TfHttpResponse *r, TfEpOut *out);
+/* the thread's last request to Quran Lab's hosts: its role and whether more than one host was asked (24.2's host_role
+ * and fallback); noted by tf__ep_http and the model download, read by the error reports */
+void tf__ep_note(int role, int fallback);
+int tf__ep_noted(int *role, int *fallback);
+void tf__ep_note_clear(void);
+const char *tf__ep_role_name(int role);
+extern double tf__ep_now_override;                    /* tests: 28.3's clock in seconds (0: the monotonic clock) */
+extern const char *(*tf__ep_test_origin)(const char *host); /* tests: a host's stand-in ("http://127.0.0.1:N"), NULL: none */
+TfEndpoints *tf__client_endpoints(TfClient *c);       /* the Client's set, its lists brought to the config in force */
+void tf__clean27(const char *v, char out[33]); /* APP_VERSION_40.md 27.1: app_version and app_build cleaned ("" for none) */
 int _tf_strnicmp(const char *a, const char *b, size_t n);
 /* 1 when the system says the connection in use is metered (Windows); 0 when not or when it cannot tell */
 /* The kind of connection the machine has. Neither system gives this library a dependable answer it can use
@@ -399,6 +513,7 @@ TfModel *tf__model_open(const char *folder, const TfModelOpen *o);
 TfModel *tf__model_open_folder(const char *folder, const TfModelOptions *options, const char *trusted_key_hex);
 /* Tests only: tf_client_create with another Ed25519 key (64 hex) for the signed config and the manifest. */
 TfClient *tf__client_create_with_key(const TfClientOptions *options, const char *trusted_key_hex);
+TfClient *tf__client_create2_with_key(const TfClientOptions *options, const TfClientOptionsExt *ext, const char *trusted_key_hex);
 const char *tf__model_dir(const TfModel *m);
 TfClient *tf__model_client(const TfModel *m);
 const TfJson *tf__model_manifest(const TfModel *m);
@@ -615,8 +730,11 @@ void tf__pm_lock(TfPm *p);
 void tf__pm_unlock(TfPm *p);
 void tf__pm_client_gone(TfClient *c);
 extern const char *tf__lease_test_base;
+extern int tf__pm_open_fail_status; /* tests: the model open fails with this Core status (0: never) */
 void **tf__client_pm_slot(TfClient *c);
-int tf__client_call_lease(TfClient *c, const char *body, TfHttpResponse *r);
+int tf__client_call_lease(TfClient *c, const char *body, int (*taken)(void *user, const TfHttpResponse *r), void *user, TfHttpResponse *r);
+int tf__client_call_taken(TfClient *c, const char *method, const char *path, const char *body, int auth,
+                          int (*taken)(void *user, const TfHttpResponse *r), void *user, TfHttpResponse *r);
 /* 18.4.7.1: the answer the last request of this thread got (status, 0 for none; the API's refusal: a JSON error
  * string) and this thread's request count; tf__http_answer_none records a request that never started */
 unsigned tf__http_answer(int *status, int *api_error);
@@ -708,6 +826,7 @@ typedef struct {
   int debug_build;            /* 1 in the app's debug builds; 0: the client logs nothing */
   void (*on_log)(void *user, int level, const char *message);
   void *log_user;
+  const char *app_build;      /* 4.0.1 (APP_VERSION_40.md 27.1): the app's build number; NULL: not known */
 } TfClientConfig;
 enum { TF_LOG_DEBUG = 0, TF_LOG_INFO = 1, TF_LOG_WARNING = 2, TF_LOG_ERROR = 3 };
 TfClientConfig tf__client_default_config(void); /* anonymous telemetry is always on: only flags.analytics stops it */
@@ -876,8 +995,15 @@ extern const char *const *tf__sharing_test_card; /* tests: card strings (line, o
 extern long long tf__now_override; /* tests: a fixed clock (unix seconds), 0 for the system's */
 
 /* ---- the model downloader (tf_download.c) ---- */
+/* tests: the pause before a resume (16.2) is given to this instead of being slept (NULL: slept) */
+extern void (*tf__download_on_pause)(long long ms);
+/* tests (tf40_tests endpoints): one file of a build's folder `path` fetched through 16.2's resumes and 28.4's hosts on
+ * the set `ep`, to `to` (its .part beside it); key and size and SHA-256 as a manifest names them */
+int tf__download_file_test(TfEndpoints *ep, const char *path, const char *rel, long long size, const char *sha_hex, const char *to);
 typedef struct {
-  const char *cdn_url;        /* the model base: default https://cdn.quranlab.ai/models ({base}/{repo}/{build}/{folder}/...) */
+  const char *cdn_url;        /* tests without a Client: the models role's one host and the folder's prefix; NULL: the
+                                 built-in hosts and /models (4.0.1: a Client's downloads use the Client's hosts) */
+  const char *base_hint;      /* 4.0.1: the base of the lease the install holds for this build (the manifest's folder) */
   const char *key;            /* developer key (qlk_v1_...) */
   TfClient *client;           /* the Client whose app token every request carries beside the key (SPEC 15.4); NULL
                                  in the downloader's own tests: the key alone */
@@ -898,14 +1024,16 @@ typedef struct {
   volatile int *cancel;       /* may be NULL: tf__http_cancel(cancel) from another thread ends the request in flight
                                  and the pause before a resume, and the download returns TF_ERR_DOWNLOAD_FAILED */
   /* SDK 4.0: after the manifest is accepted and before any file (the lease); 0 or an error that ends the download.
-   * It writes the model folder the lease answer named (base, ending in '/'): the files are read only from
-   * <base><path>, and with none no file is downloaded. Without this hook (the downloader's own tests) the files come
-   * from cdn_url's {base}/{repo}/{build}/{folder}/{path}. */
+   * It writes the model folder the lease answer named (base, ending in '/'): the files are read from its path on the
+   * models hosts (4.0.1, its host first when it is not one of them), and with none no file is downloaded. Without
+   * this hook (the downloader's own tests) the files come from the manifest's folder. */
   int (*after_manifest)(void *user, const char *manifest, size_t n, const TfJson *m, char *base, size_t base_cap);
   /* SDK 4.0: a qle1 container is downloaded and verified: the Core installs it (CDN form to device form) */
   int (*install)(void *user, const char *decoded_path, const char *manifest, size_t n);
   int want_recited;           /* the recited index (role recited, 17.5) is fetched too */
   void *hook_user;            /* after_manifest's and install's */
+  const char *want_key_id;    /* 4.0.1, may be NULL: the build's key id the signed config names (18.4.5); a manifest
+                                 that names another is refused before any file is asked for */
 } TfDownload;
 TfDownload tf__download_defaults(void);
 /* A model request ends when no byte of its answer arrives for this long (30 s). It is not a limit on the whole
@@ -914,6 +1042,29 @@ extern int tf__download_stall_ms;
 /* The pause before the first resume of a file inside one call (1 s); it doubles before each further resume
  * (1, 2, 4, 8, 16 s). Tests set a shorter one. */
 extern int tf__download_pause_ms;
+/* 4.0.1: at most this many files of one call download at once, each on its own connection (4). Tests may set 1. */
+extern int tf__download_lanes;
+/* 4.0.1: 1 (the default): with a lease hook, the files are fetched from the build's folder on the model host while
+ * the lease is asked, and used when the lease answer names that folder; 0: only after the lease, from its folder. */
+extern int tf__download_early;
+/* tests: how many files were read again after their last byte (only a transport that gives no on_data makes one) */
+extern int tf__download_rereads;
+
+/* ---- 4.0.1, Windows: the engine's threads are never power-throttled (tf_qos.c; no-ops elsewhere) ---- */
+typedef struct {
+  unsigned long ids[512];
+  int n, full, taken;
+} TfThreadSnap;
+typedef struct {
+  int set;
+  unsigned long control, state;
+} TfQosSave;
+extern int tf__qos_off;                          /* measurements and tests: 1 is the 4.0.0 behaviour */
+void tf__qos_snapshot(TfThreadSnap *s);          /* this process's threads now */
+int tf__qos_mark_new(const TfThreadSnap *before); /* every thread since `before` gets high QoS; how many */
+void tf__qos_enter(TfQosSave *q);                /* the calling thread gets high QoS until tf__qos_leave */
+void tf__qos_leave(const TfQosSave *q);          /* puts back what the calling thread had */
+int tf__qos_thread_high(void);                   /* tests: 1 high QoS, 0 not, -1 unknown */
 /* Fetches and verifies the manifest, then every file of the profile (never the expected table, CoreML or NPU
  * files), resuming partial files with HTTP Range and checking each SHA-256. 0, or a TfError. */
 int tf__download_model(const TfDownload *o);

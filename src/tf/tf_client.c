@@ -86,6 +86,13 @@ struct TfClient {
   int answered;        /* the server answered an authenticated request of this client with a success */
   uint8_t sess_counted[4320], sess_judged[4320]; /* the analytics session's measured and judged ayahs (surah * 300 + ayah) */
   int config_fresh;    /* the config in force was fetched or confirmed (304) by this client */
+  /* 4.0.1, ENDPOINTS_40.md (section 28): the hosts of each role, their order and the sticky host, for this process */
+  TfEndpoints *ep;
+  unsigned config_gen, ep_gen; /* the config in memory changed / the one the lists were made from */
+  int ep_in_force;             /* the lists were made while that config was in force */
+  /* 4.0.1, APP_VERSION_40.md (section 27): app_version and app_build as the config request carries them, cleaned
+   * once when the Client is made; "" leaves the parameter out */
+  char q_version[33], q_build[33];
 };
 
 /* ------------------------------------------------------------------ small helpers */
@@ -114,6 +121,44 @@ const char *tf__client_app(const TfClient *c) { return c->app_id; }
 const char *tf__client_platform(const TfClient *c) { return c->platform; }
 const char *tf__client_api(const TfClient *c) { return c->api; }
 const char *tf__client_cdn(const TfClient *c) { return c->cdn; }
+/* 28.2: the lists of the config in force when a request starts (the built-in lists while none is, and once the stored
+ * config has expired); made again only when the config or its being in force changed */
+TfEndpoints *tf__client_endpoints(TfClient *c) {
+  if (!c) return NULL;
+  tf_mutex_lock(&c->lock);
+  const int in_force = c->config && c->config_exp > now_unix();
+  if (c->ep_gen != c->config_gen || c->ep_in_force != in_force) {
+    tf__ep_set_config(c->ep, c->config, in_force);
+    c->ep_gen = c->config_gen;
+    c->ep_in_force = in_force;
+  }
+  tf_mutex_unlock(&c->lock);
+  return c->ep;
+}
+/* APP_VERSION_40.md 27.1, the one cleaning of app_version and app_build, in its order: keep only the ASCII 0-9 A-Z a-z
+ * . + - (every other byte dropped, so a letter outside ASCII goes whole); drop the . + - before the first letter or
+ * digit; keep the first 32. "" when unknown, nothing is left, or what is left is "0": the config request leaves the
+ * parameter out, and register sends its placeholder "0". tf__clean27 is the tests' way in. */
+static int clean_keeps(char ch) { return (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '.' || ch == '+' || ch == '-'; }
+void tf__clean27(const char *v, char out[33]) {
+  size_t n = 0;
+  for (const char *p = v ? v : ""; *p && n < 32; ++p) {
+    if (!clean_keeps(*p)) continue;                          /* step 2 */
+    if (!n && (*p == '.' || *p == '+' || *p == '-')) continue; /* step 3 */
+    out[n++] = *p;                                           /* step 4: the first 32 */
+  }
+  out[n] = 0;
+  if (!strcmp(out, "0")) out[0] = 0;
+}
+/* the value percent-encoded for a query: '+' as %2B (a bare '+' reads as a space); the rest needs none */
+static void query_value(TfBuf *b, const char *name, const char *v) {
+  if (!v[0]) return;
+  tf_buf_printf(b, "&%s=", name);
+  for (const char *p = v; *p; ++p) {
+    if (*p == '+') tf_buf_puts(b, "%2B");
+    else tf_buf_put(b, p, 1);
+  }
+}
 volatile int *tf__client_cancel_flag(TfClient *c) { return &c->cancel; }
 void tf__client_set_download_protocol(TfClient *c, const char *protocol) {
   tf_mutex_lock(&c->lock);
@@ -222,6 +267,11 @@ typedef struct {
   const char *method, *path, *body;
   int auth; /* 0 key, 1 token */
   const char *extra_header;
+  /* 4.0.1 (28.3): whether a 2xx is the route's own answer (NULL: a body that is empty or JSON), and whether a 304 is
+   * taken (a config request with If-None-Match); any other answer is read by 28.3's table */
+  int (*taken)(void *user, const TfHttpResponse *r);
+  void *user;
+  int not_modified_ok;
 } Call;
 
 static int classify_stop(TfClient *c, const TfHttpResponse *r);
@@ -405,8 +455,7 @@ static int call_locked(TfClient *c, const Call *k, TfHttpResponse *r) {
   const char *stage = route_stage(k->path);
   for (int attempt = 0; attempt < 2; ++attempt) {
     if (k->auth && ensure_token(c)) return tf__error_code();
-    char url[2048], auth[1200];
-    snprintf(url, sizeof url, "%s%s", c->api, k->path);
+    char auth[1200];
     const char *hdr[6];
     int nh = 0;
     if (k->auth) snprintf(auth, sizeof auth, "authorization: Bearer %s", c->token);
@@ -418,7 +467,6 @@ static int call_locked(TfClient *c, const Call *k, TfHttpResponse *r) {
     TfHttpRequest q;
     memset(&q, 0, sizeof q);
     q.method = k->method;
-    q.url = url;
     q.headers = hdr;
     q.body = k->body;
     q.body_n = k->body ? strlen(k->body) : 0;
@@ -434,13 +482,26 @@ static int call_locked(TfClient *c, const Call *k, TfHttpResponse *r) {
       if (left < q.timeout_s) q.timeout_s = left < 1 ? 1 : (int)(left + 0.999);
     }
     q.cancel = t_cancel ? t_cancel : &c->cancel;
+    /* 4.0.1 (ENDPOINTS_40.md 28.3): the request goes to the api hosts in their order, P first; an unreachable host is
+     * followed by the next at once, and the request ends as the answer it was taken, refused or slowed down on, or as
+     * the first host's when none answered. Each repeat below (the token renewed once) is a request of its own. */
+    TfEndpoints *ep = tf__client_endpoints(c);
+    TfEpReq er;
+    memset(&er, 0, sizeof er);
+    er.role = TF_EP_API;
+    er.path = k->path;
+    er.stage = stage;
+    er.taken = k->taken;
+    er.user = k->user;
+    er.not_modified_ok = k->not_modified_ok;
+    er.deadline = t_deadline;
     /* The request itself runs without the client's lock (everything it reads is copied above): until 11-18 a request
      * in flight held it for up to its 30 s, and every other thread that reads the client (a config flag, the counters,
      * another call, a model open past exp under its 10 s) waited for the network with it (Stage B, staging: an open
      * past exp behind the background refresh's hanging request took 32 s). Calls of several threads may now overlap;
      * each still sees and changes the client's state under the lock. */
     tf_mutex_unlock(&c->lock);
-    const int hrc = tf_http(&q, r);
+    const int hrc = tf__ep_http(ep, &er, &q, r, NULL);
     tf_mutex_lock(&c->lock);
     if (hrc) {
       const int rc = tf__error_code() ? tf__error_code() : TF__ERR_NETWORK;
@@ -504,10 +565,17 @@ int tf__client_call(TfClient *c, const char *method, const char *path, const cha
   Call k = {method, path, body, auth, extra};
   return call(c, &k, r);
 }
+/* the same with the route's own check of a 2xx (28.3: a 2xx that is not the route's answer is that host unreachable) */
+int tf__client_call_taken(TfClient *c, const char *method, const char *path, const char *body, int auth,
+                          int (*taken)(void *user, const TfHttpResponse *r), void *user, TfHttpResponse *r) {
+  Call k = {method, path, body, auth, NULL, taken, user, 0};
+  return call(c, &k, r);
+}
 /* POST /v1/model-key with the app token (18.4.4). A 401 invalid_token without a reason renews the token and repeats
- * once, as every token route; no stop reason of the answer is taken here (18.4.10: the caller asks the Core). */
-int tf__client_call_lease(TfClient *c, const char *body, TfHttpResponse *r) {
-  Call k = {"POST", "/v1/model-key", body, 1, NULL};
+ * once, as every token route; no stop reason of the answer is taken here (18.4.10: the caller asks the Core). taken:
+ * the Core's acceptance of a 200 (28.3: a lease the Core refuses is that host unreachable). */
+int tf__client_call_lease(TfClient *c, const char *body, int (*taken)(void *user, const TfHttpResponse *r), void *user, TfHttpResponse *r) {
+  Call k = {"POST", "/v1/model-key", body, 1, NULL, taken, user, 0};
   t_no_gate = 1;
   const int rc = call(c, &k, r);
   t_no_gate = 0;
@@ -639,8 +707,15 @@ TfClient *tf__client_open(const TfClientConfig *opt) {
   c->platform = dupstr(o.platform ? o.platform : tf__platform_name());
   c->app_name = dupstr(o.app_name);
   c->app_version = dupstr(o.app_version ? o.app_version : "0");
+  /* 4.0.1: a test build's own hosts (each its role's only host); a released build has the lists of section 28 */
   c->api = dupstr(o.api_url ? o.api_url : "https://api.quranlab.ai");
   c->cdn = dupstr(o.cdn_url ? o.cdn_url : "https://cdn.quranlab.ai/models");
+  c->ep = tf__ep_new(o.api_url, o.cdn_url);
+  c->ep_gen = (unsigned)-1;
+  /* 27.1: read once; a value the app does not know (app_version's placeholder "0", no build) is left out */
+  tf__clean27(o.app_version, c->q_version);
+  tf__clean27(o.app_build, c->q_build);
+  c->o.app_build = NULL; /* the app's string is not kept: q_build holds what is sent */
   c->dir = dupstr(o.storage_dir);
   c->language = dupstr(o.language ? o.language : "en");
   c->o.key = c->key;
@@ -722,6 +797,7 @@ void tf__client_close(TfClient *c) {
   free(c->app_version);
   free(c->api);
   free(c->cdn);
+  tf__ep_free(c->ep);
   free(c->dir);
   free(c->language);
   free(c->config);
@@ -734,6 +810,15 @@ void tf__client_close(TfClient *c) {
 }
 
 /* ------------------------------------------------------------------ token (unattested: native has no attestation) */
+/* 28.3: a token answer is taken on a host only with a token in it */
+static int token_taken(void *user, const TfHttpResponse *r) {
+  (void)user;
+  TfJson *j = r->status == 200 ? tf_json_parse(r->body, r->body_n, NULL) : NULL;
+  const char *t = tf_json_str(tf_json_get(j, "token"));
+  const int ok = t && *t && strlen(t) < 1024;
+  tf_json_free(j);
+  return ok;
+}
 static int ensure_token(TfClient *c) {
   if (c->token[0] && c->token_exp - now_unix() > 3600) return 0;
   TfBuf b;
@@ -743,7 +828,7 @@ static int ensure_token(TfClient *c) {
   tf_buf_puts(&b, ",\"bundle_id\":");
   tf_buf_json_str(&b, c->app_id);
   tf_buf_puts(&b, "}");
-  Call k = {"POST", "/v1/attest", b.p, 0, NULL};
+  Call k = {"POST", "/v1/attest", b.p, 0, NULL, token_taken, NULL, 0};
   TfHttpResponse r;
   int rc = call(c, &k, &r);
   tf_buf_free(&b);
@@ -790,8 +875,10 @@ int tf__client_register(TfClient *c) {
     tf_buf_puts(&b, ",\"app_name\":");
     tf_buf_json_str(&b, c->app_name);
   }
+  /* 4.0.1 (27.1): register sends the same cleaned app_version as the config request, or its placeholder "0" (4.0.0
+   * sent the app's string as it was, which the server refuses with 400 when it is not of the form it takes) */
   tf_buf_puts(&b, ",\"app_version\":");
-  tf_buf_json_str(&b, c->app_version);
+  tf_buf_json_str(&b, c->q_version[0] ? c->q_version : "0");
   tf_buf_printf(&b, ",\"sdk_version\":\"%s\",\"new_install\":%s}", TF_SDK_VERSION, c->new_install ? "true" : "false");
   Call k = {"POST", "/v1/register", b.p, 1, NULL};
   TfHttpResponse r;
@@ -839,19 +926,38 @@ int tf__verify_config(const uint8_t pk[32], const char *kid_pinned, const char *
 
 void tf__client_check_latest(TfClient *c);
 static void check_pin(TfClient *c);
+/* 28.3: a config answer is taken on a host only when it verifies (any other 200 is that host unreachable) */
+static int config_taken(void *user, const TfHttpResponse *r) {
+  const TfClient *c = (const TfClient *)user;
+  if (r->status != 200 || !r->body) return 0;
+  TfErrSave *keep = tf__error_save();
+  long long exp = 0;
+  const int ok = !tf__verify_config(c->pk, c->kid, r->body, r->body_n, r->signature, r->key_id, now_unix(), &exp);
+  tf__cause_clear(); /* the check of one host's answer is no cause: the answer the request ends on is checked again */
+  tf__error_restore(keep, 1);
+  return ok;
+}
 int tf__client_refresh_config(TfClient *c) {
   tf__clear_error();
   if (!c) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no client");
-  char path[256], inm[120];
-  /* SPEC 2a: a pinned model version goes with the request; the server answers that version's build for this SDK */
-  if (c->pin[0]) snprintf(path, sizeof path, "/v1/config?bucket=%d&sdk=%s&model_version=%s", c->bucket, TF_SDK_VERSION, c->pin);
-  else snprintf(path, sizeof path, "/v1/config?bucket=%d&sdk=%s", c->bucket, TF_SDK_VERSION);
+  char inm[120];
+  /* SPEC 2a: a pinned model version goes with the request; the server answers that version's build for this SDK.
+   * 4.0.1 (APP_VERSION_40.md 27.1): then the app's version and build, each left out when not known; with neither the
+   * request is byte for byte 4.0.0's */
+  TfBuf pb;
+  tf_buf_init(&pb);
+  tf_buf_printf(&pb, "/v1/config?bucket=%d&sdk=%s", c->bucket, TF_SDK_VERSION);
+  if (c->pin[0]) tf_buf_printf(&pb, "&model_version=%s", c->pin);
+  query_value(&pb, "app_version", c->q_version);
+  query_value(&pb, "app_build", c->q_build);
+  if (!pb.p) return tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
   /* within 1 h of expiry: ask without If-None-Match for a freshly signed body */
   const int conditional = c->config && c->etag[0] && c->config_exp - now_unix() > 3600 && !strcmp(c->pin, c->config_pin);
   snprintf(inm, sizeof inm, "if-none-match: %s", c->etag);
-  Call k = {"GET", path, NULL, 1, conditional ? inm : NULL};
+  Call k = {"GET", pb.p, NULL, 1, conditional ? inm : NULL, config_taken, c, conditional};
   TfHttpResponse r;
   int rc = call(c, &k, &r);
+  tf_buf_free(&pb);
   if (rc) return rc;
   if (r.status == 304 && c->config) {
     tf_http_response_free(&r);
@@ -881,6 +987,7 @@ int tf__client_refresh_config(TfClient *c) {
   c->config = r.body;
   r.body = NULL;
   c->config_exp = exp;
+  c->config_gen++; /* 28.2: the next request takes this config's lists */
   c->config_fresh = 1;
   snprintf(c->etag, sizeof c->etag, "%s", r.etag);
   snprintf(c->config_pin, sizeof c->config_pin, "%s", c->pin);
@@ -895,6 +1002,9 @@ int tf__client_refresh_config(TfClient *c) {
   /* 2.0.3: a config that turns sharing off, or sets another join window, reaches a recording that waits for its
    * next take now, not at the end of the window it started with */
   tf__share_window_check(c);
+  /* a config that turns the switch on for a learner who said yes before: the uploader starts now, not at the next
+   * launch (tf_sharing.c uploads_start) */
+  if (tf__client_sharing_state(c)) tf__sharing_outbox_resume(c);
   tf__rep_config(c); /* 24.5: flags.issues */
   return 0;
 }

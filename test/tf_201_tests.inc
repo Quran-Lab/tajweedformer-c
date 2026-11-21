@@ -230,7 +230,7 @@ static int bitrate_tests(const char *vdir, const char *dir) {
   CHECK(ss != NULL, "session: %s", tf_last_error() ? tf_last_error() : "");
   if (!ss) return 1;
   char id[33] = "";
-  only_session(c, id);
+  CHECK(only_session(c, id), "one recording in the outbox: %s", id);
   /* segment k starts at packet 500, 1500, 3500, 6500: before the packet that opens it, the ladder is moved; the
    * capture's own segment_closed events (backlog 30, 70, then 60 s once segments 1 to 3 went up) do not move it */
   const int starts[5] = {0, 500, 1500, 3500, 6500};
@@ -245,6 +245,8 @@ static int bitrate_tests(const char *vdir, const char *dir) {
     if (k == 3)
       for (int i = 0; i < 3; ++i) tf__ladder_event(c, 1, 0);                       /* -> 64000 */
     if (k == 4) {
+      /* the test moves the outbox by hand: no uploader may have run in this process */
+      CHECK(tf__share_passes(c) == 0 && g_st.n_s == 0, "the uploader ran: %d passes, %d sessions at the stub", tf__share_passes(c), g_st.n_s);
       /* segments 1 to 3 "uploaded": kept for the stream check, removed as the uploader does after a 2xx */
       for (int s = 1; s <= 3; ++s) {
         char name[32];
@@ -1492,7 +1494,7 @@ static int sdk_latest_tests(const char *configs, const char *dir) {
   if (!g_sl.fx) return 2;
   tf_mkdirs(dir);
   tf_http_set_transport(sl_stub, NULL);
-  static const char want[] = "Quran Lab SDK 4.0.1 is available (recommended), you have " TF_SDK_VERSION ": https://github.com/Quran-Lab/tajweedformer-c/releases";
+  static const char want[] = "Quran Lab SDK 4.0.2 is available (recommended), you have " TF_SDK_VERSION ": https://github.com/Quran-Lab/tajweedformer-c/releases";
   char d[1100];
   /* newer: one line at launch; a second newer config (a refresh) adds none */
   snprintf(d, sizeof d, "%s/newer", dir);

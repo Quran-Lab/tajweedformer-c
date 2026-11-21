@@ -18,11 +18,12 @@
  *   Backend  what runs the model (here always the CPU engine)
  *
  * SDK 4.0: the model is protected. It downloads encrypted, is installed encrypted for this install, and is opened
- * only inside Quran Lab's closed Core (qlcore.dll / libqlcore.so, shipped beside this library), with a lease the
- * server gives this install (a key in the TPM where Windows has one; a software key elsewhere). No call of this
- * header reads, writes or names a model file, and no file of the SDK's folder is usable outside it. Desktop installs
- * get 24-hour leases, refreshed in the background: without a connection for longer, tf_client_model answers
- * TF_ERR_NEEDS_CONNECTION (a Model already open keeps running).
+ * only inside Quran Lab's closed Core (qlcore.dll / libqlcore.so, shipped beside this library), with a key the
+ * server gives this install (whose own keys are in the TPM where Windows has one, in a software key store elsewhere). No call of this
+ * header reads, writes or names a model file, and no file of the SDK's folder is usable outside it. The first run
+ * needs a connection; after that it works offline, and the SDK keeps itself up to date in the background when the
+ * machine is online. TF_ERR_NEEDS_CONNECTION means it needs Quran Lab to continue (a Model already open keeps
+ * running).
  *
  *   static void on_chunk(void *user, const TfChunk *chunk) { puts(chunk->decoded->text); }
  *
@@ -56,6 +57,7 @@
 #define TAJWEEDFORMER_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -71,9 +73,9 @@ extern "C" {
 #define TF_API
 #endif
 
-#define TF_SDK_VERSION "4.0.0"
+#define TF_SDK_VERSION "4.0.1"
 
-TF_API const char *tf_version(void); /* "4.0.0" */
+TF_API const char *tf_version(void); /* "4.0.1" */
 
 /* ============================================================================ errors */
 
@@ -271,7 +273,9 @@ typedef struct {
   const char *key;             /* the desktop key from sdk.quranlab.ai (qlk_v1_...); required */
   const char *app_id;          /* the app's id as registered for the key (Windows: package family name or
                                   AppUserModelID; Linux: a reverse-DNS id); required */
-  const char *app_version;     /* NULL: "0" */
+  const char *app_version;     /* NULL: "0" (registration's placeholder). 4.0.1: cleaned to 0-9 A-Z a-z . + -
+                                  (the leading . + - dropped, at most 32 characters) for registration ("0" when
+                                  nothing is left) and every config request (left out there when not known) */
   const char *storage;         /* a folder the app can write: the SDK's state and the model files; NULL:
                                   %LOCALAPPDATA%/<app_id>/tajweedformer, or $XDG_DATA_HOME (~/.local/share) on Linux */
   const char *language;        /* the copy deck's language, BCP 47; NULL: "en" */
@@ -281,7 +285,22 @@ typedef struct {
   void (*on_log)(void *user, int level, const char *message); /* where that log goes; NULL: stderr. level 0 debug,
                                   1 info, 2 warning, 3 error */
   void *user;                  /* passed to on_consent and on_log */
-} TfClientOptions;
+} TfClientOptions;             /* frozen at 4.0.0's fields: new options go in TfClientOptionsExt */
+
+/* 4.0.1: options added after 4.0.0, given to tf_client_create2. It starts with its own size, so an app built against
+ * any 4.0 header runs with any later 4.0 library: a field is read only when it lies wholly within `size`, and fields
+ * are only ever appended, each optional (NULL or 0: not set). Set `size` from the header the app is built with:
+ *   TfClientOptionsExt ext = {.size = sizeof ext, .app_build = "412"};
+ * The library copies what it needs during the call and keeps no pointer into it. */
+typedef struct {
+  uint32_t size;               /* sizeof(TfClientOptionsExt) of the header the app was built with; below 4:
+                                  TF_ERR_INVALID_ARGUMENT */
+  const char *app_build;       /* the app's build number ("412"); NULL: not known. With app_version it goes on every
+                                  request for Quran Lab's signed config, so the model version rules set for the app
+                                  on sdk.quranlab.ai can give older releases of the app the model they were built
+                                  for. Cleaned as app_version is and left out when nothing is left; nothing else
+                                  carries it */
+} TfClientOptionsExt;
 
 /* One Client per process: a second one while the first is not destroyed is TF_ERR_CLIENT_EXISTS. Never waits for
  * the network: registration, the signed config and the telemetry go in the background.
@@ -289,6 +308,8 @@ typedef struct {
  * never audio, text, names or device identifiers. Quran Lab's signed config (flags.analytics) is the only off
  * switch. */
 TF_API TfClient *tf_client_create(const TfClientOptions *options);
+/* 4.0.1: tf_client_create with the options of TfClientOptionsExt (NULL: none, which is tf_client_create) */
+TF_API TfClient *tf_client_create2(const TfClientOptions *options, const TfClientOptionsExt *ext);
 TF_API void tf_client_destroy(TfClient *c);
 
 typedef struct {
@@ -300,7 +321,7 @@ typedef struct {
 } TfModelOptions;
 
 /* The Model for this app: downloads on first use (resumable), verifies every file, installs it encrypted for this
- * install, gets its lease, opens and warms the engine, so call it early. Without a network and without a model on disk: TF_ERR_NEEDS_CONNECTION. While Quran Lab has no
+ * install, gets the key that opens it on this install, opens and warms the engine, so call it early. Without a network and without a model on disk: TF_ERR_NEEDS_CONNECTION. While Quran Lab has no
  * build for this SDK version: TF_ERR_MODEL_UNAVAILABLE. When Quran Lab refuses the key or the app (a revoked key,
  * a paused or blocked app): TF_ERR_INVALID_KEY or TF_ERR_SERVER_REJECTED, and the SDK removes the downloaded
  * model from the device; once the key is accepted again the model is downloaded again. A Model that is open
@@ -331,11 +352,11 @@ TF_API int tf_client_remove_models(TfClient *c);
 
 /* One structured report, safe to paste into an issue: no audio, text or identifiers. */
 typedef struct {
-  const char *sdk_version;     /* "4.0.0" */
+  const char *sdk_version;     /* "4.0.1" */
   const char *sdk_latest;      /* the SDK release the signed config in force names, or NULL when it names none */
   int key_accepted;            /* 1 accepted, 0 refused, -1 not known yet (no answer from the server) */
   const char *key_reason;      /* why not: the server's code, or NULL */
-  const char *config;          /* "fresh" (a verified config that has not expired), "stale" (expired) or "none" */
+  const char *config;          /* "fresh" (a current verified config), "stale" (an older one, still in use) or "none" */
   const char *model_version;   /* NULL without a model on disk */
   const char *model_build;
   int model_verified;
@@ -352,11 +373,10 @@ typedef struct {
                                   has no field: the protocol the last request for a model file ran on ("h3",
                                   "h2" or "http/1.1"), null while this Client has made none in this process;
                                   and (4.0) "protected", an object: keyStore
-                                  ("tpm", "software" or "file"), lease ("valid", "grace", "expired", "stopped" or
-                                  "none"), leaseExpires (unix seconds or null), leaseClass ("7d" or "24h", from the
-                                  lease's flags; null without a lease or after a stop), refreshAfter (unix seconds or
-                                  null), graceUntil (exp + 86400 while lease is "grace", else null) and core (the
-                                  Core's release and target) */
+                                  ("tpm", "software" or "file"), lease (the state of this install's model key:
+                                  "valid", "grace", "expired", "stopped" or "none"), leaseExpires, refreshAfter and
+                                  graceUntil (unix seconds or null), leaseClass ("attested" or "standard", or null)
+                                  and core (the Core's release and target) */
 } TfDiagnosis;
 TF_API int tf_client_diagnose(TfClient *c, TfDiagnosis *out);
 TF_API const char *tf_client_diagnose_json(TfClient *c);
@@ -417,7 +437,7 @@ TF_API int tf_model_calibration_number(const TfModel *m, const char *path, doubl
 
 /* The expected units of each ayah: read-only data. SDK 4.0: the table is encrypted with the model and read by the
  * Core; tf_reference_fetch is refused with TF_ERR_SESSION_OPEN while a take runs, and the first tf_reference_units
- * needs a valid lease (TF_ERR_NEEDS_CONNECTION without one). TfUnits stays valid until the Model is closed. */
+ * needs the model's key on this install (TF_ERR_NEEDS_CONNECTION when it needs Quran Lab to continue). TfUnits stays valid until the Model is closed. */
 typedef struct TfReference TfReference;
 typedef struct {
   int n;                       /* units of the ayah */

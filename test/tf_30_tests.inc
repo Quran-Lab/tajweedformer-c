@@ -11,10 +11,10 @@
  *   model30 <local30 dir> <key> <work dir>   the local 3.0 model folders (not in the repository) */
 
 /* the SHA-256 of sdk_3.0.0/errors.json as recorded when the catalogue was embedded (the contract's file at
- * sdk-4.0.0-protected 3c62bf3: 26 codes, the ten entries under server_rejected's reasons, and the fix of
- * sharing_unavailable that names no per-app switch). A changed catalogue changes this line, the generated header and
+ * sdk-4.0.0-protected 564c144: 26 codes, the ten entries under server_rejected's reasons, the fix of
+ * sharing_unavailable that names no per-app switch, and 7f097b9's fix of reference_missing). A changed catalogue changes this line, the generated header and
  * test/data together. */
-#define TF_TEST_ERRORS_SHA256 "923da8f3d66e765a34574c4e12cbce5ae963688f407a07106f46dcd865fad3bd"
+#define TF_TEST_ERRORS_SHA256 "9b6c034e8a2ec73080b2621aef821d5f7117fa828a27c5f6cf97e672e044c880"
 /* the contract's file when this machine has it; TF_CONTRACT_ERRORS in the environment names another copy (an empty
  * value skips the comparison) */
 #define TF_TEST_CONTRACT_ERRORS ""

@@ -2,7 +2,7 @@
 
 4.0 keeps the 3.x API (Client, Model, Session, Heads, Backend) with two options fewer (analytics and audience, below).
 What changes is underneath: the engine, the model's formats and its keys move into the Quran Lab Core, a closed binary that ships
-beside this library, and the model opens only inside the Core, under a lease for this install. Most apps change their
+beside this library, and the model opens only inside the Core, with a key for this install. Most apps change their
 build and what they ship, and delete the analytics and audience lines if they had them.
 
 **When to move.** SDK 3.x stops receiving the V4 model on 15 January 2027, 00:00 UTC. New model versions, from V4.1
@@ -15,11 +15,11 @@ on, are published only encrypted, for SDK 4.0: an app on 3.x never gets them.
 | `TfClientOptions.analytics = TF_ANALYTICS_OFF` turned the anonymous analytics off. | Removed, with `TfAnalytics`, `TF_ANALYTICS_ON` and `TF_ANALYTICS_OFF`, so code that sets it no longer compiles: delete the line. Anonymous analytics are always on, because they are daily counts and durations only, never audio, text, names or device identifiers. Only Quran Lab can switch them off, from its signed config. |
 | `TfClientOptions.audience = "children"`, and the `guardian` members of `TfConsentRequest` and `TfSharing`. | Removed, so code that sets or reads them no longer compiles: delete those lines. Every learner is asked the same way, whatever the app. Complying with children's privacy law is your app's and its app store's. A learner who said yes on a 3.x guardian sheet keeps that yes and is not asked again. |
 | The storage folder held the model as plain files. | The model is encrypted for this install. Only the calibration and the sample clips are plain. No call reads, writes or names a model file, and nothing in the storage folder opens outside this install. The first start after the upgrade downloads the model once more, so it needs a connection once. |
-| `tf_client_model` worked offline once the model was downloaded. | It works offline while the install's lease is valid: 24 hours on a desktop, renewed in the background whenever the machine is online. See "The protected model". |
+| `tf_client_model` worked offline once the model was downloaded. | The first run needs a connection; after that it works offline, and the SDK keeps itself up to date in the background when the machine is online. See "The protected model". |
 | `tf_session_report_recited` was the only count of recited ayahs. | The SDK counts the ayahs of each take itself. Your report is used only for a take it could not place, and a take is never counted twice, so keep calling it if you already do. `tf_session_report_recited_outcome` adds your app's own judgement: correct, or incorrect with the number of mistakes and the rules. |
-| `tf_reference_fetch` and `tf_reference_units` read a plain table. | The table is encrypted with the model and read by the Core. `tf_reference_fetch` is refused with `TF_ERR_SESSION_OPEN` while a take runs, and the first `tf_reference_units` needs a valid lease. |
+| `tf_reference_fetch` and `tf_reference_units` read a plain table. | The table is encrypted with the model and read by the Core. `tf_reference_fetch` is refused with `TF_ERR_SESSION_OPEN` while a take runs, and the first `tf_reference_units` needs the model's key on this install. |
 | The int8 kernel headers (`zf_gemm_vnni.h`, `zf_gemm_cuda.h`) and `ZF_NATIVE_INT8`. | Gone: the engine is in the Core. 4.0 runs the CPU engine, never an accelerator, and the CUDA tier is gone. |
-| `tf_client_diagnose_json` | The same, plus `"protected"`: which key store holds the install's keys, whether the lease is valid and until when, and the Core's release. |
+| `tf_client_diagnose_json` | The same, plus `"protected"`: which key store holds the install's keys, the state of the install's model key, and the Core's release. |
 
 ## Install and requirements
 
@@ -39,25 +39,16 @@ on, are published only encrypted, for SDK 4.0: an app on 3.x never gets them.
   the machine has one, else in CNG's software key store (not exportable, protected for this Windows account); on Linux
   in a key file of the storage folder, sealed to this machine and account. It then gets an install certificate from Quran
   Lab. The first call takes a little longer for this.
-- **A lease per install.** The model opens under a lease Quran Lab signs for this install. Desktop installs are not
-  attested, so a desktop lease lasts 24 hours (7-day leases are for attested phones; in an emergency Quran Lab may give
-  longer ones, and the SDK holds every lease to its own end). The SDK renews it in the background when it is due, and a
-  valid lease never waits for a renewal. Offline with a valid lease, the model opens.
-- **When Quran Lab cannot be reached.** If the lease has ended and Quran Lab cannot be reached (no answer, a server
-  error, or "too many requests"), the model keeps opening under that lease for up to 24 hours past its end: 48 hours
-  after a 24-hour lease was given. A refusal from Quran Lab ends this at once. When Quran Lab answers that its lease
-  service is briefly unavailable (503 with a `Retry-After`), the SDK asks again after that time; such an answer is never
-  a refusal. A model open past the end of the lease first
-  asks Quran Lab for a new one and waits at most 10 seconds, and not at all when the machine is offline. Each such
-  open is reported to Quran Lab; your app gets no error. After the 24 hours the model opens only with a new lease:
-  until then `tf_client_model` fails with `TF_ERR_NEEDS_CONNECTION` when Quran Lab gave no answer, and with
-  `TF_ERR_DOWNLOAD_FAILED` when it answered with a server error. `tf_client_diagnose_json` names the lease's state:
-  `valid`, `grace` (past its end, opening in those 24 hours), `expired`, `stopped` or `none`.
-- **A Model already open keeps running** until it is closed, past the end of its lease and of those 24 hours too.
-- **The clock is the Core's.** A device clock moved back never lengthens a lease, and one moved forward never locks a
-  learner out for long.
-- **Refusals.** When Quran Lab stops a key or an app, its answer on the lease route is signed. Only when the Core
-  verifies it are the lease and the model's files removed, as in 3.x. Any other refusal there removes nothing and is
+- **Online and offline.** The first run needs a connection: the model downloads and this install gets the key that
+  opens it. After that it works offline, and while the machine is online the SDK keeps itself up to date in the
+  background; an open never waits for that. When the model needs Quran Lab to continue and Quran Lab gives no answer,
+  `tf_client_model` fails with `TF_ERR_NEEDS_CONNECTION`; when Quran Lab answers with a server error, with
+  `TF_ERR_DOWNLOAD_FAILED`. An answer that the service is briefly unavailable (503 with a `Retry-After`) is never a
+  refusal. `tf_client_diagnose_json` names the state of the install's model key (`lease`).
+- **A Model already open keeps running** until it is closed.
+- **The clock is the Core's own.**
+- **Refusals.** When Quran Lab stops a key or an app, its answer on the model-key route is signed. Only when the Core
+  verifies it are the model's key and files removed, as in 3.x. Any other refusal there removes nothing and is
   `TF_ERR_SERVER_REJECTED`.
 - **The honest limit.** A model that runs on a device can be taken by someone who controls that device and has the
   skill and the time. The goal of 4.0 is that a key, an AI agent, a copied folder or a script gets nothing usable, and
@@ -71,7 +62,7 @@ gets: an answer from a server is never `TF_ERR_NEEDS_CONNECTION`.
 | What happened | Code |
 | --- | --- |
 | A request the call needs got no answer at all (offline, DNS, a refused connection) and nothing of the model is here yet | `TF_ERR_NEEDS_CONNECTION` |
-| The lease and its 24 hours above have ended, and Quran Lab gave no answer | `TF_ERR_NEEDS_CONNECTION` |
+| The model needs Quran Lab to continue, and Quran Lab gave no answer | `TF_ERR_NEEDS_CONNECTION` |
 | Quran Lab answered with a failure: a server error, a 429, a redirect, a lease answer without a lease | `TF_ERR_DOWNLOAD_FAILED`; the message names what answered. Call again later |
 | The connection went while part of the model was already downloaded | `TF_ERR_DOWNLOAD_FAILED`; the download resumes at the next call |
 | Quran Lab refused the key or the app | `TF_ERR_INVALID_KEY`, or `TF_ERR_SERVER_REJECTED` with the reason, as in 3.x; `TF_ERR_SDK_TOO_OLD` when the key needs a newer SDK |
@@ -82,7 +73,7 @@ gets: an answer from a server is never `TF_ERR_NEEDS_CONNECTION`.
 
 New in 4.0. Every error a call hands to your app, except the codes that only say the API was used wrongly
 (`invalid_argument`, `client_exists`, `session_open`, `session_closed`, `cancelled`), and every failure the SDK goes
-on from without telling your app (for example a renewal of the lease that failed), is sent to Quran Lab as one small
+on from without telling your app (for example a background update that failed), is sent to Quran Lab as one small
 report: where it failed, why, the HTTP status, the error's name and code, how often that day, the memory tier and the
 free-space bucket. Never a message, a path, a URL or an identifier. One report per kind of failure per day, with its
 count; at most 16 a day and 32 waiting, kept 7 days. Your app's page at sdk.quranlab.ai lists them under Problems, with

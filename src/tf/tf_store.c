@@ -384,7 +384,8 @@ int tf__store_fetch(TfClient *c, const TfFetch *f, char *out_dir, size_t n, TfMo
   char cfg_ctx[32] = "";
   const char *ctx = f->context ? f->context : tf__client_inference_context(c, cfg_ctx, sizeof cfg_ctx);
   TfDownload d = tf__download_defaults();
-  d.cdn_url = tf__client_cdn(c); /* the manifest's host; the files come from the lease answer's base */
+  char hint[512] = ""; /* 4.0.1 (28.4): the manifest from the folder of the lease held for this build, if any */
+  d.base_hint = tf__pm_base(tf__pm_existing(c), p.build, hint, sizeof hint) ? hint : NULL;
   d.key = tf__client_key(c);
   d.repo = p.repo;
   d.revision = p.build;
@@ -409,6 +410,7 @@ int tf__store_fetch(TfClient *c, const TfFetch *f, char *out_dir, size_t n, TfMo
   d.client = c;
   d.cancel = tf__client_cancel_flag(c); /* destroying the Client ends the download */
   Hook hk = {c, out_dir, p.build, p.key_id};
+  d.want_key_id = p.key_id[0] ? p.key_id : NULL; /* 4.0.1: checked before any file is asked for */
   d.after_manifest = hook_lease;
   d.install = hook_install;
   d.hook_user = &hk;
@@ -471,7 +473,8 @@ int tf__store_fetch_role(TfClient *c, const TfModel *m, const char *context, con
                       context ? context : role ? role : "the model");
   }
   TfDownload d = tf__download_defaults();
-  d.cdn_url = tf__client_cdn(c);
+  char hint[512] = "";
+  d.base_hint = tf__pm_base(tf__pm_existing(c), p.build, hint, sizeof hint) ? hint : NULL;
   d.key = tf__client_key(c);
   d.repo = p.repo;
   d.revision = p.build;
@@ -485,6 +488,7 @@ int tf__store_fetch_role(TfClient *c, const TfModel *m, const char *context, con
   d.want_version = p.version;
   d.check_build = 1;
   Hook hk = {c, tf__model_dir(m), p.build, p.key_id[0] ? p.key_id : NULL};
+  d.want_key_id = hk.key_id;
   d.after_manifest = hook_lease;
   d.install = hook_install;
   d.hook_user = &hk;

@@ -65,8 +65,8 @@ Copy the setup prompt from [sdk.quranlab.ai](https://sdk.quranlab.ai) and paste 
   V4.1 on is published only encrypted, for SDK 4.0 and later.
 - **Coming from 3.x:** [docs/migrating-to-4.md](docs/migrating-to-4.md) says what changes. SDK 3.x stops receiving the
   V4 model on 15 January 2027, 00:00 UTC.
-- **Status:** 4.0.0, built and tested on Windows x86-64 (MinGW-w64 GCC 13): the 35 conformance clips through the
-  whole 4.0 path (download, install, lease, the Core) give outputs byte-identical to the 3.1.3 C SDK's; the
+- **Status:** 4.0.1, not released yet. 4.0.0 was built and tested on Windows x86-64 (MinGW-w64 GCC 13): the 35
+  conformance clips through the whole 4.0 path (download, install, the model key, the Core) give outputs byte-identical to the 3.1.3 C SDK's; the
   contract's 4.0 vectors (lease, clock, container, attest proof) and a stand-in server's flow pass. Linux x86-64:
   built and tested on every change (GCC, the full `ctest` against the Core's test release for `linux-x64`); the
   conformance clips run on Windows.
@@ -80,9 +80,10 @@ hands out its weights or keys. The SDKs around it are open source.
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
 | [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR), the exact CPU engine on every phone | Android 8.0+ on arm64-v8a and armeabi-v7a | Maven Central `ai.quranlab:tajweedformer:4.0.0` |
-| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "3.1.4"`, product `TajweedFormer` |
+| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "4.0.1"`, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | Web SDK: a hosted loader, and the engine in Quran Lab's frame on your page | Browsers, and Node for desktop apps | `<script src="https://web.quranlab.ai/4/loader.js">`, or `npm install @quran-lab/tajweedformer` |
-| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C library and CLI | Windows, Linux (x86-64) | CMake `FetchContent`, tag 4.0.0 |
+| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C library and CLI | Windows, Linux (x86-64) | CMake `FetchContent`, tag 4.0.1 |
+| [tajweedformer-flutter](https://github.com/Quran-Lab/tajweedformer-flutter) | Flutter plugin over the Android and Apple SDKs | Android and iOS | pub.dev, `flutter pub add quranlab_tajweedformer` |
 
 The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), encrypted end to end, hosted by Quran Lab and served by
 `cdn.quranlab.ai/models` to app keys from [sdk.quranlab.ai](https://sdk.quranlab.ai).
@@ -93,8 +94,8 @@ revision your learners get, and see the problems your app's learners hit.
 
 The library builds from this repository's tag inside your project, over the Quran Lab Core, which is not built from
 source: download the Core's binary for your target from the release's folder,
-`https://cdn.quranlab.ai/sdk/native/4.0.0/` (`qlcore-4.0.0-windows-x64.zip` with `qlcore.dll` and
-`libwinpthread-1.dll`, or `qlcore-4.0.0-linux-x64.tar.gz` with `qlcore.so`; `SHA256SUMS` beside them), and unpack
+`https://cdn.quranlab.ai/sdk/native/4.0.1/` (`qlcore-4.0.1-windows-x64.zip` with `qlcore.dll` and
+`libwinpthread-1.dll`, or `qlcore-4.0.1-linux-x64.tar.gz` with `qlcore.so`; `SHA256SUMS` beside them), and unpack
 it into a folder of your project, here `qlcore/`. `CMakeLists.txt`:
 
 ```cmake
@@ -105,7 +106,7 @@ include(FetchContent)
 set(QLCORE_DIR "${CMAKE_SOURCE_DIR}/qlcore" CACHE PATH "the Core's binary for this target")
 FetchContent_Declare(tajweedformer
   GIT_REPOSITORY https://github.com/Quran-Lab/tajweedformer-c.git
-  GIT_TAG        4.0.0)
+  GIT_TAG        4.0.1)
 FetchContent_MakeAvailable(tajweedformer)
 
 add_executable(quickstart quickstart.c)
@@ -137,7 +138,7 @@ checks its own code, and a changed Core gets no lease.
 | **Libraries** | Linux: the development files of libcurl and OpenSSL 3 (`libcurl4-openssl-dev libssl-dev` on Debian and Ubuntu). Windows: none. The build downloads libopus 1.6.1 once and checks its hash. |
 | **Microphone** | The library takes samples; capturing them is your program's part. The quick start pipes the system's recorder in. |
 | **Download** | The model is 56.2 MB for the default context (69.1 MB on disk), encrypted, downloaded once by `tf_client_model` into the SDK's folder; every context together is 58.5 MB. The first run needs a connection. |
-| **Offline** | The model opens under a lease of 24 hours that Quran Lab signs for this install, renewed in the background while the machine is online. When the lease has ended and Quran Lab cannot be reached, the model keeps opening for up to 24 hours more; a refusal ends that at once. A model that is open keeps running. |
+| **Offline** | The first run needs a connection. After that the model works offline, and the SDK keeps itself up to date in the background when the machine is online. When it needs Quran Lab to continue, `tf_client_model` answers `TF_ERR_NEEDS_CONNECTION`. A model that is open keeps running. |
 | **Analytics** | Anonymous counts and durations (never audio, text, names or device identifiers) and reports of the failures your learners hit are always sent; you find them at sdk.quranlab.ai under your app, Problems included. |
 | **Takes** | One Client per process, and one take at a time. A server runs one worker process per take. |
 
@@ -162,7 +163,7 @@ static int recite(const char *key) {
 
 Put your app's id where the example says `com.example.quickstart`: a key works for the first app id that used
 it. `tf_client_model` downloads the model once, verifies every file, installs it encrypted for
-this install, gets its lease, opens it and warms the engine. Each chunk (320 ms of audio) prints what the model heard so far; the take ends by itself after
+this install, gets the key that opens it on this install, opens it and warms the engine. Each chunk (320 ms of audio) prints what the model heard so far; the take ends by itself after
 1.5 s of silence following speech (`end_on_silence_ms`). In a noisy room a take may not end on silence, so keep
 a way to stop (here the end of the input; an app calls `tf_session_finish`); the 20-minute limit ends it in any
 case. Values under 1000 can end a take in a breath pause between two words. A call on a NULL object fails and keeps the first error, so one check at the
@@ -195,9 +196,8 @@ never audio, text, names or device identifiers.
 the transcript (units, text and word timings), a summary of each tajweed head, the processing time and, with
 references, the unit and word error rates. It uses the public C API only, with your app's desktop key: the model is
 downloaded once and runs inside the Core as in any app. **The raw weights are not needed to evaluate the model**, and
-the tool never writes model files or plaintext. Once the model is installed it runs with no network while the
-install's lease is valid (24 hours on a desktop, renewed whenever it is online, and 24 hours more while Quran Lab
-cannot be reached).
+the tool never writes model files or plaintext. The first run needs a connection; after that it works offline, and it
+keeps itself up to date in the background when the machine is online.
 
 It ships beside the library (`tajweedformer-eval.exe` with `tajweedformer.dll`, `qlcore.dll` and
 `libwinpthread-1.dll` on Windows; `tajweedformer-eval` with `libtajweedformer.so` and `qlcore.so` on Linux), and every
@@ -265,7 +265,7 @@ where it says `...`. The output is plain ASCII: the units' letters are `\u` esca
 The last line holds the totals:
 
 ```json
-{"total":{"files":6,"evaluated":6,"failed":0,"with_reference":6,"audio_s":27.507,"processing_s":7.804,"rtf":0.2837,"units":{"ref":138,"hyp":143,"sub":3,"del":0,"ins":5,"rate":0.057971},"words":{"ref":25,"wrong":2,"rate":0.080000},"sdk":"4.0.0","model":"4.1.0","context":"c16_l64","threads":2}}
+{"total":{"files":6,"evaluated":6,"failed":0,"with_reference":6,"audio_s":27.507,"processing_s":7.804,"rtf":0.2837,"units":{"ref":138,"hyp":143,"sub":3,"del":0,"ins":5,"rate":0.057971},"words":{"ref":25,"wrong":2,"rate":0.080000},"sdk":"4.0.1","model":"4.1.0","context":"c16_l64","threads":2}}
 ```
 
 `transcript` is what the public API gives: the decoded text, each unit with its id, time and confidence, and the
@@ -297,7 +297,7 @@ anonymous daily counts and durations every app of the SDK sends.
 
 What happens the first time `tf_client_model` runs, and what stays on the device:
 
-1. **The install's keys.** On Windows with a TPM, an ECDH P-256 key (to receive leases) and an ECDSA P-256 key (to
+1. **The install's keys.** On Windows with a TPM, an ECDH P-256 key (to receive the model's key) and an ECDSA P-256 key (to
    prove it holds them) are made in the TPM through CNG's Microsoft Platform Crypto Provider, for this user, never
    exportable. Without a TPM they are made in CNG's Microsoft Software Key Storage Provider, not exportable, their
    private halves protected by DPAPI for this user; the SDK reports that as a software key store. On Linux one
@@ -308,35 +308,32 @@ What happens the first time `tf_client_model` runs, and what stays on the device
    signature (made through the Core) over the agreement key's hash. Desktop installs are not attested: the
    certificate says `att none`, and a TPM changes only its `hw` field. **A new agreement key is made at every
    attest**; when an attest fails, the new key is deleted and the old one kept.
-3. **The lease.** A challenge, the Core's proof, and `POST /v1/model-key`: the server answers a lease for this
-   install's key and this Core release. Desktop leases last 24 hours (the unattested class; the server may give
-   longer ones in an emergency, and each is held to its own end) and are refreshed in the background after the time
-   the server chose (with its own jitter), retried after 1, 5 and 30 minutes, then 2 and 4 hours, then every 6 hours,
-   or after the answer's `Retry-After` (a `503 lease_unavailable`, never a refusal). A valid lease never waits for a
-   refresh. The clock is the Core's: a device
-   clock moved back never lengthens a lease, one moved forward never locks a learner out for long. A lease answer
-   may carry the week's data piece (signed data, never code); the SDK hands it to the Core after the lease is
-   accepted, and the Core uses it from the next request on.
+3. **The model key.** A challenge, the Core's proof, and `POST /v1/model-key`: the server answers the key to the
+   model for this install's key and this Core release. While the machine is online the SDK keeps it up to date in
+   the background (after an answer's `Retry-After` where there is one; a `503 lease_unavailable` is never a
+   refusal), and an open never waits for that. The clock is the Core's own. An answer may carry a data piece (signed
+   data, never code); the SDK hands it to the Core after the answer is accepted, and the Core uses it from the next
+   request on.
 4. **The files.** The signed config names the build and its key id (no download address); the signed manifest must
-   name that key id before a lease is asked for. The build's containers (encrypted, as the CDN serves them) are
-   downloaded only from the model folder the lease answer names (https, on Quran Lab's hosts; an answer without
-   one downloads nothing), checked against the signed manifest, and handed to the
+   name that key id before any file is asked for. The build's containers (encrypted, as the CDN serves them) come
+   from the build's folder on the model host while the model key is asked for (4.0.1), up to four at once, and are
+   used only when its answer names that same folder (https, on Quran Lab's hosts); an answer that names another is
+   where they come from instead, and a key that does not come, or an answer without a folder, leaves none of them. Each
+   is checked against the signed manifest as it arrives (its size and SHA-256) and handed to the
    Core, which writes the device form (encrypted again, for this install) and checks the plaintext's hash inside.
    The downloaded form is deleted. **No plaintext model file is ever written**; the only plain files are the
    calibration and the sample clips (public data).
-5. **Opening.** The Core reads the device forms into its own memory with the lease. Offline with a valid lease the
-   model opens. Past the lease's end an open first asks for a new one (waiting at most 10 seconds, not at all
-   offline); while Quran Lab cannot be reached (no answer, a 5xx, a 429, a redirect, a page that is not the API's)
-   the model keeps opening for 24 hours past the lease's end, its grace, and each such open is reported silently
-   (`lease`, `grace`). A refusal ends the grace at once. After it, `tf_client_model` answers `needs_connection` (no
-   answer) or `download_failed` (a server's error). A Model already open keeps running until it is closed.
+5. **Opening.** The Core reads the device forms into its own memory with the model key. After the first run the
+   model opens offline. When it needs Quran Lab to continue and Quran Lab cannot be reached, `tf_client_model`
+   answers `needs_connection` (no answer) or `download_failed` (a server's error); an open that asks waits a few
+   seconds at most, and not at all offline. A Model already open keeps running until it is closed.
 
-**Refusals.** Every refusal of the lease route goes to the Core. When the server refuses the key or the app there,
-the refusal counts only when the Core verifies its signature (Quran Lab's key, this install, this request, within
-10 minutes): then the lease is gone and the model's files are removed, as in 3.x. An unsigned refusal there is a
-failed request and changes nothing. A refusal while a new data piece is in force sends the Core back to the last
-piece a lease was accepted with, and a request refused for the Core's proof under a new piece is asked once more
-under it, so a bad week's piece never costs a learner the model. On the other routes 3.x's rules stand.
+**Refusals.** Every refusal of the model-key route goes to the Core. When the server refuses the key or the app
+there, the refusal counts only when the Core verifies its signature (Quran Lab's key, this install, this request,
+and recent): then the model's key and files are removed, as in 3.x. An unsigned refusal there is a failed request
+and changes nothing. A refusal while a new data piece is in force sends the Core back to the last piece an answer
+was accepted with, and a request refused for the Core's proof under a new piece is asked once more under it, so a
+bad data piece never costs a learner the model. On the other routes 3.x's rules stand.
 
 **The honest limit.** A model that runs on a device can be taken by someone who controls that device and has the
 skill and the time. The goal is that a key, an AI agent, a copied folder or a script gets nothing usable: the
@@ -370,7 +367,7 @@ folder holds ciphertext bound to this install, and the key that opens it never e
 - **The reference data** (`tf_model_reference`): the table of expected units is encrypted with the model and read by
   the Core. `tf_reference_fetch` downloads it when the app asks and the Core installs it (with the Model's engine
   closed for the moment: it is refused while a take runs); `tf_reference_units` asks the Core, which reads the table at
-  the first ask (that ask needs a valid lease, as a take does). The units and words are 3.x's: the conformance run
+  the first ask (that ask needs the model's key on this install, as a take does). The units and words are 3.x's: the conformance run
   holds every ayah of the Quran to the plaintext table (`test/reference_fnv.py`).
 
 ## Running in an app
@@ -382,8 +379,9 @@ folder holds ciphertext bound to this install, and the key that opens it never e
   SDK's own state. Nothing in it opens outside this install. `tf_client_remove_models` removes the model files.
 - **A Session is one take**; a process runs one take at a time (`tajweedformer serve` runs one process per take).
 - **The diagnose report** (`tf_client_diagnose_json`) adds `"protected"` (the contract's section 25): which key store
-  holds the keys, whether the lease is valid, in its grace, expired or stopped and until when, its class (`7d` or
-  `24h`), when it is renewed, the grace's end, and the Core's release.
+  holds the keys, the state of this install's model key (`lease`, `leaseExpires`, `leaseClass`, `refreshAfter`,
+  `graceUntil`), and the Core's release. From 4.0.1 it also names the servers in use (`"endpoints"`).
+- **Backup servers (4.0.1).** If Quran Lab's main servers can't be reached, the SDK uses backup servers automatically.
 
 ## Recitation sharing
 
@@ -478,7 +476,7 @@ it, never as a repeat, and its judgement not toward first attempt or repeat.
 **Error reports**. Every error a call hands to the app, except the five that
 only say the API was used wrongly (`invalid_argument`, `client_exists`, `session_open`, `session_closed`,
 `cancelled`), and every failure the SDK goes on from without telling the app (a launch's config, register or token
-request answered with a failure, a config that does not verify, the lease's background refresh, a telemetry delta
+request answered with a failure, a config that does not verify, the background update of the model key, a telemetry delta
 refused or kept 7 days, a shared recording refused for good, an installed build whose files were removed) is sent to
 Quran Lab as one small report: where the cause was (`config`, `lease`, `manifest`, `download`, `storage`,
 `model_open`, `session` and the rest), why (`http`, `timeout`, `hash`, `memory`, ...), the HTTP status, the transport's
@@ -526,14 +524,16 @@ every step of its 40 cases, action, reason and the whole new state), `tf40_share
 a fake clock: the settle, the card, its open, a take that ends it, the re-ask sheet in a card's place) and
 `tf40_flow` (the
 whole flow against a stand-in server: config, attest with `install_sig`, challenge, the lease request's closed schema
-and signature, download from the lease answer's model folder (and nothing when the answer names none, or one off
-Quran Lab's hosts), install, signed and unsigned stops,
+and signature, download beside the lease and from the lease answer's model folder (and nothing kept when the answer
+names none, or one off Quran Lab's hosts), install, signed and unsigned stops,
 `install_cert_invalid`, `challenge_invalid`, the route off, a config without the build's key id and one with another,
 and the data pieces of the contract's `piece.json`: each one in force from the next request, a proof refused once
-under a new piece and asked again under the last good one, a piece with a bad signature changing nothing), and
-`tf40_lease_clock` (the staging clock case of 11-15: on one boot moved by hand past a lease's `exp`, a lease from a
-server whose clock stayed behind is refused by the Core as expired; one from a server whose clock moved with the
-device's re-anchors the Core's clock and is valid). The Core used by the tests is the contract's test release
+under a new piece and asked again under the last good one, a piece with a bad signature changing nothing),
+`tf40_lanes` (the downloader's lanes: at most four files at once, each hashed as it comes and never read again,
+resume, a partial file of other bytes, a cut connection, a mismatch, a stall, the files fetched while the lease hook
+runs and none left when it fails), `tf40_qos` (Windows: the engine's threads and the pushing thread are not
+power-throttled), and
+`tf40_lease_clock` (a device clock moved by hand against a server's clock, through the Core's own clock). The Core used by the tests is the contract's test release
 `4.0.0-c1`.
 
 **Conformance.** `test/make_flow40.py --testbuild <folder>` takes an encrypted test build (made by quranlab-core's

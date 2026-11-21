@@ -422,9 +422,12 @@ static void wrap_up(TfSession *s, int reason) {
  * completes (the last one final), then the take's Heads. Returns the chunks run, or a negative TfError. */
 static int end_take(TfSession *s, int reason) {
   s->finishing = 1;
+  TfQosSave qos;
+  tf__qos_enter(&qos);
   const double t0 = tf__now_s();
   const int r = qlc_stream_finish(s->zs);
   const double dt = tf__now_s() - t0;
+  tf__qos_leave(&qos);
   s->compute_s += dt;
   s->compute_us += (long long)(dt * 1e6);
   if (r < 0) {
@@ -463,19 +466,26 @@ static int push(TfSession *s, const float *samples, int n) {
    * ends at the chunk that reached the silence, whatever the app pushed in one call (the same bits either way) */
   const int piece = s->end_ms > 0 ? (s->rate / 100 > 0 ? s->rate / 100 : 1) : (n > 0 ? n : 1);
   int chunks = 0;
+  /* 4.0.1, Windows: the engine runs on this thread too; it is never power-throttled while it does (tf_qos.c) */
+  TfQosSave qos;
+  tf__qos_enter(&qos);
   for (int at = 0; at < n && s->state == OPEN && !s->silence_end; at += piece) {
     const int k = n - at < piece ? n - at : piece;
     const double t0 = tf__now_s();
     const int r = qlc_stream_push(s->zs, samples + at, k);
     const double dt = tf__now_s() - t0;
     s->compute_s += dt;
-    if (r < 0) return engine_failed(s, r);
+    if (r < 0) {
+      tf__qos_leave(&qos);
+      return engine_failed(s, r);
+    }
     if (r > 0) s->compute_us += (long long)(dt * 1e6);
     chunks += r;
     s->samples += k;
     share_push(s, samples + at, k);
     if (r > 0 && s->take_id) tf__recited_feed(tf__model_pm(s->m), s->zs); /* the take's units so far, off the audio path */
   }
+  tf__qos_leave(&qos);
   if (s->state == OPEN && s->silence_end) {
     if (s->failed_code) return fail_take(s, s->failed_code);
     wrap_up(s, TF_ENDED_SILENCE);

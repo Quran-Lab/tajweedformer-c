@@ -38,6 +38,7 @@ const char *tf__rep_code_for(const char *stage, const char *reason, int status, 
   if (!stage || !reason) return "none";
   if (!ec) ec = "";
   if (is(stage, "sharing") || is(stage, "events")) return "none";
+  if (is(reason, "failover")) return "none"; /* 4.0.1 (28.7): answered on another host after the first was unreachable */
   static const char *const unattested[] = {"unsupported", "attestation_failed", "integrity_failed", "turnstile", NULL};
   /* 24.3 (69326fb): a token request refused 403 lease_integrity_failed is server_rejected, as at the lease */
   if (is(stage, "attest") && is(reason, "integrity_failed") && on_device != TF_REP_COMPLETE) return "server_rejected";
@@ -200,11 +201,33 @@ typedef struct {
   int force; /* the next catalogue code takes it whatever 24.4 says (a code the contract gives that pair elsewhere) */
   int status, retries;
   char stage[16], reason[33], name[49], code[33];
+  char role[8]; /* 4.0.1 (28.7): the role of the request the cause is, "" for none */
+  int fallback; /* 0 none, 1 false, 2 true */
 } Cause;
 static _Thread_local Cause t_cause;
+typedef char tf__cause_fits_err_state[sizeof(Cause) <= sizeof(((TfErrState *)0)->cause) ? 1 : -1];
 _Thread_local int tf__app_call;
+/* 4.0.1 (ENDPOINTS_40.md 28.7, ERRORS_40.md 24.2): a cause that is a request to Quran Lab's hosts carries the role of
+ * that request (the thread's last, tf__ep_note) and whether more than one host was asked; never a host name */
+static void host_of(Cause *k) {
+  static const char *const net[] = {"config", "register", "attest", "lease", "manifest", "download", "sharing", "events", NULL};
+  static const char *const local[] = {"storage", "quota", NULL};
+  int role, fb;
+  k->role[0] = 0;
+  k->fallback = 0;
+  if (!one_of(k->stage, net) || one_of(k->reason, local) || !tf__ep_noted(&role, &fb)) return;
+  snprintf(k->role, sizeof k->role, "%s", tf__ep_role_name(role));
+  k->fallback = fb ? 2 : 1;
+}
 
 void tf__cause_clear(void) { memset(&t_cause, 0, sizeof t_cause); }
+/* 4.0.1: the cause crosses threads with the error it belongs to (tf__err_save, tf__err_restore) */
+void tf__cause_save(void *out, size_t n) {
+  if (n >= sizeof t_cause) memcpy(out, &t_cause, sizeof t_cause);
+}
+void tf__cause_restore(const void *in, size_t n) {
+  if (n >= sizeof t_cause) memcpy(&t_cause, in, sizeof t_cause);
+}
 void tf__cause(const char *stage, const char *reason, int status, const char *error_name, const char *error_code) {
   tf__cause_clear();
   if (!stage || strlen(stage) >= sizeof t_cause.stage || !reason_ok(reason)) return;
@@ -215,6 +238,7 @@ void tf__cause(const char *stage, const char *reason, int status, const char *er
   t_cause.retries = -1;
   if (name_ok(error_name)) snprintf(t_cause.name, sizeof t_cause.name, "%s", error_name);
   if (code_ok(error_code)) snprintf(t_cause.code, sizeof t_cause.code, "%s", error_code);
+  host_of(&t_cause);
 }
 void tf__cause_force(void) { t_cause.force = t_cause.set; }
 /* the code just set on the thread has this cause (where the cause is known only after the code was set) */
@@ -342,6 +366,8 @@ static void copy_fields(TfRepItem *it, const TfRepOcc *o) {
   snprintf(it->revision, sizeof it->revision, "%s", o->revision && strlen(o->revision) < sizeof it->revision && tf__is_model_version(o->revision) ? o->revision : "");
   const int hex40 = o->build && strlen(o->build) == 40 && strspn(o->build, "0123456789abcdef") == 40;
   snprintf(it->build, sizeof it->build, "%s", hex40 ? o->build : "");
+  snprintf(it->role, sizeof it->role, "%s", is(o->role, "api") || is(o->role, "models") ? o->role : "");
+  it->fallback = it->role[0] && o->fallback >= 1 && o->fallback <= 2 ? o->fallback : 0;
 }
 
 /* An occurrence on `day`; 1 when it made a new report. */
@@ -475,7 +501,7 @@ void tf__rep_from_json(TfRepState *r, const char *text, size_t n) {
     const char *day = jstr(x, "day"), *stage = jstr(x, "stage"), *reason = jstr(x, "reason"), *code = jstr(x, "code");
     if (!is_day(day) || !reason_ok(stage) || strlen(stage) >= 16 || !reason_ok(reason) || !reason_ok(code)) continue;
     TfRepOcc o = {stage, reason, code, jint(x, "status", 0), 0, jint(x, "retries", -1), jstr(x, "name"), jstr(x, "ecode"),
-                  jstr(x, "ram"), jstr(x, "free"), jstr(x, "revision"), jstr(x, "build")};
+                  jstr(x, "ram"), jstr(x, "free"), jstr(x, "revision"), jstr(x, "build"), jstr(x, "host_role"), jint(x, "fallback", 0)};
     TfRepItem *it = &r->q[r->nq++];
     memset(it, 0, sizeof *it);
     snprintf(it->day, sizeof it->day, "%s", day);
@@ -510,9 +536,11 @@ char *tf__rep_to_json(const TfRepState *r) {
   for (int i = 0; i < r->nq; ++i) {
     const TfRepItem *it = &r->q[i];
     tf_buf_printf(&b, "%s{\"day\":\"%s\",\"stage\":\"%s\",\"reason\":\"%s\",\"code\":\"%s\",\"status\":%d,\"count\":%d,\"first_report\":%d,"
-                      "\"first_launch\":%d,\"retries\":%d,\"name\":\"%s\",\"ecode\":\"%s\",\"ram\":\"%s\",\"free\":\"%s\",\"revision\":\"%s\",\"build\":\"%s\"}",
+                      "\"first_launch\":%d,\"retries\":%d,\"name\":\"%s\",\"ecode\":\"%s\",\"ram\":\"%s\",\"free\":\"%s\",\"revision\":\"%s\",\"build\":\"%s\"",
                   i ? "," : "", it->day, it->stage, it->reason, it->code, it->status, it->count, it->first_report, it->first_launch, it->retries,
                   it->name, it->ecode, it->ram, it->free_, it->revision, it->build);
+    if (it->role[0]) tf_buf_printf(&b, ",\"host_role\":\"%s\",\"fallback\":%d", it->role, it->fallback);
+    tf_buf_puts(&b, "}");
   }
   tf_buf_puts(&b, "],\"days\":[");
   for (int i = 0; i < r->nds; ++i) tf_buf_printf(&b, "%s[\"%s\",\"%s\",%d]", i ? "," : "", r->ds[i].day, r->ds[i].sig, r->ds[i].sent);
@@ -614,7 +642,8 @@ static void occur(const Cause *k, const char *code) {
   }
   const long long fb = g.dir[0] ? tf__free_bytes(g.dir) : -1;
   if (fb >= 0) snprintf(rf, sizeof rf, "%s", tf__rep_storage_free(fb));
-  TfRepOcc o = {k->stage, k->reason, code, k->status, g.first_process, k->retries, k->name, k->code, tf__client_ram_tier(), rf, g.revision, g.build};
+  TfRepOcc o = {k->stage, k->reason, code, k->status, g.first_process, k->retries, k->name, k->code, tf__client_ram_tier(), rf, g.revision, g.build,
+                k->role[0] ? k->role : NULL, k->fallback};
   char day[11];
   today(day);
   const int made = tf__rep_occur(&g.st, day, &o);
@@ -650,6 +679,7 @@ void tf__rep_silent(const char *stage, const char *reason, int status, const cha
   k.status = status >= 100 && status <= 599 ? status : 0;
   if (name_ok(error_name)) snprintf(k.name, sizeof k.name, "%s", error_name);
   if (code_ok(error_code)) snprintf(k.code, sizeof k.code, "%s", error_code);
+  host_of(&k);
   occur(&k, "none");
 }
 /* ------------------------------------------------------------------ 24.2: the body, 24.6: sending */
@@ -673,6 +703,9 @@ char *tf__rep_body(TfClient *c, const TfRepItem *it) {
   if (it->build[0]) tf_buf_printf(&b, ",\"build\":\"%s\"", it->build);
   if (it->ram[0]) tf_buf_printf(&b, ",\"ram_tier\":\"%s\"", it->ram);
   if (it->free_[0]) tf_buf_printf(&b, ",\"storage_free\":\"%s\"", it->free_);
+  /* 4.0.1 (ENDPOINTS_40.md 28.7): the role of the request the cause is, and whether more than one host was asked */
+  if (it->role[0]) tf_buf_printf(&b, ",\"host_role\":\"%s\"", it->role);
+  if (it->role[0] && it->fallback) tf_buf_printf(&b, ",\"fallback\":%s", it->fallback == 2 ? "true" : "false");
 #if defined(__x86_64__) || defined(_M_X64) || defined(__amd64__)
   tf_buf_puts(&b, ",\"abi\":\"x86_64\"");
 #endif
