@@ -140,7 +140,44 @@ void tf__clear_error(void) {
   tf__cause_clear(); /* a failure the call went on from is not the cause of a later one */
 }
 int tf__error_code(void) { return g_code; }
+/* the thread's error as it is now, and back (ENDPOINTS_40.md 28.3: a request asked of several hosts is the failure of
+ * the first host's answer when every host was unreachable, and leaves the error as it was when one answered) */
+struct TfErrSave {
+  int code;
+  char msg[sizeof g_msg], fix[sizeof g_fix], raw[sizeof g_raw];
+};
+TfErrSave *tf__error_save(void) {
+  TfErrSave *s = (TfErrSave *)malloc(sizeof *s);
+  if (!s) return NULL;
+  s->code = g_code;
+  memcpy(s->msg, g_msg, sizeof g_msg);
+  memcpy(s->fix, g_fix, sizeof g_fix);
+  memcpy(s->raw, g_raw, sizeof g_raw);
+  return s;
+}
+void tf__error_restore(TfErrSave *s, int free_it) {
+  if (!s) return;
+  g_code = s->code;
+  memcpy(g_msg, s->msg, sizeof g_msg);
+  memcpy(g_fix, s->fix, sizeof g_fix);
+  memcpy(g_raw, s->raw, sizeof g_raw);
+  if (free_it) free(s);
+}
 const char *tf__error_text(void) { return g_msg; }
+void tf__err_save(TfErrState *s) {
+  s->code = g_code;
+  memcpy(s->msg, g_msg, sizeof g_msg);
+  memcpy(s->fix, g_fix, sizeof g_fix);
+  memcpy(s->raw, g_raw, sizeof g_raw);
+  tf__cause_save(s->cause, sizeof s->cause);
+}
+void tf__err_restore(const TfErrState *s) {
+  g_code = s->code;
+  memcpy(g_msg, s->msg, sizeof g_msg);
+  memcpy(g_fix, s->fix, sizeof g_fix);
+  memcpy(g_raw, s->raw, sizeof g_raw);
+  tf__cause_restore(s->cause, sizeof s->cause);
+}
 int tf__error_as(int code) {
   if (!g_code || entry(g_code)) return g_code;
   char keep[sizeof g_raw];

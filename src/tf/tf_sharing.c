@@ -572,6 +572,15 @@ void tf__share_forget_seq(TfClient *c);
 
 /* ------------------------------------------------------------------ SDK 4.0's ask (section 20) */
 static void grant(Share *s);
+/* Sharing has just come on in this process (a yes on the sheet, the settings switch, or a config that turns the
+ * switch on for a learner who said yes before): the uploader starts now. tf__client_launch starts it only for a
+ * learner who had already said yes when the process started, so a yes given in a running app left its recordings on
+ * disk until the next launch (production, 11-19: 301 s and nothing sent, then sent within 4 s of the next launch).
+ * Idempotent: a running uploader is only woken. Not from tf__client_sharing_answer, the tests' 3.x answer: the tests
+ * that use it start the uploader themselves when they want it. */
+static void uploads_start(TfClient *c) {
+  if (tf__client_sharing_state(c)) tf__sharing_outbox_resume(c);
+}
 long long tf__ask_now_ms;      /* tests: the wall clock (0: the system's) */
 int tf__ask_tz_min = -100000;  /* tests: the UTC offset in minutes (-100000: the device's) */
 static long long ask_now(int *tz) {
@@ -746,6 +755,7 @@ int tf__sharing_event(TfClient *c, const TfAskEvent *ev, const char **why) {
     tf__telemetry_add(c, "share_yes", 1);
   }
   if (changed || newly_granted) share_save(c, s);
+  if (newly_granted) uploads_start(c);
   if (why) *why = w;
   return action;
 }
@@ -969,6 +979,7 @@ int tf__client_sharing_set(TfClient *c, int on) {
   if (on) {
     grant(s);
     share_save(c, s);
+    uploads_start(c);
     return 0;
   }
   tf_mutex_lock(&s->lock);
@@ -1035,18 +1046,21 @@ int tf__client_sharing_recovery_code(TfClient *c, char out[33]) {
 
 /* deletion routes take NO app key or token (403 credential_not_accepted): plain JSON POSTs */
 static int post_plain(TfClient *c, const char *path, const char *body, TfHttpResponse *r) {
-  char url[1024];
-  snprintf(url, sizeof url, "%s%s", tf__client_api(c), path);
   const char *hdr[] = {"content-type: application/json", NULL};
   TfHttpRequest q;
   memset(&q, 0, sizeof q);
   q.method = "POST";
-  q.url = url;
   q.headers = hdr;
   q.body = body;
   q.body_n = strlen(body);
   q.timeout_s = 30;
-  return tf_http(&q, r);
+  /* 4.0.1 (ENDPOINTS_40.md 28.3): through the api hosts in their order, as every API request */
+  TfEpReq er;
+  memset(&er, 0, sizeof er);
+  er.role = TF_EP_API;
+  er.path = path;
+  er.stage = "sharing";
+  return tf__ep_http(tf__client_endpoints(c), &er, &q, r, NULL);
 }
 
 /* The server confirmed "Delete what I shared". Since 3.0.1 sharing goes OFF with it, as the settings switch turns

@@ -585,7 +585,7 @@ static int t_eval(const char *fixture, const char *list, const char *work) {
   const TfJson *T = n1 == 7 ? tf_json_get(L1[6], "total") : NULL;
   int tok = T && tf_json_get(T, "files")->num == 6 && tf_json_get(T, "evaluated")->num == 6 && tf_json_get(T, "failed")->num == 0 &&
             tf_json_get(T, "with_reference")->num == 6 && ev_t_ed_ok(tf_json_get(T, "units")) && ev_t_wer_ok(tf_json_get(T, "words")) &&
-            !strcmp(tf_json_str(tf_json_get(T, "sdk")), "4.0.0") && tf_json_str(tf_json_get(T, "model")) && tf_json_get(T, "threads")->num == 2;
+            !strcmp(tf_json_str(tf_json_get(T, "sdk")), TF_SDK_VERSION) && tf_json_str(tf_json_get(T, "model")) && tf_json_get(T, "threads")->num == 2;
   for (int q = 0; tok && q < 5; ++q) {
     const char *const kk[5] = {"ref", "hyp", "sub", "del", "ins"};
     tok = (long long)tf_json_get(tf_json_get(T, "units"), kk[q])->num == tot[0][q];

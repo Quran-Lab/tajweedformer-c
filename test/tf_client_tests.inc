@@ -565,16 +565,16 @@ static int download_tests(const char *cdn, const char *dest, const char *key) {
   CHECK(g_ranged >= 1, "no Range request after the interruption");
   CHECK(g_bad_url == 0, "a download URL is not under https://cdn.quranlab.ai/models/Quran-Lab/tajweedformer-v4/test/sdk/v4.0/");
   {
-    /* the base: the /models shape; a bare cdn.quranlab.ai (or regional) base keeps its /hf/ path */
+    /* 4.0.1 (ENDPOINTS_40.md 28.4): the build's folder is a path the models hosts are asked for (the legacy /hf/ shape
+     * of a bare host went with the fixed host) */
     static const char *const cases[][2] = {
-      {"https://cdn.quranlab.ai/models/", "https://cdn.quranlab.ai/models/Quran-Lab/m/r/sdk/v4.0/a"},
-      {"https://cdn.quranlab.ai", "https://cdn.quranlab.ai/hf/Quran-Lab/m/r/sdk/v4.0/a"},
-      {"https://oc.cdn.quranlab.ai", "https://oc.cdn.quranlab.ai/hf/Quran-Lab/m/r/sdk/v4.0/a"},
-      {"https://mirror.test/x", "https://mirror.test/x/Quran-Lab/m/r/sdk/v4.0/a"},
+      {"/models/", "/models/Quran-Lab/m/r/sdk/v4.0/"},
+      {"/models", "/models/Quran-Lab/m/r/sdk/v4.0/"},
+      {"", "/Quran-Lab/m/r/sdk/v4.0/"},
     };
     char u[256];
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
-      CHECK(!tf__model_url(u, sizeof u, cases[i][0], "Quran-Lab/m", "r", "sdk/v4.0", "a") && !strcmp(u, cases[i][1]), "model URL for %s: %s", cases[i][0], u);
+      CHECK(!tf__model_folder(u, sizeof u, cases[i][0], "Quran-Lab/m", "r", "sdk/v4.0") && !strcmp(u, cases[i][1]), "model folder for %s: %s", cases[i][0], u);
     }
   }
   char *c24 = tf_path_join(dest, "c24_l72/frames.zfw"), *gzleft = tf_path_join(dest, "layers.zfw.gz");

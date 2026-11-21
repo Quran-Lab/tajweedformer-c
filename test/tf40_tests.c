@@ -52,8 +52,18 @@
  *                                           disk after both (tf40_eval_tests.inc)
  *   tf40_tests errors <test/data/sdk_4.0.0> <work>  error reports (ERRORS_40.md 24): the contract's errors_40.json
  *                                           codes, queue, telemetry and signatures (tf40_errors_tests.inc)
- *   tf40_tests errors_flow <fixture> <work> each reported stage from its failure against the stand-in server: the
- *                                           code the app gets and the report it sends (tf40_errors_tests.inc)
+ *   tf40_tests errors_flow <fixture> <work> [<test/data/sdk_4.0.0>]   each reported stage from its failure against the
+ *                                           stand-in server: the code the app gets and the report it sends; with the
+ *                                           vectors, errors_40.json core_open from a failed model open (24.3, Gate C)
+ *                                           (tf40_errors_tests.inc)
+ *   tf40_tests app27 <fixture> <work>       4.0.1, APP_VERSION_40.md 27.3: app_version and app_build on the config
+ *                                           request, register's app_version, tf_client_create2 and its ext's size
+ *   tf40_tests endpoints <vectors> <fixture> <work>   4.0.1, ENDPOINTS_40.md 28.8: endpoints_40.json replayed on this SDK's code
+ *                                           (hosts, config_lists, bases, answers, requests, attempts, first_manifest,
+ *                                           downloads with downloads_if_range), and standby_40.json's answers read by
+ *                                           28.3's table (tf40_endpoints_tests.inc)
+ *   tf40_tests loopback <fixture> <work>    4.0.1, 28.8's checks on this platform's real HTTP code (WinHTTP, libcurl)
+ *                                           against stand-in servers on 127.0.0.1 (tf40_endpoints_tests.inc)
  * <vectors>: the contract's sdk_4.0.0/vectors. Nothing here reaches a network: every request goes to the stand-in. */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
@@ -683,7 +693,7 @@ static int t_attest(const char *vec, const char *work) {
 
 /* ------------------------------------------------------------------ the stand-in server */
 enum { LEASE_OK = 0, LEASE_SIGNED_STOP, LEASE_UNSIGNED_STOP, LEASE_CERT_INVALID_ONCE, LEASE_CHALLENGE_INVALID_ONCE, LEASE_ROUTE_OFF, LEASE_SIGNED_STOP_NOW,
-       LEASE_PIECE, LEASE_NO_BASE, LEASE_OFF_BASE, LEASE_LATER };
+       LEASE_PIECE, LEASE_NO_BASE, LEASE_OFF_BASE, LEASE_LATER, LEASE_HOST_BASE };
 typedef struct {
   TfJson *fx;
   int lease_mode, once_done;
@@ -691,6 +701,7 @@ typedef struct {
   int named[16], n_named;              /* core.piece of each lease request, in order (-1: none) */
   int manifest_host, manifest_base;    /* the manifest read from the model host's URL / from the lease's base */
   int files_host, files_base;          /* the files read from the model host's URL / from the lease's base */
+  int files_at_lease;                  /* LEASE_HOST_BASE: the files asked for when the lease answer went out */
   const char *cfg;                     /* the fixture's config to answer ("config" when NULL) */
   char last_install_key[200];
   /* the error reports' tests (tf40_errors_tests.inc): a request whose URL holds fail_url is answered fail_status with
@@ -705,6 +716,11 @@ typedef struct {
   const char *fail_with;
   char err_bodies[8][2048];
   int n_err;
+  int err_host[8];                     /* the api host (index of k_api_hosts) each error report was sent to */
+  int api_asked[4];                    /* requests to each api host (4.0.1: a failover asks the next) */
+  char last_config[600], last_register[1200]; /* section 27: the last config request's path and query, register's body */
+  int configs;
+  int script_host[32];                 /* 4.0.1: the api host each scripted answer was given on (endpoints_40 attempts) */
   /* tf40_tests grace: one grace.json outcome's answers, given in order to the requests of their routes (token, attest,
    * challenge, model-key); a request of another route, or past the last, is answered as usual. retry_after: the
    * Retry-After of a scripted answer. */
@@ -717,6 +733,16 @@ typedef struct {
   const char *stall_url;
 } Fake;
 static Fake g_f;
+/* 4.0.1: the downloader's lanes ask for files from several threads at once, beside the lease on the caller's thread:
+ * the model host's counts are kept under this lock */
+static TfMutex g_f_lock;
+static int g_f_lock_ready;
+static int fake_files(void) {
+  tf_mutex_lock(&g_f_lock);
+  const int n = g_f.files;
+  tf_mutex_unlock(&g_f_lock);
+  return n;
+}
 static char *dupz(const char *s, size_t n) {
   char *p = (char *)malloc(n + 1);
   memcpy(p, s, n);
@@ -750,10 +776,25 @@ static int sig_ok(const char *spki_b64u, const char *sig_b64u, const char *text)
  * the request's whole time, then none), else a status with a body of its kind; a 2xx lease answer the Core accepts is
  * the install's next lease (lease_later), one it refuses has a changed byte (lease_bad); a stop the Core verifies is
  * the signed stop made at the moment the test replays the outcomes at (refusal_signed_grace) */
+/* 4.0.1 (ENDPOINTS_40.md 28.1): the stand-in answers the API on each of the api role's built-in hosts, in their order;
+ * any other host is a model host. A request's api host is counted (api_asked) and its path is what follows it. */
+static const char *const k_api_hosts[] = {"api.quranlab.ai", "api-b.tajweedformer.com", "api-g.tajweedformer.com", "api-a.tajweedformer.com"};
+#define N_API_HOSTS 4
+static int api_host_of(const char *url) {
+  const char *h = strncmp(url, "https://", 8) ? NULL : url + 8;
+  for (int i = 0; h && i < N_API_HOSTS; ++i) {
+    const size_t n = strlen(k_api_hosts[i]);
+    if (!strncmp(h, k_api_hosts[i], n) && h[n] == '/') return i;
+  }
+  return -1;
+}
+static const char *api_path(const char *url) {
+  const int i = api_host_of(url);
+  return i < 0 ? NULL : url + 8 + strlen(k_api_hosts[i]);
+}
 static const char *route_of(const TfHttpRequest *q, const TfJson *b) {
-  const char *api = "https://api.quranlab.ai";
-  if (strncmp(q->url, api, strlen(api))) return NULL;
-  const char *path = q->url + strlen(api);
+  const char *path = api_path(q->url);
+  if (!path) return NULL;
   if (!strcmp(path, "/v1/attest")) return tf_json_get(b, "install_key") ? "attest" : "token";
   if (!strcmp(path, "/v1/attest/challenge")) return "challenge";
   if (!strcmp(path, "/v1/model-key")) return "model-key";
@@ -795,7 +836,8 @@ static int scripted(const TfHttpRequest *q, TfHttpResponse *r, const TfJson *a) 
     }
   }
   answer(r, st, o.p ? o.p : "");
-  r->retry_after = g_f.retry_after;
+  /* an answer's own Retry-After (endpoints_40.json attempts), else the test's */
+  r->retry_after = tf_json_get(a, "retry_after") && tf_json_get(a, "retry_after")->type == TJ_NUM ? (int)N(a, "retry_after") : g_f.retry_after;
   tf_buf_free(&o);
   return 0;
 }
@@ -803,7 +845,8 @@ static int fake(const TfHttpRequest *q, TfHttpResponse *r, void *user) {
   (void)user;
   memset(r, 0, sizeof *r);
   const TfJson *fx = g_f.fx;
-  const char *api = "https://api.quranlab.ai";
+  const int host = api_host_of(q->url);
+  if (host >= 0) g_f.api_asked[host]++;
   TfJson *b = q->body ? tf_json_parse((const char *)q->body, q->body_n, NULL) : NULL;
   int rc = 0;
   if (g_f.stall_url && strstr(q->url, g_f.stall_url)) {
@@ -830,6 +873,7 @@ static int fake(const TfHttpRequest *q, TfHttpResponse *r, void *user) {
     const char *route = route_of(q, b);
     const TfJson *a = &g_f.script->kids[g_f.at];
     if (route && !strcmp(route, S(a, "route"))) {
+      if (g_f.at < 32) g_f.script_host[g_f.at] = host;
       g_f.at++;
       if (!strcmp(route, "challenge")) g_f.challenges++;
       if (!strcmp(route, "model-key")) g_f.leases++;
@@ -838,13 +882,16 @@ static int fake(const TfHttpRequest *q, TfHttpResponse *r, void *user) {
     }
   }
   if (strstr(q->url, "/v1/issues") && q->body && strstr((const char *)q->body, "\"kind\":\"error\"")) {
-    if (g_f.n_err < 8) snprintf(g_f.err_bodies[g_f.n_err++], sizeof g_f.err_bodies[0], "%.*s", (int)q->body_n, (const char *)q->body);
+    if (g_f.n_err < 8) {
+      g_f.err_host[g_f.n_err] = host;
+      snprintf(g_f.err_bodies[g_f.n_err++], sizeof g_f.err_bodies[0], "%.*s", (int)q->body_n, (const char *)q->body);
+    }
     answer(r, g_f.issues_status ? g_f.issues_status : 202, "{\"ok\":true}");
     tf_json_free(b);
     return 0;
   }
-  if (!strncmp(q->url, api, strlen(api))) {
-    const char *path = q->url + strlen(api);
+  if (host >= 0) {
+    const char *path = api_path(q->url);
     if (!strcmp(path, "/v1/attest")) {
       g_f.attests++;
       if (tf_json_get(b, "install_key")) {
@@ -872,6 +919,8 @@ static int fake(const TfHttpRequest *q, TfHttpResponse *r, void *user) {
         answer(r, 200, "{\"token\":\"qlt_v1.test\",\"expires_in\":3600,\"attested\":false}");
       }
     } else if (!strncmp(path, "/v1/config", 10)) {
+      g_f.configs++;
+      snprintf(g_f.last_config, sizeof g_f.last_config, "%s", path);
       char kb[64], ks[64];
       snprintf(kb, sizeof kb, "%s_body", g_f.cfg ? g_f.cfg : "config");
       snprintf(ks, sizeof ks, "%s_sig", g_f.cfg ? g_f.cfg : "config");
@@ -923,14 +972,22 @@ static int fake(const TfHttpRequest *q, TfHttpResponse *r, void *user) {
         /* the server's answer to a proof that does not match the digest of the piece it names (18.6.3, 18.6.7) */
         g_f.once_done = 1;
         answer(r, 403, "{\"error\":\"lease_integrity_failed\",\"message\":\"the Core could not be verified\",\"why\":\"core\"}");
-      } else if (g_f.lease_mode == LEASE_NO_BASE || g_f.lease_mode == LEASE_OFF_BASE) {
-        /* the lease with no model folder, or with one on a host that only looks like Quran Lab's */
+      } else if (g_f.lease_mode == LEASE_NO_BASE || g_f.lease_mode == LEASE_OFF_BASE || g_f.lease_mode == LEASE_HOST_BASE) {
+        /* the lease with no model folder, with one on a host that only looks like Quran Lab's, or (4.0.1, production's
+         * shape) the build's own folder on the model host; that answer waits until the files have come (2 s at most),
+         * so a downloader that fetches them only after the lease shows here */
+        if (g_f.lease_mode == LEASE_HOST_BASE) {
+          for (int i = 0; i < 200 && fake_files() < 8; ++i) tf__sleep_ms(10);
+          g_f.files_at_lease = fake_files();
+        }
         const TfJson *l = tf_json_get(fx, "lease");
         tf_buf_printf(&o, "{\"v\":1,\"lease\":\"%s\",\"iat\":%lld,\"exp\":%lld,\"refresh_after\":%lld,\"install_cert\":\"%s\"", S(l, "lease"),
                       (long long)tf_json_get(l, "iat")->num, (long long)tf_json_get(l, "exp")->num, (long long)tf_json_get(l, "refresh_after")->num,
                       S(l, "install_cert"));
         if (g_f.lease_mode == LEASE_OFF_BASE)
           tf_buf_printf(&o, ",\"base\":\"https://cdn.quranlab.ai.example.net/models/Quran-Lab/tajweedformer-v4/%s/sdk/v4.0/\"", S(fx, "build"));
+        if (g_f.lease_mode == LEASE_HOST_BASE)
+          tf_buf_printf(&o, ",\"base\":\"https://cdn.quranlab.ai/models/Quran-Lab/tajweedformer-v4/%s/sdk/v4.0/\"", S(fx, "build"));
         tf_buf_puts(&o, "}");
         answer(r, 200, o.p);
       } else if (g_f.lease_mode == LEASE_PIECE) {
@@ -951,6 +1008,7 @@ static int fake(const TfHttpRequest *q, TfHttpResponse *r, void *user) {
       }
       tf_buf_free(&o);
     } else {
+      if (!strcmp(path, "/v1/register")) snprintf(g_f.last_register, sizeof g_f.last_register, "%.*s", (int)q->body_n, (const char *)q->body);
       answer(r, 200, "{}"); /* register, telemetry, issues */
     }
   } else {
@@ -958,7 +1016,9 @@ static int fake(const TfHttpRequest *q, TfHttpResponse *r, void *user) {
     const char *rel = strstr(q->url, "/sdk/v4.0/");
     const char *lb = S(tf_json_get(fx, "lease"), "base");
     const int from_base = !strncmp(q->url, lb, strlen(lb));
+    tf_mutex_lock(&g_f_lock);
     g_f.no_token += !has_header(q, "authorization: Bearer ");
+    tf_mutex_unlock(&g_f_lock);
     if (!rel || !strstr(q->url, S(fx, "build"))) {
       answer(r, 404, "{}");
     } else {
@@ -968,8 +1028,10 @@ static int fake(const TfHttpRequest *q, TfHttpResponse *r, void *user) {
       if (!strcmp(rel, "manifest.json")) {
         data = dupz(S(fx, "manifest"), strlen(S(fx, "manifest")));
         n = strlen(data);
+        tf_mutex_lock(&g_f_lock);
         if (from_base) g_f.manifest_base++;
         else g_f.manifest_host++;
+        tf_mutex_unlock(&g_f_lock);
       } else if (tf_json_get(fx, "cdn_dir")) {
         char *p = tf_path_join(S(fx, "cdn_dir"), rel);
         if (!p || tf_read_file(p, &data, &n)) data = NULL;
@@ -987,9 +1049,11 @@ static int fake(const TfHttpRequest *q, TfHttpResponse *r, void *user) {
         r->body_n = n;
         data = NULL;
       } else {
+        tf_mutex_lock(&g_f_lock);
         g_f.files++;
         if (from_base) g_f.files_base++;
         else g_f.files_host++;
+        tf_mutex_unlock(&g_f_lock);
         const long long from = q->range_from > 0 ? q->range_from : 0;
         if (g_f.corrupt && n > 0) data[n - 1] ^= 1; /* not the file the manifest names */
         FILE *f = fopen(q->download_file, from > 0 ? "ab" : "wb");
@@ -1022,6 +1086,10 @@ static TfClient *flow_client(const char *work) {
   return flow_client_in(work);
 }
 static void fake_reset(int mode) {
+  if (!g_f_lock_ready) {
+    tf_mutex_init(&g_f_lock);
+    g_f_lock_ready = 1;
+  }
   TfJson *fx = g_f.fx;
   memset(&g_f, 0, sizeof g_f);
   g_f.fx = fx;
@@ -1038,6 +1106,10 @@ static TfJson *flow_setup(const char *fixture) {
   tf__ikey_test_pkcs8_n = pk8n;
   tf__client_no_timer = 1;
   tf__plat_test_no_counter = 1;
+  if (!g_f_lock_ready) {
+    tf_mutex_init(&g_f_lock);
+    g_f_lock_ready = 1;
+  }
   tf_http_set_transport(fake, NULL);
   g_f.fx = fx;
   return fx;
@@ -1060,9 +1132,12 @@ static int t_flow(const char *fixture, const char *work) {
   CHECK(g_f.challenges == 1 && g_f.leases == 1 && !g_f.bad_lease && !g_f.bad_lease_sig, "flow: one challenge, one lease request of 18.4.4's shape (bad %d, sig %d)",
         g_f.bad_lease, g_f.bad_lease_sig);
   CHECK(!g_f.no_token, "flow: the app token on the challenge, the lease and every model request");
-  CHECK(g_f.manifest_host == 1 && !g_f.manifest_base && g_f.files_base == g_f.files && g_f.files > 0 && !g_f.files_host,
-        "flow: the manifest from the model host, every file from the lease answer's base (host %d, base %d of %d)", g_f.files_host, g_f.files_base,
-        g_f.files);
+  /* 4.0.1: the files are fetched from the build's folder on the model host while the lease is asked; this fixture's
+   * lease answer names another folder, so what came from the host is dropped and every file comes from that folder
+   * (production names the host's folder: the LEASE_HOST_BASE run below) */
+  CHECK(g_f.manifest_host == 1 && !g_f.manifest_base && g_f.files_base == 8 && g_f.files == g_f.files_base + g_f.files_host,
+        "flow: the manifest from the model host, the eight files from the lease answer's base (host %d first, base %d of %d)", g_f.files_host,
+        g_f.files_base, g_f.files);
   CHECK(g_f.n_named == 1 && g_f.named[0] == 0, "flow: the first lease request names no data piece (core.piece 0)");
   {
     char *lj = NULL;
@@ -1090,6 +1165,12 @@ static int t_flow(const char *fixture, const char *work) {
   }
   CHECK(devs >= 6 && cdns == 0, "flow: %d device forms installed, %d CDN forms left", devs, cdns);
   {
+    /* nothing of what came from the host stays: no partial file beside a CDN form */
+    char p[1400];
+    snprintf(p, sizeof p, "%s/cdn/layers.zfw.qle.part", models);
+    CHECK(!tf_file_exists(p), "flow: no partial file of the host's fetch left");
+  }
+  {
     uint8_t *mk = NULL;
     const size_t mkn = unhex(S(fx, "plain_marker"), &mk);
     CHECK(mkn == 32 && !tree_holds(w, mk, mkn, 0), "flow: no plaintext of a model file in the SDK's folder");
@@ -1105,7 +1186,7 @@ static int t_flow(const char *fixture, const char *work) {
   CHECK(pj && strstr(pj, "\"lease\":\"valid\"") && strstr(pj, "\"keyStore\":\"file\""), "flow: the diagnosis names the lease and the key store: %s",
         pj ? pj : "(none)");
   /* DIAGNOSIS_40 (section 25): the class from flags bit 3, the refresh time, no grace end outside the grace */
-  CHECK(pj && (strstr(pj, "\"leaseClass\":\"7d\"") || strstr(pj, "\"leaseClass\":\"24h\"")) && strstr(pj, "\"refreshAfter\":") &&
+  CHECK(pj && (strstr(pj, "\"leaseClass\":\"attested\"") || strstr(pj, "\"leaseClass\":\"standard\"")) && strstr(pj, "\"refreshAfter\":") &&
           !strstr(pj, "\"refreshAfter\":null") && strstr(pj, "\"graceUntil\":null"),
         "flow: the diagnosis names the lease's class and refresh time, and no grace: %s", pj ? pj : "(none)");
   tf_json_free((TfJson *)mf);
@@ -1173,16 +1254,52 @@ static int t_flow(const char *fixture, const char *work) {
   CHECK(!m && tf_last_error_code() == TF_ERR_MODEL_UNAVAILABLE, "flow: the route off is model_unavailable (%s)", tf_error_name(tf_last_error_code()));
   if (c) tf_client_destroy(c);
 
-  /* a lease answer without a model folder, and one whose folder is off Quran Lab's hosts: the lease is taken, no
-   * file is downloaded from anywhere (never the default host's URLs), and the install fails as an invalid response */
+  /* 4.0.1, production's shape: the lease answer names the build's folder on the model host. The files come from it
+   * while the lease is asked (the stand-in's lease answer waits for them), each once, and are installed after it */
+  {
+    fake_reset(LEASE_HOST_BASE);
+    snprintf(w, sizeof w, "%s/hostbase", work);
+    c = flow_client(w);
+    m = c ? tf_client_model(c, NULL) : NULL;
+    CHECK(!m && tf_last_error_code() == TF_ERR_MODEL_INCOMPATIBLE, "flow, host folder: the vector build opens as far as its vocabulary (%s: %s)",
+          tf_error_name(tf_last_error_code()), tf_last_error());
+    CHECK(g_f.leases == 1 && g_f.files == 8 && g_f.files_host == 8 && g_f.files_at_lease == 8,
+          "flow, host folder: the eight files once each, all asked before the lease answer came (%d, %d at the lease)", g_f.files, g_f.files_at_lease);
+    char md[1200], p[1400];
+    snprintf(md, sizeof md, "%s/models/%s", w, S(fx, "build"));
+    snprintf(p, sizeof p, "%s/dev/layers.zfw.qld", md);
+    const int dev = tf_file_exists(p);
+    snprintf(p, sizeof p, "%s/cdn/layers.zfw.qle", md);
+    CHECK(dev && !tf_file_exists(p), "flow, host folder: installed by the Core after the lease, no CDN form left");
+    if (c) tf_client_destroy(c);
+  }
+
+  /* a lease answer without a model folder, and one whose folder is off Quran Lab's hosts: the lease is taken, no file
+   * is installed and none is kept (4.0.1: what came from the host's folder while the lease was asked is removed; never
+   * a file from the answer's other host), and the call fails as an invalid response */
   for (int mode = LEASE_NO_BASE; mode <= LEASE_OFF_BASE; ++mode) {
     fake_reset(mode);
     snprintf(w, sizeof w, "%s/%s", work, mode == LEASE_NO_BASE ? "nobase" : "offbase");
     c = flow_client(w);
     m = c ? tf_client_model(c, NULL) : NULL;
-    CHECK(!m && tf_last_error_code() == TF_ERR_SERVER_REJECTED && strstr(tf_last_error(), "invalid_response") && g_f.leases == 1 && !g_f.files,
-          "flow: a lease answer %s downloads nothing (%s: %s; leases %d, files %d)", mode == LEASE_NO_BASE ? "without a base" : "with a base off quranlab.ai",
-          tf_error_name(tf_last_error_code()), tf_last_error(), g_f.leases, g_f.files);
+    /* 4.0.1 (28.4): a base off the allow-list is no lease answer (unreachable on that host, so the same request goes to
+     * each api host in turn: download_failed when no host gives one); an answer without a base is accepted on the first
+     * host. Either way nothing is installed or kept: the files fetched beside the lease are removed */
+    const int want_code = mode == LEASE_NO_BASE ? TF_ERR_SERVER_REJECTED : TF_ERR_DOWNLOAD_FAILED;
+    const int want_leases = mode == LEASE_NO_BASE ? 1 : N_API_HOSTS;
+    char md[1200], p[1400];
+    snprintf(md, sizeof md, "%s/models/%s", w, S(fx, "build"));
+    int kept = 0;
+    static const char *const left[] = {"cdn/layers.zfw.qle", "cdn/layers.zfw.qle.part", "cdn/tokens.txt.qle", "dev/layers.zfw.qld", "calibration.json"};
+    for (size_t k = 0; k < sizeof left / sizeof left[0]; ++k) {
+      snprintf(p, sizeof p, "%s/%s", md, left[k]);
+      kept += tf_file_exists(p);
+    }
+    CHECK(!m && tf_last_error_code() == want_code && strstr(tf_last_error(), "invalid_response") && g_f.leases == want_leases && !g_f.files_base &&
+              !kept,
+          "flow: a lease answer %s installs and keeps nothing (%s: %s; leases %d, from its folder %d, %d files kept)",
+          mode == LEASE_NO_BASE ? "without a base" : "with a base off quranlab.ai", tf_error_name(tf_last_error_code()), tf_last_error(), g_f.leases,
+          g_f.files_base, kept);
     if (c) tf_client_destroy(c);
   }
 
@@ -1341,8 +1458,10 @@ static int t_lease_clock(const char *fixture, const char *work) {
   tf__plat_test_boot_ms = b0 + (exp - iat + 10800) * 1000;
   c = flow_client_in(w);
   rc = c ? tf__pm_lease(c, tf__pm(c), mt, strlen(mt), mj, build) : -1;
-  CHECK(rc == 0 && g_f.leases == 1 && tf__pm_grace(tf__pm(c), NULL),
-        "lease_clock 3: the server's clock 3 h behind the device's: its lease answered 200 and refused as expired, the open in the grace (%s, leases %d)",
+  /* 4.0.1 (ENDPOINTS_40.md 28.5): a lease the Core refuses is that host unreachable, so the same request goes to each
+   * api host in turn; every one gives the same expired lease, the attempt ends unreachable, and the open is in the grace */
+  CHECK(rc == 0 && g_f.leases == N_API_HOSTS && tf__pm_grace(tf__pm(c), NULL),
+        "lease_clock 3: the server's clock 3 h behind the device's: its lease answered 200 and refused as expired on every api host, the open in the grace (%s, leases %d)",
         rc ? tf_error_name(rc) : "ok", g_f.leases);
   tf__pm_status(c ? tf__pm(c) : NULL, &ls);
   CHECK(!ls.valid && ls.now == exp + 10800 && ls.exp == exp, "lease_clock 3: nothing moved (now - exp %lld, the lease held is lease 1's)",
@@ -3099,6 +3218,9 @@ static int t_conformance(const char *fixture, const char *list, const char *outp
 
 #include "tf40_eval_tests.inc"
 #include "tf40_errors_tests.inc"
+#include "tf40_endpoints_tests.inc"
+#include "tf40_lanes_tests.inc"
+#include "tf40_qos_tests.inc"
 
 int main(int argc, char **argv) {
   if (argc < 4 && !(argc >= 3 && !strcmp(argv[1], "json_leak"))) {
@@ -3129,7 +3251,12 @@ int main(int argc, char **argv) {
   if (!strcmp(t, "eval_units")) return t_eval_units(argv[2], argv[3]);
   if (!strcmp(t, "eval") && argc >= 5) return t_eval(argv[2], argv[3], argv[4]);
   if (!strcmp(t, "errors")) return t_errors(argv[2], argv[3]);
-  if (!strcmp(t, "errors_flow")) return t_errors_flow(argv[2], argv[3]);
+  if (!strcmp(t, "errors_flow")) return t_errors_flow(argv[2], argv[3], argc >= 5 ? argv[4] : NULL);
+  if (!strcmp(t, "app27")) return t_app27(argv[2], argv[3]);
+  if (!strcmp(t, "endpoints") && argc >= 5) return t_endpoints(argv[2], argv[3], argv[4]);
+  if (!strcmp(t, "loopback")) return t_loopback(argv[2], argv[3]);
+  if (!strcmp(t, "lanes")) return t_lanes(argv[2], argv[3]);
+  if (!strcmp(t, "qos")) return t_qos();
   fprintf(stderr, "unknown test %s\n", t);
   return 2;
 }

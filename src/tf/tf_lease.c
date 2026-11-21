@@ -81,20 +81,12 @@ double tf__lease_wait_s = 10, tf__lease_reuse_s = 60;
 
 static long long now_s(void) { return tf__now_override ? tf__now_override : (long long)time(NULL); }
 
-/* A model folder named by a lease answer is used only on Quran Lab's own hosts, over https (as the Apple SDK):
- * https://quranlab.ai/ or https://<name>.quranlab.ai/, a path that ends in '/', no port, user, query or "..". */
-static int base_ok(const char *b) {
-  const size_t n = b ? strlen(b) : 0;
-  if (n < 9 || n >= 512 || strncmp(b, "https://", 8) || b[n - 1] != '/' || strstr(b, "..") || strpbrk(b, "?#@\\ ")) return 0;
-  const char *h = b + 8, *e = strchr(h, '/');
-  char host[256];
-  const size_t hn = (size_t)(e - h);
-  if (!hn || hn >= sizeof host) return 0;
-  for (size_t i = 0; i < hn; ++i) host[i] = (char)(h[i] >= 'A' && h[i] <= 'Z' ? h[i] + 32 : h[i]);
-  host[hn] = 0;
-  if (strchr(host, ':')) return 0;
-  return !strcmp(host, "quranlab.ai") || (hn > 12 && !strcmp(host + hn - 12, ".quranlab.ai"));
-}
+/* A model folder named by a lease answer is used only on Quran Lab's own hosts, over https (as the Apple SDK): from
+ * 4.0.1 a host of the allow-list of ENDPOINTS_40.md 28.1 (quranlab.ai, tajweedformer.com, quran-lab.com; 4.0.0 took
+ * *.quranlab.ai only), a path that starts and ends with '/', printable ASCII, at most 511 characters, no port, user,
+ * query, fragment, backslash, space or ".." (28.4). Its path is the folder every model request of the build asks the
+ * models hosts for. */
+static int base_ok(const char *b) { return tf__ep_base_parts(b, NULL, NULL, 0) || (b && strlen(b) < 512 && tf__lease_test_base && !strncmp(b, tf__lease_test_base, strlen(tf__lease_test_base))); }
 
 /* lease.json: {"build":"<40 hex>","base":"<the answer's base>"}, the lease the Core holds. Data only: the Core checks
  * its own lease's build at install and open, so a changed record can only cost a refused install or a new lease. */
@@ -154,6 +146,8 @@ int tf__pm_lease_expired(int status, int detail) { return status == QLC_E_NEEDS_
 /* 24.3: a Core status as the cause of the error it maps to (error_name the status's name, error_code its detail, else
  * its number). The stage is where the Core was asked: installing a container (download), else what the status says. */
 static _Thread_local const char *t_core_stage;
+/* ERRORS_40.md 24.3 (Gate C, contract 7f097b9): set while a failed qlc_model_open is mapped (tf__pm_open) */
+static _Thread_local int t_core_open;
 static int pm_error_code(int status, int detail);
 static const char *core_name(int status) {
   static const char *const n[] = {"QLC_OK", "QLC_E_ARG", "QLC_E_NOMEM", "QLC_E_STORAGE", "QLC_E_MANIFEST", "QLC_E_NEEDS_CONNECTION",
@@ -176,6 +170,16 @@ static int core_cause(int rc, int status, int detail) {
   if (t_core_stage && status == QLC_E_FILE) stage = t_core_stage;
   char code[16];
   snprintf(code, sizeof code, "%d", detail ? detail : status);
+  /* 24.3 (4.0.1, Gate C): when qlc_model_open fails with a status this SDK answers engine_failed for, error_code is the
+   * status's name without QLC_E_, in lower case: QLC_E_NOMEM is reason memory, nomem; QLC_E_ENGINE is reason engine,
+   * engine (errors_40.json core_open). C answers QLC_E_BUSY with session_open, never reported, and QLC_E_ARG with
+   * model_invalid, so only these two carry it. Elsewhere (an install, a lease) error_code stays the detail or number. */
+  if (t_core_open && (status == QLC_E_NOMEM || status == QLC_E_ENGINE)) {
+    const char *n = core_name(status) + 6; /* past "QLC_E_" */
+    size_t i = 0;
+    for (; n[i] && i + 1 < sizeof code; ++i) code[i] = (char)(n[i] >= 'A' && n[i] <= 'Z' ? n[i] + 32 : n[i]);
+    code[i] = 0;
+  }
   tf__cause_now(rc, stage, reason, 0, core_name(status), code);
   return rc;
 }
@@ -327,6 +331,7 @@ static int off_cause(int rc, const char *stage, int status, const char *code) {
   return rc;
 }
 
+static int attest_taken(void *user, const TfHttpResponse *r);
 /* An attest with the install's keys: a new agreement key, its certificate, and the Client's token. Needs no Core
  * model open (the Core is made again for the new key). 0, or an error (the old key and certificate stay). */
 int tf__pm_attest(TfClient *c, TfPm *p) {
@@ -357,7 +362,7 @@ int tf__pm_attest(TfClient *c, TfPm *p) {
   tf_mutex_unlock(&p->lock);
   TfHttpResponse r;
   memset(&r, 0, sizeof r);
-  if (!rc) rc = tf__client_call(c, "POST", "/v1/attest", b.p, 0, NULL, &r);
+  if (!rc) rc = tf__client_call_taken(c, "POST", "/v1/attest", b.p, 0, attest_taken, NULL, &r);
   tf_buf_free(&b);
   TfJson *j = !rc && r.status == 200 ? tf_json_parse(r.body, r.body_n, NULL) : NULL;
   const char *cert = tf_json_str(tf_json_get(j, "install_cert")), *token = tf_json_str(tf_json_get(j, "token"));
@@ -434,6 +439,85 @@ static _Thread_local int t_cause;
 static _Thread_local int t_stopped;
 /* the Retry-After of the answer that ended the attempt (the lease route's 503 lease_unavailable: 30), 0 for none */
 static _Thread_local int t_retry_after;
+/* 28.3, 28.5: the answers of the lease's routes that are taken on a host; any other 2xx is that host unreachable and
+ * the next api host is asked (a challenge from one host is good with a lease request that another host answers) */
+static int challenge_taken(void *user, const TfHttpResponse *r) {
+  (void)user;
+  TfJson *j = r->status == 200 ? tf_json_parse(r->body, r->body_n, NULL) : NULL;
+  const char *ch = tf_json_str(tf_json_get(j, "challenge"));
+  const int ok = ch && *ch && strlen(ch) < 80;
+  tf_json_free(j);
+  return ok;
+}
+static int attest_taken(void *user, const TfHttpResponse *r) {
+  (void)user;
+  TfJson *j = r->status == 200 ? tf_json_parse(r->body, r->body_n, NULL) : NULL;
+  const int ok = tf_json_str(tf_json_get(j, "install_cert")) && tf_json_str(tf_json_get(j, "token"));
+  tf_json_free(j);
+  return ok;
+}
+/* A lease answer (18.4.5) on one host: taken only when its base is a folder of 28.4 (or absent) and the Core accepts
+ * its lease, which it does here, at once, with the piece after it (the file's comment). A 200 that is not that is the
+ * host unreachable (28.3, 18.4.7.1's table); the first such answer is remembered, so the request that every host left
+ * unreachable fails as its first host's answer did. */
+typedef struct {
+  TfClient *c;
+  TfPm *p;
+  const char *manifest, *build;
+  size_t mn;
+  int accepted; /* the Core accepted a lease */
+  int bad;      /* the first 200 that was not taken: 1 no lease, 2 a base off the allow-list, 3 a lease the Core refused */
+  int a, d;     /* the Core's status and detail for 3 */
+} LeaseTake;
+static int lease_taken(void *user, const TfHttpResponse *r) {
+  LeaseTake *t = (LeaseTake *)user;
+  if (r->status != 200) return 0;
+  TfJson *j = tf_json_parse(r->body, r->body_n, NULL);
+  const char *lease64 = tf_json_str(tf_json_get(j, "lease")), *base = tf_json_str(tf_json_get(j, "base"));
+  const char *cert = tf_json_str(tf_json_get(j, "install_cert")), *piece64 = tf_json_str(tf_json_get(j, "piece"));
+  uint8_t lease[4096], piece[4096];
+  const int ln = lease64 && strlen(lease64) < 5400 ? tf_base64_decode(lease64, lease, sizeof lease) : -1;
+  int ok = 0, why = 0, a = 0, d = 0;
+  if (ln <= 0) {
+    why = 1;
+  } else if (base && !base_ok(base) && !tf__lease_test_base) {
+    why = 2; /* 28.4: a base off the allow-list is not a lease answer (4.0.0 took the lease and dropped the base) */
+  } else {
+    TfPm *p = t->p;
+    tf_mutex_lock(&p->lock);
+    int64_t exp = 0, ra = 0;
+    a = qlc_lease_accept(p->core, lease, (size_t)ln, t->manifest, t->mn, t->build, &exp, &ra);
+    d = qlc_detail(p->core);
+    if (a == QLC_OK) {
+      /* the data piece after the accept (the file's comment): the lease was granted under the piece in force, which
+       * the accept made the last good one; this one is in force from the next ask. A piece that does not verify
+       * changes nothing. */
+      if (piece64 && strlen(piece64) < 5400) {
+        const int pn = tf_base64_decode(piece64, piece, sizeof piece);
+        if (pn > 0) qlc_lease_piece(p->core, piece, (size_t)pn);
+      }
+      snprintf(p->build, sizeof p->build, "%s", t->build);
+      p->base[0] = 0;
+      if (base && strlen(base) < sizeof p->base) snprintf(p->base, sizeof p->base, "%s", base);
+      rec_save(p);
+      if (cert) tf__ikey_set_cert(p->ik, cert);
+      p->fails = 0;
+      p->next_try = 0;
+      ok = t->accepted = 1;
+    } else {
+      why = 3;
+    }
+    tf_mutex_unlock(&p->lock);
+  }
+  memset(lease, 0, sizeof lease);
+  tf_json_free(j);
+  if (!ok && !t->bad) {
+    t->bad = why;
+    t->a = a;
+    t->d = d;
+  }
+  return ok;
+}
 /* one lease request; 0 with the lease accepted, 1 to repeat once (a new challenge or certificate), or an error */
 static int lease_once(TfClient *c, TfPm *p, const char *manifest, size_t mn, const TfJson *m, const char *build, int *renewed) {
   t_cause = 1;
@@ -444,8 +528,12 @@ static int lease_once(TfClient *c, TfPm *p, const char *manifest, size_t mn, con
   /* the challenge, with the app token (18.4.1 step 3) */
   TfHttpResponse r;
   memset(&r, 0, sizeof r);
-  int rc = tf__client_call(c, "GET", "/v1/attest/challenge", NULL, 1, NULL, &r);
-  if (rc) return rc;
+  int rc = tf__client_call_taken(c, "GET", "/v1/attest/challenge", NULL, 1, challenge_taken, NULL, &r);
+  if (rc) {
+    t_retry_after = r.retry_after; /* 28.5: every host unreachable: the largest Retry-After any host gave */
+    tf_http_response_free(&r);
+    return rc;
+  }
   TfJson *j = r.status == 200 ? tf_json_parse(r.body, r.body_n, NULL) : NULL;
   char challenge[80] = "";
   const char *ch = tf_json_str(tf_json_get(j, "challenge"));
@@ -495,9 +583,20 @@ static int lease_once(TfClient *c, TfPm *p, const char *manifest, size_t mn, con
   tf_buf_json_str(&b, key_id);
   tf_buf_printf(&b, ",\"core\":%s}", core_json);
   memset(&r, 0, sizeof r);
-  rc = b.p ? tf__client_call_lease(c, b.p, &r) : tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
+  LeaseTake lt;
+  memset(&lt, 0, sizeof lt);
+  lt.c = c;
+  lt.p = p;
+  lt.manifest = manifest;
+  lt.mn = mn;
+  lt.build = build;
+  rc = b.p ? tf__client_call_lease(c, b.p, lease_taken, &lt, &r) : tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
   tf_buf_free(&b);
-  if (rc) return rc;
+  if (rc) {
+    t_retry_after = r.retry_after;
+    tf_http_response_free(&r);
+    return rc;
+  }
   if (r.status != 200) {
     char code[48], why[48], check[48];
     http_code(&r, code, why, check);
@@ -557,43 +656,20 @@ static int lease_once(TfClient *c, TfPm *p, const char *manifest, size_t mn, con
     tf_http_response_free(&r);
     return rc;
   }
-  j = tf_json_parse(r.body, r.body_n, NULL);
-  const char *lease64 = tf_json_str(tf_json_get(j, "lease")), *base = tf_json_str(tf_json_get(j, "base"));
-  const char *cert = tf_json_str(tf_json_get(j, "install_cert")), *piece64 = tf_json_str(tf_json_get(j, "piece"));
-  uint8_t lease[4096], piece[4096];
-  const int ln = lease64 && strlen(lease64) < 5400 ? tf_base64_decode(lease64, lease, sizeof lease) : -1;
-  if (ln <= 0) {
-    tf__cause("lease", "invalid_answer", 200, NULL, NULL); /* a 200 that is not what was asked for */
-    rc = tf__fail(TF__ERR_HTTP, "lease: no lease in the answer");
-  } else {
-    tf_mutex_lock(&p->lock);
-    int64_t exp = 0, ra = 0;
-    const int a = qlc_lease_accept(p->core, lease, (size_t)ln, manifest, mn, build, &exp, &ra);
-    const int d = qlc_detail(p->core);
-    if (a == QLC_OK) {
-      /* the data piece after the accept (the file's comment): the lease was granted under the piece in force, which
-       * the accept made the last good one; this one is in force from the next ask. A piece that does not verify
-       * changes nothing. */
-      if (piece64 && strlen(piece64) < 5400) {
-        const int pn = tf_base64_decode(piece64, piece, sizeof piece);
-        if (pn > 0) qlc_lease_piece(p->core, piece, (size_t)pn);
-      }
-      snprintf(p->build, sizeof p->build, "%s", build);
-      p->base[0] = 0;
-      if (base && (base_ok(base) || tf__lease_test_base) && strlen(base) < sizeof p->base) snprintf(p->base, sizeof p->base, "%s", base);
-      rec_save(p);
-      if (cert) tf__ikey_set_cert(p->ik, cert);
-      p->fails = 0;
-      p->next_try = 0;
-    }
-    tf_mutex_unlock(&p->lock);
-    if (a != QLC_OK) {
-      t_cause = tf__pm_lease_expired(a, d) ? 3 : 6;
-      rc = tf__pm_error(a, d);
+  /* a 200: the Core accepted its lease on the host that gave it (lease_taken), or every host was unreachable and this
+   * is the first host's answer, which fails as it did there */
+  if (!lt.accepted) {
+    if (lt.bad == 3) {
+      t_cause = tf__pm_lease_expired(lt.a, lt.d) ? 3 : 6;
+      rc = tf__pm_error(lt.a, lt.d);
+    } else if (lt.bad == 2) {
+      tf__cause("lease", "invalid_answer", 200, NULL, "invalid_response");
+      rc = tf__fail(TF__ERR_HTTP, "invalid_response: the lease answer names a model folder that is not on Quran Lab's hosts; nothing was downloaded");
+    } else {
+      tf__cause("lease", "invalid_answer", 200, NULL, NULL); /* a 200 that is not what was asked for */
+      rc = tf__fail(TF__ERR_HTTP, "lease: no lease in the answer");
     }
   }
-  memset(lease, 0, sizeof lease);
-  tf_json_free(j);
   tf_http_response_free(&r);
   return rc;
 }
@@ -847,15 +923,21 @@ qlc_model *tf__pm_open(TfPm *p, const char *build_dir, const char *manifest, siz
   int st = 0;
   tf_mutex_lock(&p->lock);
   tf__plat_set_build(p->plat, build_dir);
-  qlc_model *m = qlc_model_open(p->core, manifest, mn, &o, &st);
-  const int d = qlc_detail(p->core);
+  qlc_model *m = tf__pm_open_fail_status ? NULL : qlc_model_open(p->core, manifest, mn, &o, &st);
+  const int d = tf__pm_open_fail_status ? 0 : qlc_detail(p->core);
+  if (tf__pm_open_fail_status) st = tf__pm_open_fail_status;
   if (m) {
     p->open_models++;
     p->refs++;
   }
   tf_mutex_unlock(&p->lock);
-  if (!m) tf__pm_error(st, d);
-  else if (tf__pm_grace(p, NULL)) grace_report(p); /* 24.1 item 2: each open in grace (18.4.7.1) */
+  if (!m) {
+    t_core_open = 1; /* 24.3: the open's status names the report's error_code */
+    tf__pm_error(st, d);
+    t_core_open = 0;
+  } else if (tf__pm_grace(p, NULL)) {
+    grace_report(p); /* 24.1 item 2: each open in grace (18.4.7.1) */
+  }
   return m;
 }
 
@@ -882,3 +964,4 @@ void tf__pm_lock(TfPm *p) { tf_mutex_lock(&p->lock); }
 void tf__pm_unlock(TfPm *p) { tf_mutex_unlock(&p->lock); }
 
 const char *tf__lease_test_base; /* tests: a stand-in server's base (http://127.0.0.1) is taken */
+int tf__pm_open_fail_status;     /* tests: qlc_model_open is not called and fails with this status (0: never) */

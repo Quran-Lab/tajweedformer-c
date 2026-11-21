@@ -1,6 +1,6 @@
 /* Error reports, included by tf40_tests.c.
  *
- *   tf40_tests errors      <test/data/sdk_4.0.0> <work>   vectors/errors_40.json (a copy of the contract's at 1c971ab):
+ *   tf40_tests errors      <test/data/sdk_4.0.0> <work>   vectors/errors_40.json (a copy of the contract's at 564c144):
  *                                           every `codes` case through tf__rep_code_for and tf__rep_reported, every
  *                                           `queue` sequence through the queue machine (each occurrence's made, each
  *                                           send point's requests and their fields), every `telemetry` reason, every
@@ -146,9 +146,9 @@ static int t_errors(const char *dir, const char *work) {
   /* 24.2: what is not a token, or not of its closed set, is left out, never cut into one */
   if (r) {
     memset(r, 0, sizeof *r);
-    TfRepOcc o = {"download", "http", "download_failed", 503, 1, 5, "WinHTTP", "12002", "8_16", "lt_5g", "4.1.0", "04c57bbbc6b225dfe6db7aa4a9afa1afd7ac51b3"};
+    TfRepOcc o = {"download", "http", "download_failed", 503, 1, 5, "WinHTTP", "12002", "8_16", "lt_5g", "4.1.0", "04c57bbbc6b225dfe6db7aa4a9afa1afd7ac51b3", NULL, 0};
     tf__rep_occur(r, "2026-11-18", &o);
-    TfRepOcc bad = {"runtime", "memory", "engine_failed", 0, 0, -1, "could not allocate", "/data/x", "3g", "2g", "x", "abc"};
+    TfRepOcc bad = {"runtime", "memory", "engine_failed", 0, 0, -1, "could not allocate", "/data/x", "3g", "2g", "x", "abc", NULL, 0};
     tf__rep_occur(r, "2026-11-18", &bad);
     CHECK(r->nq == 2 && !r->q[1].name[0] && !r->q[1].ecode[0] && !r->q[1].ram[0] && !r->q[1].free_[0] && !r->q[1].revision[0] && !r->q[1].build[0],
           "a name, code, tier, bucket, version or build that is not a token or of its set is left out");
@@ -207,8 +207,9 @@ static TfJson *took(const char *stage, const char *reason, const char *code) {
     if (getenv("TF_ERRORS_PRINT")) fprintf(stderr, "report: %s\n", g_f.err_bodies[i]); /* to read what is sent */
     TfJson *b = tf_json_parse(g_f.err_bodies[i], strlen(g_f.err_bodies[i]), NULL);
     static const char *const top[] = {"day", "platform", "sdk_version", "app_version", "os_version", "device_class", "revision", "kind", "code", "error", "backend"};
+    /* 4.0.1 (ENDPOINTS_40.md 28.7): host_role and fallback on a report whose cause is a request to Quran Lab's hosts */
     static const char *const err[] = {"stage", "reason", "http_status", "error_name", "error_code", "count", "retries", "first_launch", "first_report",
-                                      "build", "device_model", "ram_tier", "storage_free", "abi"};
+                                      "build", "device_model", "ram_tier", "storage_free", "abi", "host_role", "fallback"};
     int closed = b && b->type == TJ_OBJ;
     for (int k = 0; closed && k < b->n; ++k) {
       int in = 0;
@@ -230,6 +231,20 @@ static TfJson *took(const char *stage, const char *reason, const char *code) {
   return NULL;
 }
 
+/* 28.7: a report's host_role and fallback (role NULL: neither is there) */
+static int role_is(const TfJson *b, const char *role, int fallback) {
+  const TfJson *e = tf_json_get(b, "error"), *fb = tf_json_get(e, "fallback");
+  const char *r = jstr0(e, "host_role");
+  if (!role) return !r && !fb;
+  return r && !strcmp(r, role) && fb && fb->type == TJ_BOOL && fb->boolean == fallback;
+}
+/* the report's role and fallback checked, then freed */
+static void role_free(TfJson *b, const char *label, const char *role, int fallback) {
+  const TfJson *e = tf_json_get(b, "error");
+  CHECK(b && role_is(b, role, fallback), "%s: host_role %s, fallback %s (sent %s, %s)", label, role ? role : "none", fallback ? "true" : "false",
+        jstr0(e, "host_role") ? jstr0(e, "host_role") : "none", tf_json_get(e, "fallback") ? (jbool(e, "fallback") ? "true" : "false") : "none");
+  tf_json_free(b);
+}
 /* One failure of a model call against the stand-in: the code the app gets and the report sent at the Client's end */
 static TfJson *model_fails(const char *work, const char *label, int want, const char *stage, const char *reason, int status) {
   char w[1100];
@@ -275,7 +290,7 @@ static void integrity_case(const char *work, const char *label, const char *url,
         "%s: the report %s/integrity_failed/server_rejected/403 with error_code %s (%s)", label, stage, want_ec, jstr0(e, "error_code") ? jstr0(e, "error_code") : "none");
   tf_json_free(b);
 }
-static int t_errors_flow(const char *fixture, const char *work) {
+static int t_errors_flow(const char *fixture, const char *work, const char *errvec) {
   TfJson *fx = flow_setup(fixture);
   if (!fx) return 2;
   tf__download_pause_ms = 1;
@@ -283,7 +298,9 @@ static int t_errors_flow(const char *fixture, const char *work) {
   /* config: a 5xx with no config on the device is download_failed (24.4), its cause the config's answer */
   fake_reset(LEASE_OK);
   g_f.fail_url = "/v1/config", g_f.fail_status = 503;
-  tf_json_free(model_fails(work, "config503", TF_ERR_DOWNLOAD_FAILED, "config", "http", 503));
+  role_free(model_fails(work, "config503", TF_ERR_DOWNLOAD_FAILED, "config", "http", 503), "config503", "api", 1);
+  CHECK(g_f.api_asked[0] >= 1 && g_f.api_asked[1] >= 1 && g_f.api_asked[2] >= 1 && g_f.api_asked[3] >= 1,
+        "config503: the 503 is unreachable, so every api host was asked (%d %d %d %d)", g_f.api_asked[0], g_f.api_asked[1], g_f.api_asked[2], g_f.api_asked[3]);
   /* no answer at all and nothing on the device: needs_connection, reported (it reached the app) */
   fake_reset(LEASE_OK);
   g_f.fail_url = "/v1/config", g_f.fail_status = 0;
@@ -313,7 +330,7 @@ static int t_errors_flow(const char *fixture, const char *work) {
     CHECK(g_f.n_err == 0, "leasestop: the stop ends this launch's calls, so the report waits for the next launch (24.6)");
   }
   fake_reset(LEASE_UNSIGNED_STOP);
-  tf_json_free(model_fails(work, "leaseunsigned", TF_ERR_SERVER_REJECTED, "lease", "refused", 401));
+  role_free(model_fails(work, "leaseunsigned", TF_ERR_SERVER_REJECTED, "lease", "refused", 401), "leaseunsigned", "api", 0);
   /* 24.3 (69326fb): an integrity refusal names its check, at the lease and at the install's attest */
   integrity_case(work, "integrity_core", "/v1/model-key", NULL,
                  "{\"error\":\"lease_integrity_failed\",\"message\":\"free text the SDK never echoes\",\"why\":\"core\"}", "lease", "core",
@@ -332,7 +349,7 @@ static int t_errors_flow(const char *fixture, const char *work) {
   /* manifest: a 503 and a redirect, each download_failed, never followed */
   fake_reset(LEASE_OK);
   g_f.fail_url = "manifest.json", g_f.fail_status = 503;
-  tf_json_free(model_fails(work, "manifest503", TF_ERR_DOWNLOAD_FAILED, "manifest", "http", 503));
+  role_free(model_fails(work, "manifest503", TF_ERR_DOWNLOAD_FAILED, "manifest", "http", 503), "manifest503", "models", 1);
   fake_reset(LEASE_OK);
   g_f.fail_url = "manifest.json", g_f.fail_status = 302;
   tf_json_free(model_fails(work, "manifest302", TF_ERR_DOWNLOAD_FAILED, "manifest", "redirect", 302));
@@ -359,10 +376,10 @@ static int t_errors_flow(const char *fixture, const char *work) {
   /* a file that is not the one the manifest names, twice: checksum_mismatch, the download's hash */
   fake_reset(LEASE_OK);
   g_f.corrupt = 1;
-  tf_json_free(model_fails(work, "hash", TF_ERR_CHECKSUM_MISMATCH, "download", "hash", 0));
+  role_free(model_fails(work, "hash", TF_ERR_CHECKSUM_MISMATCH, "download", "hash", 0), "hash", "models", 0);
   /* the whole way, then the vector build's vocabulary refused at open: model_incompatible, the open's own */
   fake_reset(LEASE_OK);
-  tf_json_free(model_fails(work, "open", TF_ERR_MODEL_INCOMPATIBLE, "model_open", "incompatible", 0));
+  role_free(model_fails(work, "open", TF_ERR_MODEL_INCOMPATIBLE, "model_open", "incompatible", 0), "open", NULL, 0);
   /* attest: the app token refused with a 503 holds up the config: download_failed, the token's answer its cause */
   fake_reset(LEASE_OK);
   g_f.fail_url = "/v1/attest", g_f.fail_status = 503;
@@ -418,7 +435,11 @@ static int t_errors_flow(const char *fixture, const char *work) {
     for (int i = 0; i < 3 && c; ++i) tf_client_model(c, NULL);
     g_f.issues_status = 503;
     if (c) tf__client_flush(c, 1);
-    CHECK(g_f.n_err == 1 && tf__rep_due() == 0, "burst: one request at the send point, kept on a 503 (%d)", g_f.n_err);
+    /* 4.0.1 (28.3): the send point's one request asks each api host once, in order (a 503 is unreachable), and the
+     * report is kept when every host was */
+    int in_order = g_f.n_err == N_API_HOSTS;
+    for (int i = 0; in_order && i < N_API_HOSTS; ++i) in_order = g_f.err_host[i] == i;
+    CHECK(in_order && tf__rep_due() == 0, "burst: one request at the send point, each api host asked once, kept on a 503 (%d)", g_f.n_err);
     g_f.n_err = 0;
     g_f.issues_status = 0;
     if (c) tf_client_destroy(c);
@@ -436,6 +457,7 @@ static int t_errors_flow(const char *fixture, const char *work) {
     g_f.fail_url = "/v1/events", g_f.fail_status = 400, g_f.fail_body = "{\"error\":\"invalid_body\"}";
     if (c) tf__client_flush(c, 1);
     b = took("events", "http", "none");
+    CHECK(role_is(b, "api", 0), "events: a refusal on the first host, host_role api, fallback false");
     CHECK(b && jnum0(tf_json_get(b, "error"), "http_status") == 400 && !strcmp(jstr0(tf_json_get(b, "error"), "error_code") ? jstr0(tf_json_get(b, "error"), "error_code") : "", "invalid_body"),
           "events: a delta refused with 400 is reported, with the server's error");
     tf_json_free(b);
@@ -443,7 +465,7 @@ static int t_errors_flow(const char *fixture, const char *work) {
     if (c) tf__client_register(c);
     if (c) tf__client_flush(c, 1);
     b = took("register", "http", "none");
-    CHECK(b && jnum0(tf_json_get(b, "error"), "http_status") == 500, "register: a 500 at the launch is reported");
+    CHECK(b && jnum0(tf_json_get(b, "error"), "http_status") == 500 && role_is(b, "api", 1), "register: a 500 at the launch is reported (every api host asked)");
     tf_json_free(b);
     g_f.fail_url = "/v1/register", g_f.fail_status = 0;
     const int before = g_f.n_err;
@@ -467,6 +489,63 @@ static int t_errors_flow(const char *fixture, const char *work) {
     b = took("storage", "write", "storage_failed");
     CHECK(b != NULL, "storage: the report");
     tf_json_free(b);
+  }
+  /* 24.3 (4.0.1, Gate C, contract 7f097b9): a model open the Core fails, at the Core's boundary (tf__pm_open, the
+   * open every model open makes, made to fail with each status of errors_40.json core_open) and reported as an app
+   * call's failure is (tf__raise at the call's end). The flow's vector build is refused for its vocabulary before any
+   * engine open, so the open is asked directly, on that install with its build and lease 1. The statuses C answers
+   * engine_failed for carry the status's name as error_code (nomem: reason memory; engine: reason engine) and as
+   * error_name; C answers QLC_E_BUSY with session_open (never reported) and QLC_E_ARG with model_invalid, which carry
+   * no such error_code (core_open_are). */
+  {
+    TfJson *ev = errvec ? load_json(errvec, "errors_40.json") : NULL;
+    const TfJson *co = tf_json_get(ev, "core_open");
+    const char *mt = S(fx, "manifest");
+    int seen = 0;
+    for (int i = 0; co && i < co->n; ++i) {
+      const TfJson *k = &co->kids[i];
+      const int st = (int)N(k, "status");
+      char label[64], w[1100], bd[1300];
+      snprintf(label, sizeof label, "core_open_%s", S(k, "error_code"));
+      snprintf(w, sizeof w, "%s/%s", work, label);
+      snprintf(bd, sizeof bd, "%s/models/%s", w, S(fx, "build"));
+      fake_reset(LEASE_OK);
+      TfClient *c = flow_client(w);
+      if (c) tf_client_model(c, NULL); /* the build installed and lease 1 held (its vocabulary refused after) */
+      const int before = g_f.n_err;
+      tf__clear_error();
+      tf__pm_open_fail_status = st;
+      tf__app_call++;
+      qlc_model *zm = c ? tf__pm_open(tf__pm(c), bd, mt, strlen(mt), NULL, 1, 16000, 0) : NULL;
+      const int got = tf_last_error_code();
+      if (!zm && c) tf__client_note_error(c, tf__raise(got)); /* as an app call's end does */
+      tf__app_call--;
+      tf__pm_open_fail_status = 0;
+      const int engine = st == QLC_E_NOMEM || st == QLC_E_ENGINE;
+      const int want = engine ? TF_ERR_ENGINE_FAILED : st == QLC_E_BUSY ? TF_ERR_SESSION_OPEN : TF_ERR_MODEL_INVALID;
+      CHECK(!zm && got == want && (!engine || !strcmp(S(k, "code"), "engine_failed")), "%s: C answers %s with %s (%s)", label, S(k, "name"),
+            tf_error_name(want), tf_error_name(got));
+      if (c) tf_client_destroy(c); /* a send point */
+      if (engine) {
+        b = took("model_open", S(k, "reason"), "engine_failed");
+        const TfJson *e = tf_json_get(b, "error");
+        CHECK(b && jstr0(e, "error_code") && !strcmp(jstr0(e, "error_code"), S(k, "error_code")) && jstr0(e, "error_name") &&
+                  !strcmp(jstr0(e, "error_name"), S(k, "name")) && jstr0(b, "revision"),
+              "%s: the report model_open/%s with error_code %s and error_name %s (sent %s, %s)", label, S(k, "reason"), S(k, "error_code"), S(k, "name"),
+              jstr0(e, "error_code") ? jstr0(e, "error_code") : "none", jstr0(e, "error_name") ? jstr0(e, "error_name") : "none");
+        role_free(b, label, NULL, 0);
+      } else {
+        int carries = 0, busy_sent = 0;
+        for (int j = before; j < g_f.n_err; ++j) {
+          carries |= strstr(g_f.err_bodies[j], "\"error_code\":\"busy\"") || strstr(g_f.err_bodies[j], "\"error_code\":\"arg\"");
+          busy_sent |= strstr(g_f.err_bodies[j], "\"code\":\"session_open\"") != NULL;
+        }
+        CHECK(!carries && !busy_sent, "%s: no report carries busy or arg, and session_open is never reported", label);
+      }
+      seen++;
+    }
+    CHECK(!errvec || seen == 4, "core_open: the four statuses of errors_40.json replayed (%d)", seen);
+    tf_json_free(ev);
   }
   /* the app's own misuse is never reported */
   {

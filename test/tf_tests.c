@@ -6,7 +6,9 @@
  *   tf_tests errors <data dir>
  *   tf_tests vectors30 <data dir> <work dir>
  *   tf_tests ogg | codec | sharing | upload | client | bitrate | consent | sdk_latest   (as in 3.x)
- *   tf_tests join_window <work>   flags.share_join_ms read as 0 to 60000 (SDK 4.0, contract section 23) */
+ *   tf_tests join_window <work>   flags.share_join_ms read as 0 to 60000 (SDK 4.0, contract section 23)
+ *
+ * The work folder (the last argument) is emptied before the test runs. */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -192,9 +194,31 @@ static int crypto_tests(void) {
 #include "tf_201_tests.inc"
 #include "tf_30_tests.inc"
 
+/* Every run starts from an empty work folder, as tf40_tests' do. A test that meets the folder of an earlier run (ctest
+ * --repeat, or one test run again without tf_work_clean) finds that run's outbox, consent, ask and counters, and fails
+ * for no fault of the code: the bitrate stream then sees two recordings and reads none, the upload test counts two
+ * shared sessions, the consent test has no first ask. */
+static int fresh_work(int argc, char **argv) {
+  static const struct {
+    const char *name;
+    int argc, work; /* the arguments the test needs, and the one that is its work folder */
+  } k[] = {{"vectors30", 4, 3}, {"sharing", 5, 4}, {"ogg", 4, 3},    {"codec", 4, 3},      {"upload", 3, 2},   {"join_window", 3, 2},
+           {"client", 4, 3},    {"bitrate", 4, 3}, {"consent", 5, 4}, {"sdk_latest", 4, 3}, {"telemetry", 3, 2}};
+  for (size_t i = 0; argc >= 2 && i < sizeof k / sizeof k[0]; ++i)
+    if (argc >= k[i].argc && !strcmp(argv[1], k[i].name)) {
+      /* a folder that will not go (a file still held open) stops the run here, not as a test failure later */
+      if (tf__remove_tree(argv[k[i].work]) || tf_mkdirs(argv[k[i].work])) {
+        fprintf(stderr, "the work folder %s could not be emptied%c", argv[k[i].work], 10);
+        return 2;
+      }
+    }
+  return 0;
+}
+
 int main(int argc, char **argv) {
   cap_own_memory();
   tf__client_no_timer = 1; /* the replayed exchanges and stubs run on the test's thread */
+  if (fresh_work(argc, argv)) return 2;
   if (argc >= 2 && !strcmp(argv[1], "crypto")) return crypto_tests();
   if (argc >= 3 && !strcmp(argv[1], "errors")) return errors_tests(argv[2]);
   if (argc >= 4 && !strcmp(argv[1], "vectors30")) return vectors30_tests(argv[2], argv[3]);

@@ -2,6 +2,7 @@
   global:
     tf_client_background;
     tf_client_create;
+    tf_client_create2;
     tf_client_destroy;
     tf_client_diagnose;
     tf_client_diagnose_json;

@@ -1,10 +1,11 @@
-# The C API: `tajweedformer.h` (SDK 4.0.0)
+# The C API: `tajweedformer.h` (SDK 4.0.1)
 
 One library for Windows and Linux apps and for servers: `tajweedformer.dll` / `libtajweedformer.so` (or the static
 library) and one header, `include/tajweedformer.h`. It includes nothing but `<stddef.h>` and names no engine type.
 SDK 4.0 runs the model inside Quran Lab's closed Core (`qlcore.dll` / `qlcore.so`, shipped beside the library): the
-model is downloaded encrypted, installed encrypted for this install, and opened with a lease the server gives the
-install (see the README, "The protected model"). The API is 3.x's, with one addition
+model is downloaded encrypted, installed encrypted for this install, and opened with a key the server gives the
+install (see the README, "The protected model"). The first run needs a connection; after that it works offline, and
+the SDK keeps itself up to date in the background when the machine is online. The API is 3.x's, with one addition
 (`tf_session_report_recited_outcome`) and options removed ([migrating-to-4.md](migrating-to-4.md) lists every change):
 
 Coming from 3.x: `TfClientOptions.analytics` (`TfAnalytics`) is gone, not deprecated: anonymous analytics are always
@@ -31,7 +32,7 @@ Five things, with the same names and the same order of calls as the Android, App
 
 Every options struct (`TfClientOptions`, `TfModelOptions`, `TfPrefetchOptions`, `TfSessionOptions`) may be NULL or
 zeroed: zero is the default of every field. Strings and arrays returned as `const` belong to the object they came
-from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"4.0.0"`.
+from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"4.0.1"`.
 
 ## Errors
 
@@ -87,6 +88,25 @@ background. One Client per process: a second one while the first is not destroye
 `language` (the copy deck's language), `on_consent` (the SDK asks the app to show the sharing sheet, with a
 `TfConsentRequest`), `debug` and `on_log` (in the app's debug builds the client logs a newer SDK release and a
 version pin the server could not honour), `user`.
+
+From 4.0.1, if Quran Lab's main servers can't be reached, the SDK uses backup servers automatically.
+
+From 4.0.1, `TfClientOptions` is frozen at its 4.0.0 fields, so an app built against any 4.0 header runs with any later
+4.0 library. Newer options go in `TfClientOptionsExt`, given to `tf_client_create2(options, ext)`; the struct starts
+with its own `size`, and the library reads a field only when it lies within it:
+
+```c
+TfClientOptionsExt ext = {.size = sizeof ext, .app_build = "412"};
+TfClient *client = tf_client_create2(&(TfClientOptions){.key = "qlk_v1_...", .app_id = "com.example.app",
+                                                        .app_version = "1.4"}, &ext);
+```
+
+`tf_client_create(options)` is `tf_client_create2(options, NULL)`. A `size` below 4 is `invalid_argument`.
+`app_build` (the app's build number) and `app_version` go on every request for Quran Lab's signed config, so the model
+version rules set for the app on sdk.quranlab.ai can give older releases of the app the model they were built for.
+Both are kept to the ASCII letters, digits, `.`, `+` and `-`, without a leading `.`, `+` or `-`, and cut to 32
+characters; a value left empty, or `0`, is not sent. Registration sends the same cleaned `app_version` (`0` when
+nothing is left).
 
 | Call | What it does |
 | - | - |
@@ -185,8 +205,8 @@ held span of a long vowel from `timing_log_probs`), `qalqalah` and `gemination` 
 The expected units of each ayah (the same token ids as the model's vocabulary), for an app that aligns a take with
 an ayah itself. The SDK never aligns them and never compares them with a take. **SDK 4.0:** the table is encrypted
 with the model and read by the Core: the fetch downloads it and the Core installs it (refused with `session_open`
-while a take runs), and the first `tf_reference_units` needs a valid lease (`needs_connection` without one; a later
-call tries again). What it gives stays valid until the Model is closed.
+while a take runs), and the first `tf_reference_units` needs the model's key on this install (`needs_connection`
+when it needs Quran Lab to continue; a later call tries again). What it gives stays valid until the Model is closed.
 
 ```c
 TfReference *reference = tf_model_reference(model);       /* NULL when the build has none: not an error */

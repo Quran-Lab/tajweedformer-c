@@ -465,6 +465,37 @@ static int join_window_tests(const char *dir) {
   return fails ? 1 : 0;
 }
 
+int tf__share_passes(TfClient *c); /* tf_share.c, tests: upload passes finished so far */
+extern void (*tf__share_test_opened)(const char *id);
+extern void (*tf__share_test_looked)(const char *id, int active);
+/* case G's two hooks: the recording's open waits until an upload pass has looked at its folder, and that pass waits
+ * at its look until the test lets it go on (each wait 10 s at most, so a missed hook fails a check, never hangs) */
+static struct {
+  TfMutex m;
+  TfCond cv;
+  TfClient *c;
+  char id[33];
+  int looked, saw_active, release;
+} g_hold;
+static void hold_opened(const char *id) {
+  tf_mutex_lock(&g_hold.m);
+  snprintf(g_hold.id, sizeof g_hold.id, "%s", id);
+  tf_mutex_unlock(&g_hold.m);
+  tf__sharing_outbox_resume(g_hold.c); /* a pass now, while the capture has not begun */
+  tf_mutex_lock(&g_hold.m);
+  for (int i = 0; i < 1000 && !g_hold.looked; ++i) tf_cond_wait_ms(&g_hold.cv, &g_hold.m, 10);
+  tf_mutex_unlock(&g_hold.m);
+}
+static void hold_looked(const char *id, int active) {
+  tf_mutex_lock(&g_hold.m);
+  if (g_hold.id[0] && !strcmp(id, g_hold.id) && !g_hold.looked) {
+    g_hold.looked = 1;
+    g_hold.saw_active = active;
+    tf_cond_signal(&g_hold.cv);
+    for (int i = 0; i < 1000 && !g_hold.release; ++i) tf_cond_wait_ms(&g_hold.cv, &g_hold.m, 10);
+  }
+  tf_mutex_unlock(&g_hold.m);
+}
 static int upload_tests(const char *dir) {
   tf_mutex_init(&g_st.m);
   tf_mkdirs(dir);
@@ -615,6 +646,83 @@ static int upload_tests(const char *dir) {
   }
   printf("a 3.x grant on the guardian sheet: granted, no ask in 12 good moments, the take uploaded (%d segments), guardian written back "
          "unchanged\n", segs);
+
+  /* F: sharing that comes on in a running app uploads in that process: no tf__sharing_outbox_resume and no
+   * tf__sharing_outbox_wait (both start the uploader, so the cases above never saw that a yes left the uploader
+   * stopped until the next launch; production 11-19). The settings switch (tf_sharing_set_on) first, then the
+   * sheet's yes (an ask due at a good moment, on screen, answered: tf_sharing_shown, tf_sharing_answer), each on a
+   * client that has no uploader running yet. */
+  for (int k = 0; k < 2; ++k) {
+    stub_reset();
+    char *df = tf_path_join(dir, k ? "g" : "f");
+    c = share_client(df);
+    const int before = c ? tf__share_passes(c) : -1;
+    int on = -1;
+    if (c && !k) on = tf_sharing_set_on(c, 1);
+    if (c && k) {
+      good_moment(c);
+      const int pending = strstr(tf__client_sharing_status_json(c), "\"pendingAsk\":true") != NULL;
+      on = pending && tf_sharing_shown(c) == 1 ? tf_sharing_answer(c, 1) : -2;
+      tf__ask_now_ms = 0, tf__ask_tz_min = -100000; /* the system's clock again */
+    }
+    ss = c && !on ? tf__sharing_session_begin(c, rate, NULL) : NULL;
+    for (int i = 0; ss && i < 150; ++i) tf__sharing_session_push(ss, x + i * 960, 960); /* 3 s */
+    if (ss) share_finish(c, ss, 1);
+    left = -1;
+    for (int w = 0; c && w < 200; ++w) { /* 20 s at most, reading the outbox only */
+      left = tf__sharing_outbox_pending(c);
+      if (left == 0 && g_st.n_s == 1) break;
+      SLEEP_MS(100);
+    }
+    segs = 0;
+    CHECK(before == 0 && on == 0 && ss && left == 0 && g_st.n_s == 1 && joined_ok(&g_st.s[0], 1, &segs),
+          "sharing on in a running app (%s): no upload in this process (%d passes before, on %d, capture %s, %d left, %d sessions)",
+          k ? "the sheet's yes" : "the settings switch", before, on, ss ? "yes" : "no", left, g_st.n_s);
+    printf("sharing on in a running app (%s): the take uploaded in this process (%d segments)\n", k ? "the sheet's yes" : "the settings switch", segs);
+    if (c) tf__client_close(c);
+    free(df);
+  }
+
+  /* G: an upload pass that looks at a recording while it opens (its folder and session.json written, nothing
+   * captured yet) sees a capture that owns it, and the take goes up whole. The pass is held at that look until three
+   * segments have closed, then goes on. Until 4.0.1 the recording was marked as captured only after its folder was
+   * written, so such a pass took it for one a crash left: it closed it at its last whole page, sent those segments,
+   * deleted the folder under the capture, and the take was lost ("shared 0 ms"; public CI, 2026-11-21). */
+  {
+    stub_reset();
+    char *dg = tf_path_join(dir, "g");
+    c = share_client(dg);
+    tf__client_sharing_answer(c, 1);
+    tf__sharing_outbox_resume(c); /* the uploader runs */
+    tf_mutex_init(&g_hold.m);
+    tf_cond_init(&g_hold.cv);
+    g_hold.c = c;
+    g_hold.id[0] = 0;
+    g_hold.looked = g_hold.saw_active = g_hold.release = 0;
+    tf__share_test_looked = hold_looked;
+    tf__share_test_opened = hold_opened;
+    ss = tf__sharing_session_begin(c, rate, NULL);
+    tf__share_test_opened = NULL;
+    int i = 0;
+    for (; ss && i < 175; ++i) tf__sharing_session_push(ss, x + i * 960, 960); /* 3.5 s: three segments close */
+    tf_mutex_lock(&g_hold.m);
+    g_hold.release = 1;
+    tf_cond_signal(&g_hold.cv);
+    tf_mutex_unlock(&g_hold.m);
+    for (; ss && i < 10 * 50; ++i) tf__sharing_session_push(ss, x + i * 960, 960);
+    const int ms_g = ss ? share_finish(c, ss, 1) : -1;
+    left = tf__sharing_outbox_wait(c, 20000);
+    tf__share_test_looked = NULL;
+    segs = 0;
+    CHECK(g_hold.looked && g_hold.saw_active, "the pass that looked at the opening recording (%d) saw no capture owning it", g_hold.looked);
+    CHECK(ms_g == 10000, "a take a pass looked at while it opened: shared %d ms of 10000", ms_g);
+    CHECK(left == 0 && g_st.n_s == 1 && joined_ok(&g_st.s[0], 1, &segs) && segs >= 10, "that take uploaded whole: %d left, %d sessions, %d segments",
+          left, g_st.n_s, segs);
+    printf("a pass at a recording while it opens: %s (%d ms, %d segments)\n",
+           g_hold.saw_active && ms_g == 10000 && left == 0 ? "it saw the capture, the take uploaded whole" : "FAIL", ms_g, segs);
+    tf__client_close(c);
+    free(dg);
+  }
 
   stub_reset();
   tf_http_set_transport(NULL, NULL);

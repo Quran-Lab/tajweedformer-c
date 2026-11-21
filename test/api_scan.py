@@ -27,13 +27,13 @@ root = Path(__file__).resolve().parent.parent
 header = (root / "include" / "tajweedformer.h").read_text(encoding="utf-8")
 bad = []
 
-TYPES = """TfClient TfModel TfSession TfHeads TfBackend TfClientOptions TfSessionOptions TfChunk TfDecoded TfToken TfWord
+TYPES = """TfClient TfModel TfSession TfHeads TfBackend TfClientOptions TfClientOptionsExt TfSessionOptions TfChunk TfDecoded TfToken TfWord
 TfFrame TfHead TfEvent TfTokens TfCalibration TfReference TfClip TfSharing TfDiagnosis TfError
 TfModelOptions TfPrefetchOptions TfUnits TfConsentRequest TfRecitedOutcome TfRecitedAyah TfAskKind""".split()
 
 FUNCTIONS = """tf_version tf_last_error_code tf_last_error tf_last_error_fix tf_error_name tf_error_fix tf_error_docs
 tf_decoded_json tf_heads_count tf_heads_name tf_heads_get tf_heads_greedy tf_heads_decoded
-tf_client_create tf_client_destroy tf_client_model tf_client_prefetch tf_client_storage_json tf_client_remove_models
+tf_client_create tf_client_create2 tf_client_destroy tf_client_model tf_client_prefetch tf_client_storage_json tf_client_remove_models
 tf_client_diagnose tf_client_diagnose_json tf_client_report_checks tf_client_background tf_client_foreground
 tf_model_close tf_model_id tf_model_version tf_model_build tf_model_info_json tf_model_chunk_ms
 tf_model_tokens tf_model_token_count tf_model_token_name tf_model_token_id
@@ -54,8 +54,9 @@ REMOVED = ["tf_score", "tf_stream", "TfStream", "TfResult", "TfWordScore", "tf_r
            "zf_platform", "struct_size", "tajweed block", "tf_free"]
 
 includes = re.findall(r"^\s*#\s*include\s+(\S+)", header, re.M)
-if includes != ["<stddef.h>"]:
-    bad.append(f"tajweedformer.h includes {includes}, want only <stddef.h>")
+# <stdint.h> from 4.0.1: TfClientOptionsExt starts with a uint32_t
+if includes != ["<stddef.h>", "<stdint.h>"]:
+    bad.append(f"tajweedformer.h includes {includes}, want only <stddef.h> and <stdint.h>")
 for m in re.finditer(r"\b(zf_\w+|Zf[A-Z]\w+|ZF_[A-Z0-9_]+)\b", header):
     bad.append(f"an engine name in the public header: {m.group(1)}")
 for name in REMOVED:

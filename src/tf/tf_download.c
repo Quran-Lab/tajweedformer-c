@@ -9,12 +9,20 @@
  * (it has no limit on its whole time); and a file whose transfer breaks is resumed inside the call from its .part,
  * with the validator of the answer that started it, at most five times (fetch_raw).
  *
- * SPEC 2a: files come from the build URL ({base}/{repo}/{build}/{folder}/{path}, immutable); the manifest must name
- * its version in the signed text, the version must be the one the signed config named, and the manifest's SHA-256
- * must start with the build the config named. SDK 4.0 (18.4.5): the config names no base; the manifest comes from the
- * model host's URL for the build, and every file after the lease only from the model folder the lease answer named
- * (<base><path>). An answer without one (every answer carries it) downloads nothing: an invalid response, never the
- * host's URLs (as the Apple SDK, 018935d).
+ * SPEC 2a: files come from the build's folder (/models/{repo}/{build}/{folder}/{path}, immutable); the manifest must
+ * name its version in the signed text, the version must be the one the signed config named, and the manifest's
+ * SHA-256 must start with the build the config named. SDK 4.0 (18.4.5): the config names no base; every file after the
+ * lease comes only from the model folder the lease answer named. An answer without one (every answer carries it)
+ * downloads nothing: an invalid response (as the Apple SDK, 018935d).
+ *
+ * SDK 4.0.1 (ENDPOINTS_40.md 28.4): the folder is a PATH, asked of the `models` hosts in their failover order
+ * (tf_endpoints.c), manifest and files alike; there is no fixed manifest host (4.0.0 read the manifest from
+ * cdn.quranlab.ai whatever the lease said). The manifest comes from the folder of the lease the install holds for the
+ * build, else from the folder qlab-api names in every lease answer for it (MODEL_BASE's path, the repo, the build, the
+ * config's folder); the files from the lease answer's folder. A lease base whose host is not one of the role's is asked
+ * first. A file's resume after an unreachable failure (16.2's five, with their pauses) goes to the next host, cycling,
+ * with Range and no If-Range: the validator is kept with the host that gave it and sent to that host only. Size and
+ * SHA-256 decide, whatever host served the bytes; the next file starts at the host that answered last.
  *
  * SDK 4.0 (PROTECTED_MODEL.md 18.2): every model file of an encrypted build is a qle1 container. Its CDN form is
  * downloaded as it is served (<dest>/cdn/<decoded path>.qle), checked against the container's signed size and
@@ -22,7 +30,18 @@
  * path>.qld) and checks the plaintext's SHA-256 inside; the CDN form is deleted after. No plaintext of a model file
  * is ever written. The manifest's acceptance is followed by o->after_manifest (the lease, which the install needs).
  * The build's layout file is installed before the files whose install mark it keys. Plain entries (the calibration,
- * the sample clips) are public data and stored as in 3.x. */
+ * the sample clips) are public data and stored as in 3.x.
+ *
+ * 4.0.1 (perf_plan row 5): the files of one call download on up to tf__download_lanes (4) lanes at once, each on its
+ * own kept connection, the largest first, so the weights start at once and the small files fill the other lanes.
+ * Each file is hashed as its bytes are written (a resumed file hashes the bytes it already had first), so no file is
+ * read again after its last byte. With a lease hook the lanes start before it, from the build's folder the manifest
+ * came from (through the models hosts), while the hook makes the install key (a TPM key on Windows: 1.5 s in Stage B),
+ * attests and asks the lease on the caller's thread; nothing is installed before the lease is in, and the files are
+ * used only when the lease answer names that same folder (its path: the host does not matter, 28.4). Another folder: what the lanes fetched is dropped and the
+ * files come from the lease answer's folder. No lease (an error, or an answer without a folder): every file this
+ * call fetched is removed before the error goes on. The Core's installs stay on the caller's thread, one at a time,
+ * the layout first; the progress callback is called on the caller's thread. */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -31,6 +50,7 @@
 #include <string.h>
 
 #include "tf_internal.h"
+#include "tf_thread.h"
 
 int tf_gunzip_file(const char *in_path, const char *out_path);
 
@@ -42,32 +62,51 @@ static int on_storage(int rc) {
 
 int tf__download_stall_ms = 30000;
 int tf__download_pause_ms = 1000;
+int tf__download_lanes = 4;
+int tf__download_early = 1;
+int tf__download_rereads; /* tests: files read again after their last byte (a transport that gave no on_data) */
 
 TfDownload tf__download_defaults(void) {
   TfDownload o;
   memset(&o, 0, sizeof o);
-  o.cdn_url = "https://cdn.quranlab.ai/models";
   o.repo = "Quran-Lab/tajweedformer-v4";
   o.folder = "sdk/v4.0";
   return o;
 }
 
+/* 4.0.1: what the lanes of one call share, under `lock`: the progress, the caller's counters, the call's stop */
 typedef struct {
-  const TfDownload *o;
-  const char *mbytes;    /* the accepted manifest's bytes (the Core's install takes them) */
-  size_t mn;
+  TfMutex lock;
+  TfCond cv;             /* a lane finished a file, failed or ended; bytes came */
+  const TfDownload *o;   /* the caller's options: fetched and resumed are written under the lock only */
   long long done, total; /* bytes as stored, over the files asked for */
-  TfHttpConn *conn;      /* 3.1.3: the one connection to the model host, kept from the manifest to the last file */
-  char base[512];        /* SDK 4.0: the lease answer's model folder (ends in '/'), once the lease is in hand */
+  volatile int stop;     /* every lane's cancel flag: tf__http_cancel(&stop) ends the call's requests in flight */
+} Shared;
+typedef struct {
+  const TfDownload *o;   /* this lane's options: the caller's, with the call's stop as the cancel flag */
+  Shared *sh;
+  TfHttpConn *conn;      /* 3.1.3: one kept connection to the model host per lane */
+  char base[512];        /* where files are read: the lease answer's model folder (ends in '/'), or, before the
+                            lease, the build's folder the manifest came from (4.0.1) */
+  long long counted;     /* the bytes of the file in hand counted in sh->done */
+  int touched;           /* this call wrote bytes of the file in hand */
+  /* 4.0.1 (28.4): the models hosts, the folder's path every request asks for, and a base's host that is not one of
+   * the role's (asked first; first_origin: a test's stand-in base, reached there) */
+  TfEndpoints *ep;
+  char path[512], first[TF_EP_HOST], first_origin[300];
 } Run;
 /* one request for a file: what the transport's callbacks need */
 typedef struct {
   Run *run;
+  const char *host;       /* 4.0.1: the host this request goes to (the validator of a file is kept with its host) */
+  int fallback;           /* 4.0.1: this file has been asked of more than one host (24.2 fallback) */
   const char *part;       /* the partial file the body goes to; NULL for the manifest */
   const char *whole;      /* where a whole file sent for a range goes, beside the partial file */
-  long long from, before; /* the request's first byte; run->done before this file */
+  long long from;         /* the request's first byte */
   long long size;         /* the file's size, from the manifest */
   char etag[80];          /* the validator of a whole file that came for a range, until it is in place */
+  TfSha256 sha;           /* 4.0.1: the file's bytes from its first, as they are written */
+  long long hashed;       /* how many went into sha */
 } Xfer;
 
 /* The network failures of one file that one call rides out: after each the call waits (tf__download_pause_ms,
@@ -145,33 +184,94 @@ static int file_ok(const char *full, long long size, const char *sha_hex) {
   return !tf_hex_decode(sha_hex, want, 32) && !tf_sha256_file(full, got, &n) && n == size && !memcmp(got, want, 32);
 }
 
-/* {base}/{repo}/{revision}/{folder}/{rel}: Quran Lab's model hosting (base https://cdn.quranlab.ai/models). A bare cdn.quranlab.ai
- * base, or a regional {region}.cdn.quranlab.ai, keeps the old shape {cdn}/hf/{repo}/..., served for every revision.
- * Returns 0, or -1 when the URL does not fit in n bytes. */
-int tf__model_url(char *out, size_t n, const char *base, const char *repo, const char *revision, const char *folder, const char *rel) {
-  static const char *const legacy[] = {"cdn", "weur.cdn", "eeur.cdn", "enam.cdn", "wnam.cdn", "apac.cdn", "oc.cdn"};
-  size_t bl = strlen(base);
-  while (bl && base[bl - 1] == '/') bl--;
-  const char *hf = "";
-  for (size_t i = 0; i < sizeof legacy / sizeof legacy[0]; ++i) {
-    char want[64];
-    snprintf(want, sizeof want, "https://%s.quranlab.ai", legacy[i]);
-    if (bl == strlen(want) && !strncmp(base, want, bl)) hf = "/hf";
-  }
-  const int w = snprintf(out, n, "%.*s%s/%s/%s/%s/%s", (int)bl, base, hf, repo, revision, folder, rel);
+/* {prefix}/{repo}/{revision}/{folder}/: the build's folder as qlab-api names it in every lease answer (MODEL_BASE's
+ * path, /models). 4.0.1: a path, asked of the models hosts (28.4); the legacy /hf/ shape of a bare host is gone with
+ * the fixed host. Returns 0, or -1 when it does not fit in n bytes. */
+int tf__model_folder(char *out, size_t n, const char *prefix, const char *repo, const char *revision, const char *folder) {
+  size_t pl = strlen(prefix);
+  while (pl && prefix[pl - 1] == '/') pl--;
+  const int w = snprintf(out, n, "%.*s/%s/%s/%s/", (int)pl, prefix, repo, revision, folder);
   return w < 0 || (size_t)w >= n ? -1 : 0;
 }
+/* the folder a base names: its path, and its host when that is not one of the role's (asked first); a path alone is
+ * the folder on the models hosts. A base that is no base of 28.4 (a test's stand-in, tf__lease_test_base) is reached
+ * at its own origin. 0 when it names none. */
+static int folder_of(Run *run, const char *base) {
+  char host[TF_EP_HOST], path[512];
+  run->first[0] = run->first_origin[0] = 0;
+  if (base && base[0] == '/' && strlen(base) < sizeof run->path && base[strlen(base) - 1] == '/' && !strstr(base, "..")) {
+    snprintf(run->path, sizeof run->path, "%s", base); /* a folder's path alone: the models hosts in their order */
+    return 1;
+  }
+  if (tf__ep_base_parts(base, host, path, sizeof path)) {
+    snprintf(run->path, sizeof run->path, "%s", path);
+    snprintf(run->first, sizeof run->first, "%s", host);
+    return 1;
+  }
+  const char *a = base && tf__lease_test_base ? strstr(base, "://") : NULL;
+  const char *slash = a ? strchr(a + 3, '/') : NULL;
+  if (!slash || strlen(slash) >= sizeof run->path || (size_t)(slash - base) >= sizeof run->first_origin) return 0;
+  snprintf(run->first_origin, sizeof run->first_origin, "%.*s", (int)(slash - base), base);
+  snprintf(run->first, sizeof run->first, "%.*s", (int)(slash - a - 3), a + 3);
+  snprintf(run->path, sizeof run->path, "%s", slash);
+  return 1;
+}
+static void origin_of(const Run *run, const char *host, char *out, size_t n) {
+  if (run->first_origin[0] && !strcmp(host, run->first)) snprintf(out, n, "%s", run->first_origin);
+  else tf__ep_origin(run->ep, TF_EP_MODELS, host, out, n);
+}
 
-/* bytes of the files asked for that are here: the progress callback's count */
-static void add_done(Run *run, long long n) {
-  run->done += n;
-  if (run->o->progress) run->o->progress(run->o->user, run->done > run->total ? run->total : run->done, run->total);
+/* 4.0.1 (28.4): two bases name the same folder when their paths are the same, whatever host each names */
+static int same_folder(const char *a, const char *b) {
+  Run x, y;
+  memset(&x, 0, sizeof x);
+  memset(&y, 0, sizeof y);
+  return folder_of(&x, a) && folder_of(&y, b) && !strcmp(x.path, y.path);
+}
+
+/* the file in hand counts `v` bytes in the progress (bytes of the files asked for that are here) */
+static void set_counted(Run *run, long long v) {
+  if (v == run->counted) return;
+  Shared *sh = run->sh;
+  tf_mutex_lock(&sh->lock);
+  sh->done += v - run->counted;
+  tf_cond_signal(&sh->cv);
+  tf_mutex_unlock(&sh->lock);
+  run->counted = v;
 }
 /* bytes that came over the network in this call (the telemetry's downloads entry counts them) */
 static void net_bytes(void *user, long long n) {
   Run *run = ((Xfer *)user)->run;
-  if (run->o->fetched) *run->o->fetched += n;
-  add_done(run, n);
+  Shared *sh = run->sh;
+  run->touched = 1;
+  tf_mutex_lock(&sh->lock);
+  if (sh->o->fetched) *sh->o->fetched += n;
+  sh->done += n;
+  tf_cond_signal(&sh->cv);
+  tf_mutex_unlock(&sh->lock);
+  run->counted += n;
+}
+/* 4.0.1: the same bytes into the file's hash, in the order they were written */
+static void on_data(void *user, const void *p, size_t n) {
+  Xfer *x = (Xfer *)user;
+  tf_sha256_update(&x->sha, p, n);
+  x->hashed += (long long)n;
+}
+/* the first n bytes of a partial file into the hash (a resume hashes what it already has once); -1 when it cannot */
+static int hash_prefix(const char *path, long long n, TfSha256 *c) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return -1;
+  unsigned char buf[1 << 16];
+  long long left = n;
+  while (left > 0) {
+    const size_t want = left > (long long)sizeof buf ? sizeof buf : (size_t)left;
+    const size_t k = fread(buf, 1, want, f);
+    if (!k) break;
+    tf_sha256_update(c, buf, k);
+    left -= (long long)k;
+  }
+  fclose(f);
+  return left ? -1 : 0;
 }
 
 /* The validator of a partial file: the ETag of the answer that started it, kept beside it as <file>.part.etag.
@@ -185,41 +285,58 @@ static char *etag_path(const char *part) {
   if (p) snprintf(p, strlen(part) + sizeof(".etag"), "%s.etag", part);
   return p;
 }
-static void etag_write(const char *part, const char *etag) {
+/* 4.0.1 (28.4): an ETag is one store's, and each model host has its own store. The validator is kept with the host
+ * that gave it (a second line) and sent to that host only; a resume on another host goes with the Range alone. A
+ * validator an earlier SDK kept has no host and is sent to none. */
+static void etag_write(const char *part, const char *etag, const char *host) {
   char *p = etag_path(part);
   if (!p) return;
-  if (etag && etag[0] == '"') tf_write_file(p, etag, strlen(etag));
-  else remove(p);
+  if (etag && etag[0] == '"' && host && *host) {
+    char text[80 + TF_EP_HOST + 2];
+    const int n = snprintf(text, sizeof text, "%s\n%s", etag, host);
+    if (n > 0 && (size_t)n < sizeof text) tf_write_file(p, text, (size_t)n);
+    else remove(p);
+  } else {
+    remove(p);
+  }
   free(p);
 }
-static void etag_read(const char *part, char out[80]) {
+static void etag_read(const char *part, char out[80], char host[TF_EP_HOST]) {
   char *p = etag_path(part), *text = NULL;
   size_t n = 0;
-  out[0] = 0;
+  out[0] = host[0] = 0;
   if (p && !tf_read_file(p, &text, &n) && text) {
-    while (n && (text[n - 1] == '\n' || text[n - 1] == '\r' || text[n - 1] == ' ')) n--;
-    if (n >= 2 && n < 80 && text[0] == '"') {
-      memcpy(out, text, n);
-      out[n] = 0;
+    const char *nl = (const char *)memchr(text, '\n', n);
+    size_t en = nl ? (size_t)(nl - text) : n;
+    while (en && (text[en - 1] == '\r' || text[en - 1] == ' ')) en--;
+    if (en >= 2 && en < 80 && text[0] == '"' && nl) {
+      memcpy(out, text, en);
+      out[en] = 0;
+      size_t hn = n - (size_t)(nl + 1 - text);
+      while (hn && (nl[hn] == '\n' || nl[hn] == '\r' || nl[hn] == ' ')) hn--;
+      if (hn && hn < TF_EP_HOST) snprintf(host, TF_EP_HOST, "%.*s", (int)hn, nl + 1);
+      if (!host[0]) out[0] = 0;
     }
   }
   free(text);
   free(p);
 }
 /* the status and the headers of a file request are in, the file is open and no byte of the body is written */
+/* the status and the headers of a file request are in, the file is open and no byte of the body is written */
 static void on_head(void *user, const TfHttpResponse *r) {
   Xfer *x = (Xfer *)user;
   if (!x->part || r->status != 200) return; /* a 206 continues the partial file: its validator stays */
   if (x->from > 0) {
     /* a whole file for a range request: it is written beside the partial file, which keeps its bytes and
-     * its validator until all of the whole file is here (fetch_raw). The count starts again for it */
+     * its validator until all of the whole file is here (fetch_raw). The count and the hash start again for it */
     snprintf(x->etag, sizeof x->etag, "%s", r->etag);
-    x->run->done = x->before;
-    add_done(x->run, 0);
+    set_counted(x->run, 0);
+    tf_sha256_init(&x->sha);
+    x->hashed = 0;
     return;
   }
-  /* a 200 to a request without a range starts the partial file, with this answer's validator */
-  etag_write(x->part, r->etag);
+  /* a 200 to a request without a range starts the partial file, with this answer's validator and its host */
+  etag_write(x->part, r->etag, x->host);
 }
 /* Is this the answer a file request asked for? Asked before a byte of it is written. A 200 whose length,
  * when the answer names one, is the file's; or a 206, to a request that named a range, whose Content-Range
@@ -234,15 +351,34 @@ static int accept_head(void *user, const TfHttpResponse *r) {
   return 1;
 }
 
-/* One model request. `net` is set to 1 when it failed on the network (no answer, a connection that ended, a
- * stall): the failures a file request is resumed after. */
-static int get(Run *run, const char *rel, Xfer *x, const char *if_range, TfHttpResponse *r, int *net) {
+/* 28.3: a manifest is taken on a host only when it is the signed manifest of the build asked for (the same checks as
+ * below, which run again on the answer the request ends on) */
+static int manifest_taken(void *user, const TfHttpResponse *r) {
+  const Run *run = (const Run *)user;
   const TfDownload *o = run->o;
-  char url[4096], key[512];
+  if (r->status != 200 || !r->body) return 0;
+  TfErrSave *keep = tf__error_save();
+  TfJson *m = NULL;
+  const int rc = tf__manifest_accept(r->body, r->body_n, o->check_build ? o->revision : NULL, o->want_version,
+                                     o->trusted_key_hex ? o->trusted_key_hex : TF_QURANLAB_KEY_HEX, 0, &m, NULL, NULL, NULL);
+  tf_json_free(m);
+  tf__cause_clear();
+  tf__error_restore(keep, 1);
+  return rc == 0;
+}
+/* One model request: the manifest (host NULL: the models hosts in their order, 28.3) or a file's request to one host
+ * (fetch_raw picks it, 28.4). `net` is set to 1 when it failed on the network (no answer, a connection that ended, a
+ * stall): the failures a file request is resumed after. */
+static int get(Run *run, const char *host, const char *rel, Xfer *x, const char *if_range, TfHttpResponse *r, int *net) {
+  const TfDownload *o = run->o;
+  char url[4096], key[512], path[1600], origin[320];
   *net = 0;
-  if (run->base[0] ? snprintf(url, sizeof url, "%s%s", run->base, rel) >= (int)sizeof url
-                   : tf__model_url(url, sizeof url, o->cdn_url ? o->cdn_url : "https://cdn.quranlab.ai/models", o->repo, o->revision, o->folder, rel))
+  if (snprintf(path, sizeof path, "%s%s", run->path, rel) >= (int)sizeof path)
     return tf__fail(TF_ERR_INVALID_ARGUMENT, "the model URL of %s is too long", rel);
+  if (host) {
+    origin_of(run, host, origin, sizeof origin);
+    snprintf(url, sizeof url, "%s%s", origin, path);
+  }
   /* SPEC 15.4: every model request (the manifest, a file, a Range request) carries the install's app token, and
    * in 3.1.0 the key too. Both headers are made here and nowhere else. */
   snprintf(key, sizeof key, "x-qlab-key: %s", o->key ? o->key : "");
@@ -257,7 +393,7 @@ static int get(Run *run, const char *rel, Xfer *x, const char *if_range, TfHttpR
     TfHttpRequest q;
     memset(&q, 0, sizeof q);
     q.method = "GET";
-    q.url = url;
+    q.url = host ? url : NULL;
     q.headers = hdr;
     q.download_file = x->part;
     q.download_whole = x->whole;
@@ -267,12 +403,31 @@ static int get(Run *run, const char *rel, Xfer *x, const char *if_range, TfHttpR
     q.if_range = if_range;
     /* 3.1.3: no byte for 30 s ends the request; there is no limit on the whole transfer (it was one hour) */
     q.stall_ms = tf__download_stall_ms;
+    q.head_ms = TF_EP_HEAD_MS; /* 4.0.1 (28.3 item 6): the first byte within 10 s, then the next host */
     q.conn = run->conn;
     q.cancel = o->cancel;
     q.on_head = on_head;
     q.bytes_user = x;
-    if (x->part) q.on_bytes = net_bytes;
-    if (tf_http(&q, r)) {
+    if (x->part) {
+      q.on_bytes = net_bytes;
+      q.on_data = on_data;
+    }
+    int hrc;
+    if (host) {
+      tf__ep_note(TF_EP_MODELS, x->fallback); /* the token request above was the api role's */
+      hrc = tf_http(&q, r);
+    } else {
+      TfEpReq er;
+      memset(&er, 0, sizeof er);
+      er.role = TF_EP_MODELS;
+      er.path = path;
+      er.first = run->first[0] && !run->first_origin[0] ? run->first : NULL;
+      er.stage = "manifest";
+      er.taken = manifest_taken;
+      er.user = run;
+      hrc = tf__ep_http(run->ep, &er, &q, r, NULL);
+    }
+    if (hrc) {
       const char *stage = strcmp(rel, "manifest.json") ? "download" : "manifest";
       /* a failed write is the device's, not the network's; the .part stays either way */
       if (tf__error_code() == TF__ERR_IO) {
@@ -348,8 +503,13 @@ static int http_error(const Run *run, const char *rel, const TfHttpResponse *r) 
 }
 
 /* The pause before the `nth` resume (0 for the first). 1 when the download was cancelled, at once. */
+void (*tf__download_on_pause)(long long ms);
 static int pause_before_resume(const TfDownload *o, int nth) {
   long long ms = (long long)tf__download_pause_ms << nth;
+  if (tf__download_on_pause) {
+    tf__download_on_pause(ms);
+    ms = 0;
+  }
   while (ms > 0 && !(o->cancel && *o->cancel)) {
     const int step = ms > 50 ? 50 : (int)ms;
     tf__sleep_ms(step);
@@ -376,10 +536,14 @@ static int pause_before_resume(const TfDownload *o, int nth) {
  * the manifest's (every byte of it came in an answer that was the one asked for, and it is still not the
  * file: no part of it can be told from another, and kept it would fail every later call the same way). */
 static int fetch_raw(Run *run, const char *rel, long long size, const char *sha, const char *to) {
+  run->counted = 0;
+  run->touched = 0;
   if (file_ok(to, size, sha)) {
-    add_done(run, size);
+    set_counted(run, size);
     return 0;
   }
+  uint8_t want[32];
+  const int have_want = !tf_hex_decode(sha, want, 32);
   const size_t tn = strlen(to);
   char *part = (char *)malloc(tn + sizeof(".part")), *whole = (char *)malloc(tn + sizeof(".part.new"));
   if (!part || !whole) {
@@ -390,7 +554,13 @@ static int fetch_raw(Run *run, const char *rel, long long size, const char *sha,
   snprintf(part, tn + sizeof(".part"), "%s.part", to);
   snprintf(whole, tn + sizeof(".part.new"), "%s.part.new", to);
   int rc = 0, resumes = 0, mismatches = 0;
-  const long long before = run->done;
+  /* 4.0.1 (28.4): the hosts this file asks, P first; each failure a resume is for moves to the next, cycling; the
+   * first host's failure is what a failover reports */
+  TfEpOrder ord;
+  tf__ep_order(run->ep, TF_EP_MODELS, run->first[0] ? run->first : NULL, &ord);
+  int k = 0, answered = 0, first_status = 0, installed = 0;
+  char first_reason[20] = "";
+  const char *host = ord.host[0];
   for (;;) {
     /* a whole file beside the partial file, left by a call that ended between its two steps: it is the
      * partial file when it has the size and nothing else is there; else it goes */
@@ -401,36 +571,48 @@ static int fetch_raw(Run *run, const char *rel, long long size, const char *sha,
       remove(part);
       from = 0;
     }
-    if (from == 0) etag_write(part, NULL); /* no bytes, so nothing to validate */
-    run->done = before;
-    add_done(run, from); /* what an earlier request already fetched */
+    if (from == 0) etag_write(part, NULL, NULL); /* no bytes, so nothing to validate */
+    set_counted(run, from); /* what an earlier request already fetched */
     /* resumed, as the telemetry counts it: this call went on from a partial file an earlier call left. A resume
      * inside the call is not counted (it would make every download that rode out one break a resumed one) */
-    if (from > 0 && from < size && resumes == 0 && run->o->resumed) *run->o->resumed = 1;
+    if (from > 0 && from < size && resumes == 0 && run->sh->o->resumed) {
+      tf_mutex_lock(&run->sh->lock);
+      *run->sh->o->resumed = 1;
+      tf_mutex_unlock(&run->sh->lock);
+    }
+    Xfer x;
+    memset(&x, 0, sizeof x);
+    x.run = run;
+    host = ord.host[k % ord.n];
+    x.host = host;
+    /* 24.2: this file's requests are of the models role; more than one host asked from the second host on */
+    x.fallback = (k + 1 < ord.n ? k + 1 : ord.n) > 1;
+    x.part = part;
+    x.whole = whole;
+    x.from = from;
+    x.size = size;
+    /* 4.0.1: the hash of the partial file's bytes, read once; the rest goes into it as it is written */
+    tf_sha256_init(&x.sha);
+    if (from > 0) x.hashed = hash_prefix(part, from, &x.sha) ? -1 : from;
     if (from < size) {
-      char tag[80] = "";
-      if (from > 0) etag_read(part, tag);
-      Xfer x;
-      memset(&x, 0, sizeof x);
-      x.run = run;
-      x.part = part;
-      x.whole = whole;
-      x.from = from;
-      x.before = before;
-      x.size = size;
+      char tag[80] = "", tag_host[TF_EP_HOST] = "";
+      if (from > 0) etag_read(part, tag, tag_host);
+      if (strcmp(tag_host, host)) tag[0] = 0; /* the validator goes only to the host that gave it */
       TfHttpResponse r;
       int again = 0; /* 1: a failed attempt of the kind a resume is for */
-      rc = get(run, rel, &x, tag[0] ? tag : NULL, &r, &again);
+      int st = 0;
+      run->touched = 1; /* this call asked for bytes of the file: what comes of it is this call's */
+      rc = get(run, host, rel, &x, tag[0] ? tag : NULL, &r, &again);
+      if (rc) st = tf__http_failure(NULL, NULL) == TF__FAIL_ANSWER ? r.status : 0;
       if (!rc) {
-        const int st = r.status;
-        char why[48];
+        st = r.status;
         if (st == 200 && from > 0 && file_size(whole) >= 0) {
           /* the whole file came for a range, beside the partial file: all of it, and it takes the partial
            * file's place with its own validator; less, and the partial file stays as it was */
           if (file_size(whole) == size) {
             remove(part);
             if (rename(whole, part)) rc = on_storage(tf__fail(TF_ERR_STORAGE_FAILED, "cannot put %s in the place of its partial file", rel));
-            else etag_write(part, x.etag);
+            else etag_write(part, x.etag, host);
           } else {
             again = 1;
             tf__cause("download", "network", 0, NULL, NULL); /* a connection that ended */
@@ -450,12 +632,17 @@ static int fetch_raw(Run *run, const char *rel, long long size, const char *sha,
           tf__cause("download", "invalid_answer", st, NULL, NULL);
           rc = tf__fail(TF_ERR_DOWNLOAD_FAILED, "HTTP %d is not an answer to the request for %s", st, rel);
         } else {
-          again = st >= 500 && !tf__body_stop_reason(r.body, r.body_n, why) && !(r.body && strstr(r.body, "network_blocked"));
+          /* 4.0.1 (28.3, 28.4): an answer that is the host unreachable (a 5xx, a redirect, a 4xx that is not the
+           * API's) is resumed at the next host; a refusal and a 429 are asked once and on no other host. (4.0.0
+           * resumed after a 5xx only, on its one host, and never after network_blocked.) */
+          const int cls = tf__ep_class(NULL, 0, &r);
+          again = cls == TF_EP_UNREACHABLE;
+          answered = !again;
           /* no answer takes the bytes already here, but a 416: the server has no such range, so they are past
            * its file */
           if (st == 416) {
             remove(part);
-            etag_write(part, NULL);
+            etag_write(part, NULL, NULL);
           }
           rc = http_error(run, rel, &r);
         }
@@ -463,28 +650,87 @@ static int fetch_raw(Run *run, const char *rel, long long size, const char *sha,
       }
       if (rc) {
         remove(whole); /* part of a whole file that did not all come */
+        if (again && k == 0) { /* the first host's failure (28.7) */
+          snprintf(first_reason, sizeof first_reason, "%s", *tf__cause_reason() ? tf__cause_reason() : "network");
+          first_status = st;
+        }
         /* the failure after the last resume, and every failure a resume is not for, is the call's error */
         if (!again || resumes == TF_DOWNLOAD_RESUMES || pause_before_resume(run->o, resumes)) break;
         resumes++;
+        k++; /* 28.4: the resume goes to the next host */
         continue;
       }
     }
-    if (file_ok(part, size, sha)) {
+    /* every byte of the file went into the hash as it was written (4.0.1): its size and digest decide, with no second
+     * read; else (a test's transport that writes the file itself, a prefix that could not be read) the file is read */
+    int good;
+    if (x.hashed == size && have_want && file_size(part) == size) {
+      uint8_t got[32];
+      tf_sha256_final(&x.sha, got);
+      good = !memcmp(got, want, 32);
+    } else {
+      good = file_ok(part, size, sha);
+      tf_mutex_lock(&run->sh->lock);
+      tf__download_rereads++;
+      tf_mutex_unlock(&run->sh->lock);
+    }
+    if (good) {
       remove(to);
       rc = rename(part, to) ? on_storage(tf__fail(TF_ERR_STORAGE_FAILED, "cannot move %s into place", rel)) : 0;
-      etag_write(part, NULL);
-      run->done = before + size;
+      etag_write(part, NULL, NULL);
+      set_counted(run, size);
+      installed = !rc;
       break;
     }
     remove(part); /* the full size and not the file: it goes with its validator, and the file is fetched once more */
-    etag_write(part, NULL);
+    etag_write(part, NULL, NULL);
     tf__cause("download", "hash", 0, NULL, NULL);
     rc = tf__fail(TF_ERR_CHECKSUM_MISMATCH, "%s", rel);
     if (++mismatches == 2) break;
   }
+  /* 28.3 item 5, 28.4: the host the file was installed from, or refused or slowed down on, is P (the next file starts
+   * there); when every host asked failed, P stays. A file another host gave after the first was unreachable is the
+   * silent failover report (28.7) */
+  if (installed || answered) {
+    tf__ep_settle(run->ep, TF_EP_MODELS, host, ord.probe);
+    if (k > 0 && first_reason[0]) {
+      /* 28.7: lastFailover however the file ended, back on its first host too; the silent report only when another
+       * host answered */
+      tf__ep_failed_over(run->ep, TF_EP_MODELS, ord.host[0], host, first_reason, first_status);
+      if (strcmp(host, ord.host[0])) {
+        tf__ep_note(TF_EP_MODELS, 1);
+        tf__rep_silent("download", "failover", first_status, NULL, first_reason);
+      }
+    }
+  } else if (first_reason[0]) {
+    /* 28.7: every file whose first host was unreachable, a role of one host and an offline device included */
+    tf__ep_failed_over(run->ep, TF_EP_MODELS, ord.host[0], NULL, first_reason, first_status);
+  }
   if (rc) tf__cause_retries(resumes + (mismatches > 1 ? 1 : 0)); /* 24.2 retries: the resumes of 16.2 */
   free(part);
   free(whole);
+  return rc;
+}
+
+int tf__download_file_test(TfEndpoints *ep, const char *path, const char *rel, long long size, const char *sha_hex, const char *to) {
+  tf__clear_error();
+  TfDownload o = tf__download_defaults();
+  o.key = "qlk_v1_test_aaaaaaaaaaaaaaaaaaaaaa";
+  Shared sh;
+  memset(&sh, 0, sizeof sh);
+  tf_mutex_init(&sh.lock);
+  tf_cond_init(&sh.cv);
+  sh.o = &o;
+  sh.total = size;
+  Run run;
+  memset(&run, 0, sizeof run);
+  run.o = &o;
+  run.sh = &sh;
+  run.ep = ep;
+  snprintf(run.path, sizeof run.path, "%s", path);
+  const int rc = fetch_raw(&run, rel, size, sha_hex, to);
+  tf_cond_destroy(&sh.cv);
+  tf_mutex_destroy(&sh.lock);
   return rc;
 }
 
@@ -500,14 +746,10 @@ static void mkparent(const char *full) {
   free(dir);
 }
 
+/* One entry fetched and checked on a lane (4.0.1: an encrypted entry's CDN form is only downloaded here; the Core
+ * installs it on the caller's thread, after the lease, install_entry) */
 static int fetch_entry(Run *run, const TfJson *f) {
   const TfDownload *o = run->o;
-  /* SDK 4.0: a file only from the lease answer's model folder (a build already here needs none) */
-  if (o->after_manifest && !run->base[0]) {
-    const int rc = tf__fail(TF_ERR_SERVER_REJECTED, "invalid_response: the lease answer names no model folder on Quran Lab's hosts; nothing was downloaded");
-    tf__cause_now(rc, "lease", "invalid_answer", 200, NULL, "invalid_response"); /* a 200 that is not what was asked for */
-    return rc;
-  }
   const char *p = tf_json_str(tf_json_get(f, "path"));
   const long long size = (long long)tf_json_get(f, "size")->num;
   const char *sha = tf_json_str(tf_json_get(f, "sha256"));
@@ -528,12 +770,7 @@ static int fetch_entry(Run *run, const TfJson *f) {
     char *cdn = tf_path_join(o->dest, rel);
     if (!cdn) return tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
     mkparent(cdn);
-    int rc = fetch_raw(run, p, size, sha, cdn);
-    if (!rc && o->install) {
-      rc = o->install(o->hook_user, dp, run->mbytes, run->mn);
-      /* a container the Core refused is fetched again next time; one that waits for a lease stays */
-      if (!rc || rc == TF_ERR_CHECKSUM_MISMATCH || rc == TF_ERR_MODEL_INVALID) remove(cdn);
-    }
+    const int rc = fetch_raw(run, p, size, sha, cdn);
     free(cdn);
     return rc;
   }
@@ -545,7 +782,10 @@ static int fetch_entry(Run *run, const TfJson *f) {
   char *dfull = tf_path_join(o->dest, dp), *gz = tf_path_join(o->dest, p);
   int rc = 0;
   if (!dfull || !gz) rc = tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
-  else if (file_ok(dfull, dsize, dsha)) add_done(run, size);
+  else if (file_ok(dfull, dsize, dsha)) {
+    run->counted = 0;
+    set_counted(run, size);
+  }
   else {
     mkparent(gz);
     mkparent(dfull);
@@ -597,34 +837,259 @@ static int entry_done(const TfDownload *o, const TfJson *f) {
   return ok;
 }
 
+/* ------------------------------------------------------------------ 4.0.1: the lanes */
+#define TF_MAX_LANES 8
+enum { JOB_WAIT = 0, JOB_RUN = 1, JOB_DONE = 2, JOB_FAIL = 3 };
+typedef struct {
+  const TfJson *f;   /* the manifest entry */
+  long long size;    /* as stored */
+  int state;         /* JOB_WAIT, JOB_RUN, JOB_DONE (fetched and checked: the CDN form of an encrypted entry), JOB_FAIL */
+  int touched;       /* this call wrote bytes of it */
+  int rc;            /* its failure, and the error its lane had */
+  TfErrState err;
+} Job;
+typedef struct {
+  Shared sh;
+  TfDownload lo;     /* the lanes' options: the caller's, with the call's stop as the cancel flag */
+  Job *jobs;         /* the files to fetch, largest first */
+  int n;
+  long long done0;   /* the bytes of the files that were in place before any lane ran */
+  char base[512];    /* where the lanes read the files: a folder (a lease's base, or a path) */
+  TfEndpoints *ep;   /* 4.0.1: the models hosts every lane asks */
+  int failed;        /* a job failed: no lane takes another, and the first failure is the call's */
+  int first_fail;
+  int live;          /* lanes running */
+  TfThread th[TF_MAX_LANES];
+  int nth;
+} Pool;
+
+static void lane_main(void *arg) {
+  Pool *pl = (Pool *)arg;
+  Run run;
+  memset(&run, 0, sizeof run);
+  run.o = &pl->lo;
+  run.sh = &pl->sh;
+  run.ep = pl->ep;
+  run.conn = tf__http_conn_open();
+  tf_mutex_lock(&pl->sh.lock);
+  snprintf(run.base, sizeof run.base, "%s", pl->base);
+  tf_mutex_unlock(&pl->sh.lock);
+  folder_of(&run, run.base); /* 4.0.1 (28.4): its path, through the models hosts (the base's own host first) */
+  for (;;) {
+    Job *j = NULL;
+    tf_mutex_lock(&pl->sh.lock);
+    if (!pl->failed && !pl->sh.stop)
+      for (int i = 0; i < pl->n && !j; ++i)
+        if (pl->jobs[i].state == JOB_WAIT) {
+          j = &pl->jobs[i];
+          j->state = JOB_RUN;
+        }
+    tf_mutex_unlock(&pl->sh.lock);
+    if (!j) break;
+    tf__clear_error();
+    const int rc = fetch_entry(&run, j->f);
+    int stop_others = 0;
+    tf_mutex_lock(&pl->sh.lock);
+    j->touched |= run.touched;
+    if (rc) {
+      j->state = JOB_FAIL;
+      j->rc = rc;
+      tf__err_save(&j->err);
+      if (!pl->failed) {
+        pl->failed = 1;
+        pl->first_fail = (int)(j - pl->jobs);
+        stop_others = 1;
+      }
+    } else {
+      j->state = JOB_DONE;
+    }
+    tf_cond_signal(&pl->sh.cv);
+    tf_mutex_unlock(&pl->sh.lock);
+    /* the first failure ends the call: the other lanes' requests in flight end too, their partial files kept */
+    if (stop_others) tf__http_cancel(&pl->sh.stop);
+  }
+  tf__http_conn_close(run.conn);
+  tf_mutex_lock(&pl->sh.lock);
+  pl->live--;
+  tf_cond_signal(&pl->sh.cv);
+  tf_mutex_unlock(&pl->sh.lock);
+}
+
+/* the lanes start on `base` (at most tf__download_lanes, one per job at most); the count started, 0 when no thread
+ * could start (the caller then runs one lane itself) */
+static int pool_start(Pool *pl, const char *base) {
+  pl->sh.stop = 0;
+  pl->failed = 0;
+  pl->first_fail = -1;
+  snprintf(pl->base, sizeof pl->base, "%s", base ? base : "");
+  int want = tf__download_lanes < 1 ? 1 : tf__download_lanes > TF_MAX_LANES ? TF_MAX_LANES : tf__download_lanes;
+  if (want > pl->n) want = pl->n;
+  tf_mutex_lock(&pl->sh.lock);
+  for (pl->nth = 0; pl->nth < want; ++pl->nth) {
+    if (tf_thread_start(&pl->th[pl->nth], lane_main, pl)) break;
+    pl->live++;
+  }
+  tf_mutex_unlock(&pl->sh.lock);
+  return pl->nth;
+}
+static void pool_join(Pool *pl) {
+  for (int i = 0; i < pl->nth; ++i) tf_thread_join(pl->th[i]);
+  pl->nth = 0;
+}
+
+/* everything one entry's fetch may have left in dest: the file, its partial file, validator and whole file beside it
+ * (an encrypted entry: its CDN form; a gzip entry: the stored file and the decoded one) */
+static void remove_with_parts(const char *full) {
+  if (!full) return;
+  static const char *const sfx[] = {"", ".part", ".part.etag", ".part.new", ".inflate"};
+  for (size_t i = 0; i < sizeof sfx / sizeof sfx[0]; ++i) {
+    const size_t n = strlen(full) + strlen(sfx[i]) + 1;
+    char *p = (char *)malloc(n);
+    if (!p) continue;
+    snprintf(p, n, "%s%s", full, sfx[i]);
+    remove(p);
+    free(p);
+  }
+}
+static void remove_entry(const TfDownload *o, const TfJson *f) {
+  const char *p = tf_json_str(tf_json_get(f, "path")), *enc = tf_json_str(tf_json_get(f, "encoding"));
+  const char *dp = tf_json_str(tf_json_get(tf_json_get(f, "decoded"), "path"));
+  if (enc && !strcmp(enc, "qle1") && dp) {
+    char rel[1100];
+    snprintf(rel, sizeof rel, "cdn/%s.qle", dp);
+    char *cdn = tf_path_join(o->dest, rel);
+    remove_with_parts(cdn);
+    free(cdn);
+    return;
+  }
+  char *full = tf_path_join(o->dest, p);
+  remove_with_parts(full);
+  free(full);
+  if (enc && !strcmp(enc, "gzip") && dp) {
+    char *d = tf_path_join(o->dest, dp);
+    remove_with_parts(d);
+    free(d);
+  }
+}
+/* the lanes stopped, and every file this call fetched removed (a lease that did not come, or named another folder):
+ * the jobs wait again from nothing */
+static void pool_drop(Pool *pl, const TfDownload *o) {
+  tf__http_cancel(&pl->sh.stop);
+  pool_join(pl);
+  for (int i = 0; i < pl->n; ++i) {
+    if (pl->jobs[i].touched) remove_entry(o, pl->jobs[i].f);
+    pl->jobs[i].state = JOB_WAIT;
+    pl->jobs[i].touched = 0;
+    pl->jobs[i].rc = 0;
+  }
+  tf_mutex_lock(&pl->sh.lock);
+  pl->sh.done = pl->done0;
+  pl->failed = 0;
+  pl->first_fail = -1;
+  pl->live = 0;
+  pl->sh.stop = 0;
+  tf_mutex_unlock(&pl->sh.lock);
+}
+/* the progress on the caller's thread: the bytes of the files asked for that are here */
+static void report_progress(Pool *pl, long long *last) {
+  const TfDownload *o = pl->sh.o;
+  if (!o->progress) return;
+  tf_mutex_lock(&pl->sh.lock);
+  const long long d = pl->sh.done, t = pl->sh.total;
+  tf_mutex_unlock(&pl->sh.lock);
+  if (d == *last) return;
+  *last = d;
+  o->progress(o->user, d > t ? t : d < 0 ? 0 : d, t);
+}
+/* Waits until job j is fetched (0), the lanes failed (1: the first failure is the call's), or they all ended without
+ * it (2: the call was cancelled). The progress is reported while waiting, and a cancel of the caller (its Client
+ * going) ends the lanes. */
+static int wait_job(Pool *pl, Job *j, long long *last) {
+  const TfDownload *o = pl->sh.o;
+  for (;;) {
+    tf_mutex_lock(&pl->sh.lock);
+    if (j->state != JOB_DONE && !pl->failed && pl->live > 0) tf_cond_wait_ms(&pl->sh.cv, &pl->sh.lock, 100);
+    const int st = j->state, failed = pl->failed, live = pl->live;
+    tf_mutex_unlock(&pl->sh.lock);
+    report_progress(pl, last);
+    if (st == JOB_DONE) return 0;
+    if (failed) return 1;
+    if (live <= 0) return 2;
+    if (o->cancel && *o->cancel && !pl->sh.stop) tf__http_cancel(&pl->sh.stop);
+  }
+}
+/* the Core installs an encrypted entry's CDN form (on the caller's thread, after the lease); 0 for a plain entry */
+static int install_entry(const TfDownload *o, const TfJson *f, const char *mbytes, size_t mn) {
+  const char *enc = tf_json_str(tf_json_get(f, "encoding"));
+  if (!enc || strcmp(enc, "qle1") || !o->install) return 0;
+  const char *dp = tf_json_str(tf_json_get(tf_json_get(f, "decoded"), "path"));
+  const int rc = o->install(o->hook_user, dp, mbytes, mn);
+  /* a container the Core refused is fetched again next time; one that waits for a lease stays */
+  if (!rc || rc == TF_ERR_CHECKSUM_MISMATCH || rc == TF_ERR_MODEL_INVALID) {
+    char rel[1100];
+    snprintf(rel, sizeof rel, "cdn/%s.qle", dp);
+    char *cdn = tf_path_join(o->dest, rel);
+    if (cdn) remove(cdn);
+    free(cdn);
+  }
+  return rc;
+}
+
 int tf__download_model(const TfDownload *opt) {
   tf__clear_error();
   TfDownload o = opt ? *opt : tf__download_defaults();
-  if (!o.cdn_url) o.cdn_url = "https://cdn.quranlab.ai/models";
   if (!o.repo) o.repo = "Quran-Lab/tajweedformer-v4";
   if (!o.folder) o.folder = "sdk/v4.0";
   if (!o.revision || !o.dest || !o.key) return tf__fail(TF_ERR_INVALID_ARGUMENT, "a key, a build and a destination folder are required");
   if (tf_mkdirs(o.dest)) return on_storage(tf__fail(TF_ERR_STORAGE_FAILED, "cannot create %s", o.dest));
+  Pool pl;
+  memset(&pl, 0, sizeof pl);
+  tf_mutex_init(&pl.sh.lock);
+  tf_cond_init(&pl.sh.cv);
+  pl.sh.o = &o;
+  pl.lo = o;
+  pl.lo.cancel = &pl.sh.stop;
+  pl.lo.progress = NULL;
+  pl.first_fail = -1;
   Run run;
   memset(&run, 0, sizeof run);
   run.o = &o;
-  /* 3.1.3: one connection for the whole download, opened by the manifest's request and closed below (without
-   * one, each request opens its own, as before) */
+  run.sh = &pl.sh;
+  /* 4.0.1 (28.4): the Client's models hosts (the downloader's own tests: a set of their own, cdn_url their one host)
+   * and the build's folder: the held lease's for the build, else the one qlab-api names for it */
+  TfEndpoints *own_ep = NULL;
+  run.ep = pl.ep = o.client ? tf__client_endpoints(o.client) : (own_ep = tf__ep_new(NULL, o.cdn_url));
+  char mfolder[600] = "";
+  if (o.base_hint && folder_of(&run, o.base_hint)) snprintf(mfolder, sizeof mfolder, "%s", o.base_hint);
+  else if (!tf__model_folder(mfolder, sizeof mfolder, tf__ep_prefix(run.ep), o.repo, o.revision, o.folder)) folder_of(&run, mfolder);
+  else mfolder[0] = 0;
+  if (!run.ep || !mfolder[0]) {
+    tf__ep_free(own_ep);
+    tf_cond_destroy(&pl.sh.cv);
+    tf_mutex_destroy(&pl.sh.lock);
+    return tf__fail(run.ep ? TF_ERR_INVALID_ARGUMENT : TF_ERR_ENGINE_FAILED, run.ep ? "the model folder of %s is too long" : "out of memory", o.revision);
+  }
+  /* 3.1.3: a kept connection for the manifest (each lane keeps its own for the files) */
   run.conn = tf__http_conn_open();
   TfHttpResponse r;
-  /* The manifest is asked once: there is no partial file to go on from, nothing is lost when the call ends
-   * here, and a start with a model on disk is not held up when the model host does not answer. */
+  /* The manifest is asked once (of the models hosts in their order): there is no partial file to go on from,
+   * nothing is lost when the call ends here, and a start with a model on disk is not held up when no model host
+   * answers. */
   Xfer mx;
   memset(&mx, 0, sizeof mx);
   mx.run = &run;
   int net = 0;
-  int rc = get(&run, "manifest.json", &mx, NULL, &r, &net);
+  int rc = get(&run, NULL, "manifest.json", &mx, NULL, &r, &net);
   if (!rc && r.status != 200) {
     rc = http_error(&run, "manifest.json", &r);
     tf_http_response_free(&r);
   }
+  tf__http_conn_close(run.conn);
+  run.conn = NULL;
   if (rc) {
-    tf__http_conn_close(run.conn);
+    tf__ep_free(own_ep);
+    tf_cond_destroy(&pl.sh.cv);
+    tf_mutex_destroy(&pl.sh.lock);
     return rc;
   }
   /* the same acceptance checks, in the same order, as an open from disk (tf__manifest_accept) */
@@ -648,6 +1113,13 @@ int tf__download_model(const TfDownload *opt) {
         (enc && (!strcmp(enc, "gzip") || !strcmp(enc, "qle1")) && (!dp || !tf_json_is_int(tf_json_get(d, "size")) || !tf_json_str(tf_json_get(d, "sha256")))))
       rc = tf__fail(TF_ERR_MODEL_INVALID, "manifest.json lists a path that is not inside the folder");
   }
+  /* 4.0.1: the build's key id is the one the signed config names beside it (18.4.5), checked before any file is asked
+   * for (the lease hook checks it too) */
+  if (!rc && o.want_key_id) {
+    const char *kid = tf_json_str(tf_json_get(tf_json_get(m, "encryption"), "key_id"));
+    if (!kid || strcmp(kid, o.want_key_id))
+      rc = tf__fail(TF_ERR_MODEL_INVALID, "the manifest names key id %s, the signed config named %s", kid ? kid : "none", o.want_key_id);
+  }
   /* a context this build does not have (the config's inference.context is written for every build): the build's
    * default instead, the same choice the Model makes (inference.context in the shared vectors) */
   char fallback[32] = "";
@@ -663,11 +1135,14 @@ int tf__download_model(const TfDownload *opt) {
       const char *dc = tf_json_str(tf_json_get(m, "default_context"));
       snprintf(fallback, sizeof fallback, "%s", dc ? dc : "c16_l64");
       o.contexts = fallback;
+      pl.lo.contexts = fallback;
     }
   }
-  /* what is asked for, and how many bytes of it (as stored) */
+  /* what is asked for, and how many bytes of it (as stored); the files not in place yet are the jobs */
   char *want = !rc ? (char *)calloc((size_t)files->n + 1, 1) : NULL;
-  if (!rc && !want) rc = tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
+  int *jix = !rc ? (int *)malloc(((size_t)files->n + 1) * sizeof(int)) : NULL;
+  pl.jobs = !rc ? (Job *)calloc((size_t)files->n + 1, sizeof(Job)) : NULL;
+  if (!rc && (!want || !jix || !pl.jobs)) rc = tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
   long long missing = 0, room = 0;
   for (int i = 0; !rc && i < files->n; ++i) {
     const TfJson *f = &files->kids[i];
@@ -679,15 +1154,21 @@ int tf__download_model(const TfDownload *opt) {
     want[i] = (char)w;
     if (!w) continue;
     const long long size = (long long)tf_json_get(f, "size")->num;
-    run.total += size;
-    if (!entry_done(&o, f)) {
-      const TfJson *d = tf_json_get(f, "decoded");
-      const long long dsize = d ? (long long)tf_json_get(d, "size")->num : 0;
-      missing += size;
-      if (dsize > room) room = dsize; /* a gzip file and its decoded copy (a CDN form and its device form) are on disk together for a moment */
+    pl.sh.total += size;
+    if (entry_done(&o, f)) {
+      pl.done0 += size;
+      continue;
     }
+    const TfJson *d = tf_json_get(f, "decoded");
+    const long long dsize = d ? (long long)tf_json_get(d, "size")->num : 0;
+    missing += size;
+    if (dsize > room) room = dsize; /* a gzip file and its decoded copy (a CDN form and its device form) are on disk together for a moment */
+    pl.jobs[pl.n].f = f;
+    pl.jobs[pl.n].size = size;
+    pl.n++;
   }
-  if (!rc && o.only_role && run.total == 0) rc = tf__fail(TF_ERR_MODEL_MISSING, "this build has no %s data", o.only_role);
+  pl.sh.done = pl.done0;
+  if (!rc && o.only_role && pl.sh.total == 0) rc = tf__fail(TF_ERR_MODEL_MISSING, "this build has no %s data", o.only_role);
   if (!rc && missing > 0) {
     /* SPEC 13.4: not enough space is its own error, before any byte is fetched */
     const long long avail = tf__free_bytes(o.dest);
@@ -696,32 +1177,104 @@ int tf__download_model(const TfDownload *opt) {
       tf__cause_now(rc, "download", "quota", 0, NULL, NULL);
     }
   }
+  /* 4.0.1: the lanes take the largest file first (the weights start at once, the small files fill the other lanes): a
+   * stable insertion sort, the manifest's order among equal sizes; jix maps a manifest entry to its job */
+  if (!rc) {
+    for (int a = 1; a < pl.n; ++a) {
+      const Job t = pl.jobs[a];
+      int b = a - 1;
+      while (b >= 0 && pl.jobs[b].size < t.size) {
+        pl.jobs[b + 1] = pl.jobs[b];
+        b--;
+      }
+      pl.jobs[b + 1] = t;
+    }
+    for (int i = 0; i < files->n; ++i) jix[i] = -1;
+    for (int k = 0; k < pl.n; ++k)
+      for (int i = 0; i < files->n; ++i)
+        if (&files->kids[i] == pl.jobs[k].f) jix[i] = k;
+  }
+  /* 4.0.1: with a lease hook, the lanes start before it from the build's folder the manifest came from (through the
+   * models hosts) while the hook makes the install key, attests and asks the lease on this thread */
+  char prebase[600] = "";
+  int started = 0, inline_lane = 0;
+  if (!rc && pl.n > 0 && o.after_manifest && tf__download_early) snprintf(prebase, sizeof prebase, "%s", mfolder);
+  if (!rc && pl.n > 0 && (!o.after_manifest || prebase[0])) {
+    started = pool_start(&pl, o.after_manifest ? prebase : mfolder);
+    if (!started && !o.after_manifest) inline_lane = 1; /* no thread: one lane on this thread */
+  }
   /* SDK 4.0: the lease before any container is installed (the Core needs it), with the manifest just accepted */
-  run.mbytes = r.body;
-  run.mn = r.body_n;
   if (!rc && o.after_manifest) {
     rc = o.after_manifest(o.hook_user, r.body, r.body_n, m, run.base, sizeof run.base);
     const size_t bl = strlen(run.base);
-    if (bl && run.base[bl - 1] != '/') run.base[0] = 0; /* a folder, or the host's URLs */
+    /* 4.0.1 (28.4): the files from the lease answer's folder, through the models hosts (its host first when it is
+     * not one of them); a base that names no folder downloads nothing */
+    if (bl && (run.base[bl - 1] != '/' || !folder_of(&run, run.base))) run.base[0] = 0;
+    /* SDK 4.0: a file only from the lease answer's model folder (a build already here needs none) */
+    if (!rc && pl.n > 0 && !run.base[0]) {
+      rc = tf__fail(TF_ERR_SERVER_REJECTED, "invalid_response: the lease answer names no model folder on Quran Lab's hosts; nothing was downloaded");
+      tf__cause_now(rc, "lease", "invalid_answer", 200, NULL, "invalid_response"); /* a 200 that is not what was asked for */
+    }
+    if (rc) {
+      /* no lease: nothing the lanes fetched stays */
+      if (started) pool_drop(&pl, &o);
+      started = 0;
+    } else if (started && !same_folder(run.base, prebase)) {
+      /* the lease answer names another folder: what came from the host goes, and the files come from that folder */
+      pool_drop(&pl, &o);
+      started = 0;
+    }
+    if (!rc && pl.n > 0 && !started) {
+      started = pool_start(&pl, run.base);
+      if (!started) inline_lane = 1;
+    }
   }
-  if (!rc && o.progress) o.progress(o.user, 0, run.total);
-  /* the build's layout first: the Core keys the install mark of the weights with it (18.7.4) */
-  for (int pass = 0; pass < 2; ++pass)
+  if (!rc && inline_lane) {
+    snprintf(pl.base, sizeof pl.base, "%s", o.after_manifest ? run.base : mfolder);
+    pl.live = 1;
+    lane_main(&pl);
+  }
+  long long last = -1;
+  if (!rc) report_progress(&pl, &last);
+  /* the installs, on this thread, each file once its lane has it: the build's layout first (the Core keys the install
+   * mark of the weights with it, 18.7.4), then the manifest's order */
+  int lane_failed = 0;
+  for (int pass = 0; pass < 2 && !rc; ++pass)
     for (int i = 0; !rc && i < files->n; ++i) {
       const char *role = tf_json_str(tf_json_get(&files->kids[i], "role"));
       const int layout = role && !strcmp(role, "layout");
-      if (want[i] && layout == (pass == 0)) rc = entry_done(&o, &files->kids[i]) ? (add_done(&run, (long long)tf_json_get(&files->kids[i], "size")->num), 0)
-                                                                                  : fetch_entry(&run, &files->kids[i]);
+      if (!want[i] || layout != (pass == 0) || jix[i] < 0) continue;
+      const int w = wait_job(&pl, &pl.jobs[jix[i]], &last);
+      if (w == 1) {
+        lane_failed = 1;
+        rc = TF_ERR_DOWNLOAD_FAILED;
+      } else if (w == 2) {
+        rc = tf__fail(TF_ERR_DOWNLOAD_FAILED, "the download was cancelled");
+      } else {
+        rc = install_entry(&o, &files->kids[i], r.body, r.body_n);
+      }
     }
+  if (rc && started) tf__http_cancel(&pl.sh.stop);
+  pool_join(&pl);
+  if (lane_failed) {
+    /* the first file that failed is the call's error, as its lane had it */
+    const Job *j = &pl.jobs[pl.first_fail >= 0 ? pl.first_fail : 0];
+    tf__err_restore(&j->err);
+    rc = j->rc ? j->rc : tf__fail(TF_ERR_DOWNLOAD_FAILED, "a file could not be downloaded");
+  }
   free(want);
+  free(jix);
+  free(pl.jobs);
   if (!rc) {
     char *mp = tf_path_join(o.dest, "manifest.json");
     if (!mp || tf_write_file(mp, r.body, r.body_n)) rc = on_storage(tf__fail(TF_ERR_STORAGE_FAILED, "cannot write manifest.json in %s", o.dest));
     free(mp);
-    if (!rc && o.progress) o.progress(o.user, run.total, run.total);
+    if (!rc && o.progress) o.progress(o.user, pl.sh.total, pl.sh.total);
   }
   tf_json_free(m);
   tf_http_response_free(&r);
-  tf__http_conn_close(run.conn);
+  tf__ep_free(own_ep);
+  tf_cond_destroy(&pl.sh.cv);
+  tf_mutex_destroy(&pl.sh.lock);
   return rc;
 }

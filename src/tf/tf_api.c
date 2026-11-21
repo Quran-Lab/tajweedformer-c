@@ -105,9 +105,18 @@ static char *default_storage(const char *app_id) {
 /* NULL in every app: Quran Lab's key. tf__client_create_with_key sets it for one call (tests). */
 static _Thread_local const char *t_create_key;
 
-TfClient *tf_client_create(const TfClientOptions *options) {
+TfClient *tf_client_create(const TfClientOptions *options) { return tf_client_create2(options, NULL); }
+
+/* APP_VERSION_40.md 27.4: a field of ext is read only when it lies wholly within ext->size (an app built against an
+ * older header has a smaller struct); a size below 4 is no TfClientOptionsExt */
+#define EXT_HAS(ext, field) ((ext) && (size_t)(ext)->size >= offsetof(TfClientOptionsExt, field) + sizeof((ext)->field))
+TfClient *tf_client_create2(const TfClientOptions *options, const TfClientOptionsExt *ext) {
   tf__clear_error();
   if (tf__runtime_check()) return NULL;
+  if (ext && ext->size < 4) {
+    tf__fail(TF_ERR_INVALID_ARGUMENT, "TfClientOptionsExt.size is %u: set it to sizeof(TfClientOptionsExt)", (unsigned)ext->size);
+    return NULL;
+  }
   if (!options || !options->key || !*options->key) {
     tf__fail(TF_ERR_INVALID_ARGUMENT, "TfClientOptions.key is required (the desktop key from sdk.quranlab.ai)");
     return NULL;
@@ -130,6 +139,7 @@ TfClient *tf_client_create(const TfClientOptions *options) {
   cfg.key = options->key;
   cfg.app_id = options->app_id;
   cfg.app_version = options->app_version;
+  cfg.app_build = EXT_HAS(ext, app_build) ? ext->app_build : NULL; /* 4.0.1: cleaned and copied by tf__client_open */
   cfg.storage_dir = own ? own : options->storage;
   cfg.language = options->language;
   cfg.on_consent = options->on_consent;
@@ -206,8 +216,11 @@ int tf__client_model_release(TfClient *c, TfModel *m) {
 
 /* tests only: the key tf_client_create gives the client for the signed config and the manifest */
 TfClient *tf__client_create_with_key(const TfClientOptions *options, const char *trusted_key_hex) {
+  return tf__client_create2_with_key(options, NULL, trusted_key_hex);
+}
+TfClient *tf__client_create2_with_key(const TfClientOptions *options, const TfClientOptionsExt *ext, const char *trusted_key_hex) {
   t_create_key = trusted_key_hex;
-  TfClient *c = tf_client_create(options);
+  TfClient *c = tf_client_create2(options, ext);
   t_create_key = NULL;
   return c;
 }
@@ -462,7 +475,8 @@ int tf_client_diagnose(TfClient *c, TfDiagnosis *out) {
     if (pm && ls.has_lease && ls.exp > 0) tf_buf_printf(&b, "%lld", (long long)ls.exp);
     else tf_buf_puts(&b, "null");
     /* contract sdk_4.0.0 DIAGNOSIS_40 (section 25): the class from the lease's flags bit 3 (18.4.6: accelerator
-     * programs, the 7-day class), never from exp - iat (18.4.7.2); the refresh time; the grace's end (18.4.7.1) */
+     * programs, the attested class: "attested", else "standard"), never from exp - iat (18.4.7.2: how long a lease
+     * lasts is the server's, qlab-api lease_days); the refresh time; the grace's end (18.4.7.1) */
     const int held = pm && ls.has_lease && !ls.stopped && strcmp(lease, "none") != 0;
     int accel = -1;
     if (held) {
@@ -471,7 +485,7 @@ int tf_client_diagnose(TfClient *c, TfDiagnosis *out) {
       tf__pm_unlock(pm);
     }
     tf_buf_puts(&b, ",\"leaseClass\":");
-    tf_buf_puts(&b, accel == 1 ? "\"7d\"" : accel == 0 ? "\"24h\"" : "null");
+    tf_buf_puts(&b, accel == 1 ? "\"attested\"" : accel == 0 ? "\"standard\"" : "null");
     tf_buf_puts(&b, ",\"refreshAfter\":");
     if (held && ls.refresh_after > 0) tf_buf_printf(&b, "%lld", (long long)ls.refresh_after);
     else tf_buf_puts(&b, "null");
@@ -482,6 +496,16 @@ int tf_client_diagnose(TfClient *c, TfDiagnosis *out) {
     tf_buf_json_str(&b, qlc_version());
     tf_buf_puts(&b, "}");
     tf__clear_error();
+  }
+  /* 4.0.1 (DIAGNOSIS_40.md 25.3, ENDPOINTS_40.md 28.7): the host each role's next request asks first, and the last
+   * request of this process that found its first host unreachable; Quran Lab's hosts only, never a path or a key */
+  {
+    char *ep = tf__ep_diag_json(tf__client_endpoints(c));
+    if (ep) {
+      tf_buf_puts(&b, ",\"endpoints\":");
+      tf_buf_puts(&b, ep);
+    }
+    free(ep);
   }
   tf_buf_puts(&b, "}");
   free(storage);
