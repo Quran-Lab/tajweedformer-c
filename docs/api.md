@@ -32,7 +32,7 @@ Five things, with the same names and the same order of calls as the Android, App
 
 Every options struct (`TfClientOptions`, `TfModelOptions`, `TfPrefetchOptions`, `TfSessionOptions`) may be NULL or
 zeroed: zero is the default of every field. Strings and arrays returned as `const` belong to the object they came
-from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"4.0.2"`.
+from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"4.0.3"`.
 
 ## Errors
 

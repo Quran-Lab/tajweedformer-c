@@ -277,6 +277,17 @@ if(TF_CONTRACT)
     # Client destroyed while its Model and Session are in use
     add_test(NAME tf40_lifetime COMMAND tf40_tests lifetime "${TF_WORK}/nowait40" "${TF_WORK}/tf40_lifetime")
     set_tests_properties(tf40_lifetime PROPERTIES FIXTURES_REQUIRED "tf_work;tf_nowait40" TIMEOUT 1500)
+    # 4.0.3: the Core's one open model is the storage folder's (lifetime_open). It needs real model opens, so an
+    # encrypted test build: TF_TESTBUILD, a folder made by quranlab-core's tools/make_test_build.py (cdn/sdk/v4.0 and
+    # install_key.der; never inside a repository)
+    set(TF_TESTBUILD "" CACHE PATH "an encrypted test build (make_test_build.py) for the tests that open the model")
+    if(TF_TESTBUILD)
+      add_test(NAME tf40_open_data COMMAND ${Python3_EXECUTABLE} -I "${CMAKE_CURRENT_SOURCE_DIR}/test/make_flow40.py" --contract "${TF_C40}"
+               --out "${TF_WORK}/open40" --testbuild "${TF_TESTBUILD}")
+      set_tests_properties(tf40_open_data PROPERTIES FIXTURES_SETUP tf_open40 FIXTURES_REQUIRED tf_work TIMEOUT 120)
+      add_test(NAME tf40_lifetime_open COMMAND tf40_tests lifetime_open "${TF_WORK}/open40" "${TF_WORK}/tf40_lifetime_open")
+      set_tests_properties(tf40_lifetime_open PROPERTIES FIXTURES_REQUIRED "tf_work;tf_open40" TIMEOUT 900)
+    endif()
     set_tests_properties(tf40_flow tf40_lanes tf40_switches tf40_share_moments tf40_share_flac tf40_errors_flow tf40_lease_clock tf40_grace
                          tf40_app27 tf40_endpoints tf40_loopback PROPERTIES FIXTURES_REQUIRED "tf_work;tf_flow40" TIMEOUT 600)
   endif()
@@ -332,7 +343,8 @@ add_test(NAME tf_crypto COMMAND tf_tests crypto)
 add_test(NAME tf_share_write COMMAND tf_tests share_write "${TF_DATA}/sdk_4.0.0/share_write_40.json" "${TF_WORK}/share_write")
 get_property(_all DIRECTORY PROPERTY TESTS)
 list(REMOVE_ITEM _all tf40_production_sha256 tf40_production_pin tf_work_clean tf40_flow tf40_lanes tf40_flow_data tf40_switches tf40_share_moments tf40_share_flac tf40_errors_flow tf40_lease_clock tf40_grace tf40_grace_data tf40_grace_vectors
-            tf40_app27 tf40_endpoints tf40_loopback tf40_nowait_data tf40_no_wait tf40_load tf40_requests tf40_hosts tf40_lifetime)
+            tf40_app27 tf40_endpoints tf40_loopback tf40_nowait_data tf40_no_wait tf40_load tf40_requests tf40_hosts tf40_lifetime
+            tf40_open_data tf40_lifetime_open)
 set_tests_properties(${_all} PROPERTIES FIXTURES_REQUIRED tf_work LABELS library TIMEOUT 600)
 if(Python3_FOUND)
   add_test(NAME tf_api_scan COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test/api_scan.py")

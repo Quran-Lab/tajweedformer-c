@@ -65,7 +65,7 @@ Copy the setup prompt from [sdk.quranlab.ai](https://sdk.quranlab.ai) and paste 
   V4.1 on is published only encrypted, for SDK 4.0 and later.
 - **Coming from 3.x:** [docs/migrating-to-4.md](docs/migrating-to-4.md) says what changes. SDK 3.x stops receiving the
   V4 model on 15 January 2027, 00:00 UTC.
-- **Status:** 4.0.2 (2026-11-22). 4.0.0 was built and tested on Windows x86-64 (MinGW-w64 GCC 13): the 35
+- **Status:** 4.0.3 (2026-11-22). 4.0.0 was built and tested on Windows x86-64 (MinGW-w64 GCC 13): the 35
   conformance clips through the whole 4.0 path (download, install, the model key, the Core) give outputs byte-identical to the 3.1.3 C SDK's; the
   contract's 4.0 vectors (lease, clock, container, attest proof) and a stand-in server's flow pass. Linux x86-64:
   built and tested on every change (GCC, the full `ctest` against the Core's test release for `linux-x64`); the
@@ -79,10 +79,10 @@ hands out its weights or keys. The SDKs around it are open source.
 
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
-| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR), the exact CPU engine on every phone | Android 8.0+ on arm64-v8a and armeabi-v7a | Maven Central `ai.quranlab:tajweedformer:4.0.1` |
-| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "4.0.1"`, product `TajweedFormer` |
+| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR), the exact CPU engine on every phone | Android 8.0+ on arm64-v8a and armeabi-v7a | Maven Central `ai.quranlab:tajweedformer:4.0.2` |
+| [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "4.0.3"`, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | Web SDK: a hosted loader, and the engine in Quran Lab's frame on your page | Browsers, and Node for desktop apps | `<script src="https://web.quranlab.ai/4/loader.js">`, or `npm install @quran-lab/tajweedformer` |
-| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C library and CLI | Windows, Linux (x86-64) | CMake `FetchContent`, tag 4.0.2 |
+| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C library and CLI | Windows, Linux (x86-64) | CMake `FetchContent`, tag 4.0.3 |
 | [tajweedformer-flutter](https://github.com/Quran-Lab/tajweedformer-flutter) | Flutter plugin over the Android and Apple SDKs | Android and iOS | pub.dev, `flutter pub add quranlab_tajweedformer` |
 
 The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), encrypted end to end, hosted by Quran Lab and served by
@@ -94,8 +94,8 @@ revision your learners get, and see the problems your app's learners hit.
 
 The library builds from this repository's tag inside your project, over the Quran Lab Core, which is not built from
 source: download the Core's binary for your target from the release's folder,
-`https://cdn.quranlab.ai/sdk/native/4.0.2/` (`qlcore-4.0.2-windows-x64.zip` with `qlcore.dll` and
-`libwinpthread-1.dll`, or `qlcore-4.0.2-linux-x64.tar.gz` with `qlcore.so`; `SHA256SUMS` beside them), and unpack
+`https://cdn.quranlab.ai/sdk/native/4.0.3/` (`qlcore-4.0.3-windows-x64.zip` with `qlcore.dll` and
+`libwinpthread-1.dll`, or `qlcore-4.0.3-linux-x64.tar.gz` with `qlcore.so`; `SHA256SUMS` beside them), and unpack
 it into a folder of your project, here `qlcore/`. `CMakeLists.txt`:
 
 ```cmake
@@ -106,7 +106,7 @@ include(FetchContent)
 set(QLCORE_DIR "${CMAKE_SOURCE_DIR}/qlcore" CACHE PATH "the Core's binary for this target")
 FetchContent_Declare(tajweedformer
   GIT_REPOSITORY https://github.com/Quran-Lab/tajweedformer-c.git
-  GIT_TAG        4.0.2)
+  GIT_TAG        4.0.3)
 FetchContent_MakeAvailable(tajweedformer)
 
 add_executable(quickstart quickstart.c)
@@ -266,7 +266,7 @@ where it says `...`. The output is plain ASCII: the units' letters are `\u` esca
 The last line holds the totals:
 
 ```json
-{"total":{"files":6,"evaluated":6,"failed":0,"with_reference":6,"audio_s":27.507,"processing_s":7.804,"rtf":0.2837,"units":{"ref":138,"hyp":143,"sub":3,"del":0,"ins":5,"rate":0.057971},"words":{"ref":25,"wrong":2,"rate":0.080000},"sdk":"4.0.2","model":"4.1.0","context":"c16_l64","threads":2}}
+{"total":{"files":6,"evaluated":6,"failed":0,"with_reference":6,"audio_s":27.507,"processing_s":7.804,"rtf":0.2837,"units":{"ref":138,"hyp":143,"sub":3,"del":0,"ins":5,"rate":0.057971},"words":{"ref":25,"wrong":2,"rate":0.080000},"sdk":"4.0.3","model":"4.1.0","context":"c16_l64","threads":2}}
 ```
 
 `transcript` is what the public API gives: the decoded text, each unit with its id, time and confidence, and the
@@ -378,6 +378,13 @@ folder holds ciphertext bound to this install, and the key that opens it never e
   `$XDG_DATA_HOME/<app_id>/tajweedformer`) holds the containers, the Core's state, the install's identity and the
   SDK's own state. Nothing in it opens outside this install. `tf_client_remove_models` removes the model files.
 - **A Session is one take**; a process runs one take at a time (`tajweedformer serve` runs one process per take).
+- **One open model per storage folder (4.0.3).** A Model the app keeps after its Client's destroy and the Model of a
+  newer Client on the same folder share that folder's engine: the one that needs it takes it over while the other has
+  no take running, and the other opens it again for its next take. While the other's take runs, a call that needs the
+  engine (`tf_client_model`, `tf_session_create`, `tf_reference_fetch`, `tf_reference_units`) waits for that take to
+  end for up to 3 s, then fails with `TF_ERR_SESSION_OPEN`. On Windows a call on a GUI thread never waits: it fails
+  with `TF_ERR_SESSION_OPEN` at once. Linux has no UI-thread notion, so there the call may wait up to 3 s on any
+  thread: make it off the UI thread.
 - **The diagnose report** (`tf_client_diagnose_json`) adds `"protected"` (the contract's section 25): which key store
   holds the keys, the state of this install's model key (`lease`, `leaseExpires`, `leaseClass`, `refreshAfter`,
   `graceUntil`), and the Core's release. From 4.0.1 it also names the servers in use (`"endpoints"`).
@@ -524,7 +531,10 @@ events after a 429;
 `tf_client_destroy` while a model key request is in flight), `tf40_lifetime` (a call after an object's end: a Session
 after its Model's close, a Model given out twice after its Client's destroy, a late report after the destroy, one Core
 per storage folder, a verified stop then a restart offline, and 1000 rounds of a destroy while the Model and Session
-are in use on another thread; built with AddressSanitizer too on Linux),
+are in use on another thread; built with AddressSanitizer too on Linux), `tf40_lifetime_open` (with `TF_TESTBUILD`, an
+encrypted test build, so real model opens: a Model kept after its Client's destroy and a newer Client's Model on the
+same folder, a take waited for, a UI thread that never waits, the reference data beside the other Model; AddressSanitizer
+too on Linux),
 `tf_share_write` (section 29's `share_write_40.json`: a write that fails keeps the finished segments), the
 3.x library tests that need no model (client, sharing, consent, bitrate, telemetry, sdk_latest, errors, crypto), and
 with `TF_CONTRACT` (a quranlab-contract checkout; its test keys only, never a server's): `tf40_lease`, `tf40_clock`,

@@ -73,6 +73,11 @@
  *   tf40_tests no_wait <flow40> <nowait40> <test/data/sdk_4.0.0> <work>   4.0.2, NO_WAIT_40.md (section 33): the
  *                                           no_wait_40.json cases that name c against the stand-in, the platform's
  *                                           connection report set to each case's (tf40_nowait_tests.inc)
+ *   tf40_tests lifetime <nowait40> <work>   4.0.2: a call after an object's end, one Core per storage folder, the
+ *                                           1000-round destroy stress (tf40_lifetime_tests.inc)
+ *   tf40_tests lifetime_open <fixture> <work>   4.0.3, on the encrypted test build: the Core's one open model is the
+ *                                           folder's; a Client made after another's destroy opens beside its kept
+ *                                           Model (tf40_lifetime_tests.inc)
  * <vectors>: the contract's sdk_4.0.0/vectors. Nothing here reaches a network: every request goes to the stand-in. */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
@@ -3369,6 +3374,7 @@ int main(int argc, char **argv) {
   if (!strcmp(t, "requests")) return t_requests(argv[2], argv[3]);
   if (!strcmp(t, "hosts") && argc >= 5) return t_hosts(argv[2], argv[3], argv[4]);
   if (!strcmp(t, "lifetime") && argc >= 4) return t_lifetime(argv[2], argv[3]);
+  if (!strcmp(t, "lifetime_open") && argc >= 4) return t_lifetime_open(argv[2], argv[3]);
   fprintf(stderr, "unknown test %s\n", t);
   return 2;
 }

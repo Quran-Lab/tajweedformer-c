@@ -13,7 +13,7 @@
 <p align="center">
   <img alt="platform: Linux, Windows" src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-1c1b19?style=flat-square">
   <img alt="bit-exact: 35 of 35 parity clips" src="https://img.shields.io/badge/bit--exact-35%2F35%20parity%20clips-2a3b8f?style=flat-square">
-  <img alt="version: 4.0.2" src="https://img.shields.io/badge/version-4.0.2-2a3b8f?style=flat-square">
+  <img alt="version: 4.0.3" src="https://img.shields.io/badge/version-4.0.3-2a3b8f?style=flat-square">
   <img alt="model licence: NPL-1.2" src="https://img.shields.io/badge/model%20licence-NPL--1.2-1c1b19?style=flat-square">
 </p>
 
@@ -80,8 +80,8 @@ Copy the setup prompt from [sdk.quranlab.ai](https://sdk.quranlab.ai/go/gh-tajwe
 
 The library builds from this repository's tag inside your project, over the Quran Lab Core, which is not built from
 source: download the Core's binary for your target from the release's folder,
-`https://cdn.quranlab.ai/sdk/native/4.0.2/` (`qlcore-4.0.2-windows-x64.zip` with `qlcore.dll` and
-`libwinpthread-1.dll`, or `qlcore-4.0.2-linux-x64.tar.gz` with `qlcore.so`; `SHA256SUMS` beside them), and unpack
+`https://cdn.quranlab.ai/sdk/native/4.0.3/` (`qlcore-4.0.3-windows-x64.zip` with `qlcore.dll` and
+`libwinpthread-1.dll`, or `qlcore-4.0.3-linux-x64.tar.gz` with `qlcore.so`; `SHA256SUMS` beside them), and unpack
 it into a folder of your project, here `qlcore/`. `CMakeLists.txt`:
 
 ```cmake
@@ -92,7 +92,7 @@ include(FetchContent)
 set(QLCORE_DIR "${CMAKE_SOURCE_DIR}/qlcore" CACHE PATH "the Core's binary for this target")
 FetchContent_Declare(tajweedformer
   GIT_REPOSITORY https://github.com/Quran-Lab/tajweedformer-c.git
-  GIT_TAG        4.0.2)
+  GIT_TAG        4.0.3)
 FetchContent_MakeAvailable(tajweedformer)
 
 add_executable(quickstart quickstart.c)
@@ -252,7 +252,7 @@ where it says `...`. The output is plain ASCII: the units' letters are `\u` esca
 The last line holds the totals:
 
 ```json
-{"total":{"files":6,"evaluated":6,"failed":0,"with_reference":6,"audio_s":27.507,"processing_s":7.804,"rtf":0.2837,"units":{"ref":138,"hyp":143,"sub":3,"del":0,"ins":5,"rate":0.057971},"words":{"ref":25,"wrong":2,"rate":0.080000},"sdk":"4.0.2","model":"4.1.0","context":"c16_l64","threads":2}}
+{"total":{"files":6,"evaluated":6,"failed":0,"with_reference":6,"audio_s":27.507,"processing_s":7.804,"rtf":0.2837,"units":{"ref":138,"hyp":143,"sub":3,"del":0,"ins":5,"rate":0.057971},"words":{"ref":25,"wrong":2,"rate":0.080000},"sdk":"4.0.3","model":"4.1.0","context":"c16_l64","threads":2}}
 ```
 
 `transcript` is what the public API gives: the decoded text, each unit with its id, time and confidence, and the

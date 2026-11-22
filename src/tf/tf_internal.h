@@ -558,6 +558,16 @@ qlc_model *tf__model_engine(TfModel *m);
 int tf__model_set_session(TfModel *m, TfSession *s);
 void tf__model_clear_session(TfModel *m, TfSession *s);
 void tf__model_session_gone(TfModel *m);
+/* 4.0.3: a call that uses the Model's engine (a take's start, a reference read) claims it: the folder's open model is
+ * not given to another Model of the folder while a claim or a take of this one is open. Another Model's take is
+ * waited for up to tf__open_wait_s (seconds), then TF_ERR_SESSION_OPEN. */
+void tf__model_engine_claim(TfModel *m);
+void tf__model_engine_unclaim(TfModel *m);
+extern double tf__open_wait_s;
+/* 4.0.3: the calling thread is an app's UI thread (Windows: IsGUIThread), where that wait is not made: session_open at
+ * once. tf__ui_thread_hook: tests only, answers in its place */
+int tf__ui_thread(void);
+extern int (*tf__ui_thread_hook)(void);
 double tf__model_load_ms(TfModel *m); /* how long the last engine open took; 0 once read */
 /* a manifest entry as it is kept on disk (the decoded file of a gzip entry), by its local path; NULL when not listed */
 const TfJson *tf__model_listed(const TfModel *m, const char *path);
@@ -785,6 +795,12 @@ void tf__pm_tick(TfClient *c, const char *build_dir, const char *build);
 int tf__pm_install(TfPm *p, const char *build_dir, const char *manifest, size_t mn, const char *decoded_path);
 qlc_model *tf__pm_open(TfPm *p, const char *build_dir, const char *manifest, size_t mn, const char *context, int threads, int rate, int pin);
 void tf__pm_close(TfPm *p, qlc_model *m);
+/* 4.0.3: the folder's one open model (tf_lease.c): its holder, under the host's lock (tf__pm_lock) */
+TfModel *tf__pm_holder(TfPm *p);
+void tf__pm_set_holder(TfPm *p, TfModel *m);
+void tf__pm_wait(TfPm *p, long ms);              /* under the host's lock, taken once */
+void tf__pm_notify(TfPm *p);
+void tf__pm_close_held(TfPm *p, qlc_model *m);   /* under the host's lock */
 int tf__pm_status(TfPm *p, qlc_lease_status *s);
 void tf__pm_lock(TfPm *p);
 void tf__pm_unlock(TfPm *p);

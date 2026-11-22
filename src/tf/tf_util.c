@@ -751,6 +751,21 @@ double tf__now_s(void) {
   return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 #endif
 }
+/* 4.0.3: whether the calling thread is an app's UI thread, where nothing may wait for another Model's take (every SDK's
+ * rule): on Windows a GUI thread (IsGUIThread(FALSE); user32 is looked up, never loaded: a process without it has no
+ * GUI thread). Linux has no such notion: 0. Tests answer with tf__ui_thread_hook. */
+int (*tf__ui_thread_hook)(void);
+int tf__ui_thread(void) {
+  if (tf__ui_thread_hook) return tf__ui_thread_hook() != 0;
+#ifdef _WIN32
+  typedef BOOL(WINAPI * IsGuiFn)(BOOL);
+  HMODULE u = GetModuleHandleW(L"user32.dll");
+  IsGuiFn f = u ? (IsGuiFn)(void (*)(void))GetProcAddress(u, "IsGUIThread") : NULL;
+  return f && f(FALSE) ? 1 : 0;
+#else
+  return 0;
+#endif
+}
 const char *tf__platform_name(void) {
 #ifdef _WIN32
   return "windows";
