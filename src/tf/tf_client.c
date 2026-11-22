@@ -60,6 +60,11 @@ struct TfClient {
   long long token_exp;
   int stopped;         /* a stop code this launch: no more network calls */
   volatile int cancel; /* the client is being destroyed: requests in flight are abandoned */
+  /* 4.0.2: calls of a Model or Session that reach this Client hold it (tf__client_hold); tf_client_destroy frees it
+   * only once none does */
+  TfMutex hlock;
+  TfCond hcv;
+  int holds;
   char download_protocol[12]; /* 3.1.3: what the last model request ran on ("h2"), "" before the first; in
                                  memory only, for the diagnosis */
   char *config;        /* the last verified config body */
@@ -453,6 +458,14 @@ static int call_locked(TfClient *c, const Call *k, TfHttpResponse *r) {
   if (c->stopped) return tf__fail(TF__ERR_NOT_AVAILABLE, "network calls are stopped for this launch");
   if (!c->key) return tf__fail(TF__ERR_NOT_AVAILABLE, "no developer key");
   const char *stage = route_stage(k->path);
+  /* 4.0.2 (ENDPOINTS_40.md 28.11 item 4): telemetry, error reports and uploads wait after a 429; while the route
+   * waits no request goes out and the call ends as that 429 did (its queue keeps what it holds) */
+  const int optional = tf__ep_optional(k->path);
+  const long long wait = optional >= 0 ? tf__ep_slow_left(tf__client_endpoints(c), optional) : 0;
+  if (wait > 0) {
+    tf__ep_gated(r, 429, wait, "rate_limited");
+    return 0;
+  }
   for (int attempt = 0; attempt < 2; ++attempt) {
     if (k->auth && ensure_token(c)) return tf__error_code();
     char auth[1200];
@@ -527,6 +540,8 @@ static int call_locked(TfClient *c, const Call *k, TfHttpResponse *r) {
     }
     break;
   }
+  if (optional >= 0 && r->status == 429) tf__ep_slow_429(tf__client_endpoints(c), optional, r->retry_after);
+  else if (optional >= 0 && r->status >= 200 && r->status < 300) tf__ep_slow_ok(tf__client_endpoints(c), optional);
   if (r->status >= 400 && !t_no_gate) {
     char why[48];
     if (classify_stop(c, r)) c->stopped = 1;
@@ -701,6 +716,8 @@ TfClient *tf__client_open(const TfClientConfig *opt) {
   tf_mutex_init(&c->send_lock);
   tf_mutex_init(&c->tm);
   tf_cond_init(&c->tcv);
+  tf_mutex_init(&c->hlock);
+  tf_cond_init(&c->hcv);
   c->o = o;
   c->key = dupstr(o.key);
   c->app_id = dupstr(o.app_id);
@@ -717,6 +734,11 @@ TfClient *tf__client_open(const TfClientConfig *opt) {
   tf__clean27(o.app_build, c->q_build);
   c->o.app_build = NULL; /* the app's string is not kept: q_build holds what is sent */
   c->dir = dupstr(o.storage_dir);
+  if (c->ep && c->dir) { /* 4.0.2 (28.11 item 3): the Retry-After holds an earlier process kept */
+    char *hp = tf_path_join(c->dir, "holds.json");
+    tf__ep_holds_file(c->ep, hp);
+    free(hp);
+  }
   c->language = dupstr(o.language ? o.language : "en");
   c->o.key = c->key;
   c->o.app_id = c->app_id;
@@ -769,6 +791,25 @@ TfClient *tf__client_open(const TfClientConfig *opt) {
 static void timer_stop(TfClient *c);
 static int telemetry_send_point(TfClient *c);
 
+/* 4.0.2: a Model's or Session's call holds the Client while it uses it (taken under the Model's link, so never after
+ * the Client's destroy detached the Model); the destroy waits until no call holds it, then frees it */
+void tf__client_hold(TfClient *c) {
+  tf_mutex_lock(&c->hlock);
+  c->holds++;
+  tf_mutex_unlock(&c->hlock);
+}
+void tf__client_unhold(TfClient *c) {
+  if (!c) return;
+  tf_mutex_lock(&c->hlock);
+  if (--c->holds == 0) tf_cond_signal(&c->hcv);
+  tf_mutex_unlock(&c->hlock);
+}
+void tf__client_wait_unheld(TfClient *c) {
+  tf_mutex_lock(&c->hlock);
+  while (c->holds > 0) tf_cond_wait_ms(&c->hcv, &c->hlock, 100);
+  tf_mutex_unlock(&c->hlock);
+}
+
 void tf__client_cancel_calls(TfClient *c, int on) {
   if (on) {
     tf__http_cancel(&c->cancel);
@@ -803,6 +844,8 @@ void tf__client_close(TfClient *c) {
   free(c->config);
   tf_cond_destroy(&c->tcv);
   tf_mutex_destroy(&c->tm);
+  tf_cond_destroy(&c->hcv);
+  tf_mutex_destroy(&c->hlock);
   tf_mutex_destroy(&c->send_lock);
   tf_mutex_destroy(&c->tlock);
   tf_mutex_destroy(&c->lock);
@@ -1221,10 +1264,17 @@ typedef struct {
     long long fr[6]; /* 24.8 failure_reasons, kFailure's order */
   } dl[MAX_DOWNLOADS];
   int n_dl;
+  /* 4.0.2 (STEERING_40.md 34.6): per models host, the day's model requests, kept from the first start; sent only
+   * while tf__telemetry_hosts is set */
+  struct {
+    char host[TF_EP_HOST];
+    long long files, bytes, requests, unreachable, hedged, slow_switches, ttfb[9], kbps[10];
+  } hs[TF_HOSTS_MAX];
+  int n_hs;
 } Day;
 static int day_empty(const Day *d) {
   long long any = d->n + d->launches + d->ayahs + d->words + d->share_asked + d->share_yes + d->share_no + d->n_rules + d->n_dl + d->app_ayahs + d->j_ayahs +
-                  d->j_unpaired + d->repeat_ayahs + d->lease_ok;
+                  d->j_unpaired + d->repeat_ayahs + d->lease_ok + (tf__telemetry_hosts ? d->n_hs : 0);
   for (int s = 1; s <= 114; ++s) any += d->surah_ayahs[s] + d->app_surah_ayahs[s];
   for (int i = 0; i < 6; ++i) any += d->rt[i];
   for (int i = 0; i < 31; ++i) any += d->juz[i];
@@ -1363,6 +1413,27 @@ static void day_load_file(const TfClient *c, const char *name, Day *d) {
     d->dl[d->n_dl].resumed = num(x, "resumed");
     read_arr(tf_json_get(x, "failure_reasons"), kFailure, 6, d->dl[d->n_dl].fr);
     d->n_dl++;
+  }
+  /* 34.6: the per-host counts kept on disk (any entry that is not one is left out) */
+  const TfJson *hs = tf_json_get(j, "hosts");
+  for (int i = 0; hs && hs->type == TJ_ARR && i < hs->n && d->n_hs < TF_HOSTS_MAX; ++i) {
+    const TfJson *x = &hs->kids[i];
+    const char *h = tf_json_str(tf_json_get(x, "host"));
+    if (!h || strlen(h) >= TF_EP_HOST || !tf__ep_host_allowed(h, strlen(h))) continue;
+    memset(&d->hs[d->n_hs], 0, sizeof d->hs[0]);
+    snprintf(d->hs[d->n_hs].host, sizeof d->hs[0].host, "%s", h);
+    d->hs[d->n_hs].files = num(x, "files");
+    d->hs[d->n_hs].bytes = num(x, "bytes");
+    d->hs[d->n_hs].requests = num(x, "requests");
+    d->hs[d->n_hs].unreachable = num(x, "unreachable");
+    d->hs[d->n_hs].hedged = num(x, "hedged");
+    d->hs[d->n_hs].slow_switches = num(x, "slow_switches");
+    const TfJson *tb = tf_json_get(x, "ttfb_ms"), *kb = tf_json_get(x, "kbps");
+    for (int k = 0; tb && tb->type == TJ_ARR && k < 9 && k < tb->n; ++k)
+      d->hs[d->n_hs].ttfb[k] = tb->kids[k].type == TJ_NUM && tb->kids[k].num > 0 ? (long long)tb->kids[k].num : 0;
+    for (int k = 0; kb && kb->type == TJ_ARR && k < 10 && k < kb->n; ++k)
+      d->hs[d->n_hs].kbps[k] = kb->kids[k].type == TJ_NUM && kb->kids[k].num > 0 ? (long long)kb->kids[k].num : 0;
+    d->n_hs++;
   }
   d->share_yes = num(j, "share_yes");
   d->share_no = num(j, "share_no");
@@ -1511,6 +1582,22 @@ static char *day_body(const TfClient *c, const char *day, const Day *d, const ch
     tf_buf_puts(&b, "}");
   }
   if (d->n_dl) tf_buf_puts(&b, "]");
+  /* 34.6: kept on disk always; in a delta to send only while tf__telemetry_hosts is set (the server's /v1/events is a
+   * closed object that does not take `hosts` yet) */
+  if (d->n_hs && (!report_id || tf__telemetry_hosts)) {
+    tf_buf_puts(&b, ",\"hosts\":[");
+    for (int i = 0; i < d->n_hs; ++i) {
+      tf_buf_printf(&b, "%s{\"role\":\"models\",\"host\":", i ? "," : "");
+      tf_buf_json_str(&b, d->hs[i].host);
+      tf_buf_printf(&b, ",\"files\":%lld,\"bytes\":%lld,\"requests\":%lld,\"unreachable\":%lld,\"hedged\":%lld,\"slow_switches\":%lld,\"ttfb_ms\":[",
+                    d->hs[i].files, d->hs[i].bytes, d->hs[i].requests, d->hs[i].unreachable, d->hs[i].hedged, d->hs[i].slow_switches);
+      for (int k = 0; k < 9; ++k) tf_buf_printf(&b, "%s%lld", k ? "," : "", d->hs[i].ttfb[k]);
+      tf_buf_puts(&b, "],\"kbps\":[");
+      for (int k = 0; k < 10; ++k) tf_buf_printf(&b, "%s%lld", k ? "," : "", d->hs[i].kbps[k]);
+      tf_buf_puts(&b, "]}");
+    }
+    tf_buf_puts(&b, "]");
+  }
   if (report_id) tf_buf_printf(&b, ",\"report_id\":\"%s\"", report_id);
   write_count(&b, "launches", d->launches);
   write_count(&b, "ayahs", d->ayahs > 0 ? d->ayahs : 0);
@@ -1729,6 +1816,78 @@ void tf__client_count_download(TfClient *c, const char *version, const char *bui
     day_save(c, day, &d);
   }
   tf_mutex_unlock(&c->tlock);
+}
+
+/* 4.0.2 (STEERING_40.md 34.6): per models host per UTC day, sent in `hosts` (the server takes it from 2026-11-21);
+ * 0 keeps them on the device and sends none */
+int tf__telemetry_hosts = 1;
+double (*tf__dl_clock)(void);
+double tf__dl_now(void) { return tf__dl_clock ? tf__dl_clock() : tf__now_s(); }
+static const double kTtfbMs[8] = {100, 250, 500, 1000, 1500, 3000, 6000, 10000};
+static const double kKbps[9] = {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192};
+void tf__client_count_host(TfClient *c, const char *host, int unreachable, double ttfb_ms, long long bytes, double body_s, int file_done) {
+  if (!c || !host || strlen(host) >= TF_EP_HOST || !tf__ep_host_allowed(host, strlen(host)) || !tf__client_telemetry_on(c)) return;
+  tf_mutex_lock(&c->tlock);
+  char day[11];
+  day_utc(day, 0);
+  Day d;
+  day_load(c, day, &d);
+  int k = 0;
+  while (k < d.n_hs && strcmp(d.hs[k].host, host)) ++k;
+  if (k == d.n_hs && d.n_hs < TF_HOSTS_MAX) { /* at most 8 hosts a day: a ninth is counted nowhere */
+    memset(&d.hs[k], 0, sizeof d.hs[k]);
+    snprintf(d.hs[k].host, sizeof d.hs[k].host, "%s", host);
+    d.n_hs++;
+  }
+  if (k < d.n_hs) {
+    d.hs[k].files += file_done != 0;
+    if (file_done < 2) { /* 2: a file's last byte noted alone, no request of its own */
+      d.hs[k].requests++;
+      d.hs[k].unreachable += unreachable != 0;
+      d.hs[k].bytes += bytes > 0 ? bytes : 0;
+      if (ttfb_ms >= 0) {
+        int b = 0;
+        while (b < 8 && ttfb_ms >= kTtfbMs[b]) ++b;
+        d.hs[k].ttfb[b]++;
+      }
+      /* each transfer of at least 256 KiB: its average rate over its body, in kB/s (1000 bytes) */
+      if (bytes >= 256 * 1024 && body_s > 0) {
+        const double kbs = (double)bytes / 1000.0 / body_s;
+        int b = 0;
+        while (b < 9 && kbs >= kKbps[b]) ++b;
+        d.hs[k].kbps[b]++;
+      }
+    }
+    day_save(c, day, &d);
+  }
+  tf_mutex_unlock(&c->tlock);
+}
+/* 34.6's check, as the server's (tools/steering40.py telemetry_problem): NULL when `hosts` may be sent, else why not */
+const char *tf__hosts_problem(const TfJson *hosts) {
+  static const char *const fields[] = {"role", "host", "files", "bytes", "requests", "unreachable", "hedged", "slow_switches", "ttfb_ms", "kbps"};
+  if (!hosts || hosts->type != TJ_ARR || hosts->n > TF_HOSTS_MAX) return "hosts: a list of at most 8";
+  for (int i = 0; i < hosts->n; ++i) {
+    const TfJson *h = &hosts->kids[i];
+    if (h->type != TJ_OBJ || h->n != 10) return "exactly the ten fields";
+    for (int f = 0; f < 10; ++f)
+      if (!tf_json_get(h, fields[f])) return "exactly the ten fields";
+    const char *role = tf_json_str(tf_json_get(h, "role")), *host = tf_json_str(tf_json_get(h, "host"));
+    if (!role || strcmp(role, "models")) return "role: models";
+    if (!host || !tf__ep_host_allowed(host, strlen(host))) return "host: a host of the allow-list";
+    for (int j = 0; j < i; ++j)
+      if (!strcmp(tf_json_str(tf_json_get(&hosts->kids[j], "host")) ? tf_json_str(tf_json_get(&hosts->kids[j], "host")) : "", host)) return "a host twice";
+    for (int f = 2; f < 8; ++f) {
+      const TfJson *v = tf_json_get(h, fields[f]);
+      if (!tf_json_is_int(v) || v->num < 0) return "a whole number, 0 or more";
+    }
+    for (int f = 8; f < 10; ++f) {
+      const TfJson *v = tf_json_get(h, fields[f]);
+      if (!v || v->type != TJ_ARR || v->n != (f == 8 ? 9 : 10)) return "a bucket list of its length";
+      for (int k = 0; k < v->n; ++k)
+        if (!tf_json_is_int(&v->kids[k]) || v->kids[k].num < 0) return "a bucket list of whole numbers";
+    }
+  }
+  return NULL;
 }
 
 /* App-reported (SPEC 6.3), counted into today's sums as the app's fallback (4.0: app_ayahs). Validated by the

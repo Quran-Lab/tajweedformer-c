@@ -127,6 +127,19 @@ struct TfEndpoints {
     char from[TF_EP_HOST], to[TF_EP_HOST], reason[20];
     long long at;
   } last; /* 28.7 lastFailover */
+  /* 4.0.2 (28.11 item 2): a host's Retry-After for a route: no request of that route goes to that host before `until`
+   * (gate_now: unix seconds); `slow` when it came with a 429, which no other host may answer either (28.3); `err` the
+   * answer's error, so a call that meets the hold fails as that answer did */
+  struct {
+    int role, slow;
+    char route[TF_EP_ROUTE], host[TF_EP_HOST], err[33];
+    double until;
+  } gate[TF_EP_GATES];
+  struct {
+    int row;
+    double until;
+  } slow[3];   /* 4.0.2 (28.11 item 4): events, issues, uploads after a 429 */
+  char *holds; /* 28.11 item 3: where the holds and rows are kept across restarts (<storage>/holds.json), or NULL */
 };
 
 /* a test's override URL: scheme://authority[/path]; its authority is the role's one host name */
@@ -158,6 +171,7 @@ TfEndpoints *tf__ep_new(const char *api_url, const char *cdn_url) {
 }
 void tf__ep_free(TfEndpoints *e) {
   if (!e) return;
+  free(e->holds);
   tf_mutex_destroy(&e->lock);
   free(e);
 }
@@ -299,6 +313,194 @@ static int json_or_empty(const TfHttpResponse *r) {
   tf_json_free(j);
   return ok;
 }
+/* ------------------------------------------------------------------ 28.11: Retry-After per route and host (4.0.2) */
+/* the holds' clock: unix seconds (kept across restarts); a test's endpoint clock when it sets one */
+static double gate_now(void) { return tf__ep_now_override > 0 ? tf__ep_now_override : (double)wall_s(); }
+/* the route of a request: the lease's two requests are one route, an upload's every request another; on the models
+ * role each file path is its own (28.11 item 2, contract e330c08: a standby's 503 with Retry-After for a file it does
+ * not hold, an accelerator build, holds that path on that host and never the other files there); else the API path
+ * without its query. A path too long for the route is cut, which only ever holds more paths together, never fewer. */
+void tf__ep_route(int role, const char *path, char out[TF_EP_ROUTE]) {
+  if (!path) snprintf(out, TF_EP_ROUTE, "?");
+  else if (role == TF_EP_MODELS) snprintf(out, TF_EP_ROUTE, "%.*s", (int)strcspn(path, "?"), path);
+  else if (!strcmp(path, "/v1/attest/challenge") || !strcmp(path, "/v1/model-key")) snprintf(out, TF_EP_ROUTE, "lease");
+  else if (!strncmp(path, "/v1/uploads", 11)) snprintf(out, TF_EP_ROUTE, "uploads");
+  else snprintf(out, TF_EP_ROUTE, "%.*s", (int)strcspn(path, "?"), path);
+}
+static int token_ok(const char *s) {
+  if (!s || !*s || strlen(s) > 32) return 0;
+  for (const char *q = s; *q; ++q)
+    if (!((*q >= 'a' && *q <= 'z') || (*q >= '0' && *q <= '9') || *q == '_')) return 0;
+  return 1;
+}
+/* 28.11 item 3: the holds and the optional routes' rows, written whenever one changes (with e->lock held) */
+static void holds_save(TfEndpoints *e) {
+  if (!e->holds) return;
+  const double now = gate_now();
+  TfBuf b;
+  tf_buf_init(&b);
+  tf_buf_puts(&b, "{\"v\":1,\"holds\":[");
+  int n = 0;
+  for (int i = 0; i < TF_EP_GATES; ++i) {
+    if (e->gate[i].until <= now) continue;
+    tf_buf_printf(&b, "%s{\"role\":%d,\"slow\":%d,\"route\":", n++ ? "," : "", e->gate[i].role, e->gate[i].slow);
+    tf_buf_json_str(&b, e->gate[i].route);
+    tf_buf_puts(&b, ",\"host\":");
+    tf_buf_json_str(&b, e->gate[i].host);
+    tf_buf_puts(&b, ",\"error\":");
+    tf_buf_json_str(&b, e->gate[i].err);
+    tf_buf_printf(&b, ",\"until\":%lld}", (long long)e->gate[i].until);
+  }
+  tf_buf_puts(&b, "],\"rows\":[");
+  for (int k = 0; k < 3; ++k) tf_buf_printf(&b, "%s{\"row\":%d,\"until\":%lld}", k ? "," : "", e->slow[k].row, (long long)e->slow[k].until);
+  tf_buf_puts(&b, "]}\n");
+  if (b.p) tf_write_file(e->holds, b.p, b.n);
+  tf_buf_free(&b);
+}
+/* a time kept by an earlier process: one more than 21600 s ahead (a clock that moved back) ends now */
+static double kept_until(const TfJson *v, double now) {
+  const double u = v && v->type == TJ_NUM ? v->num : 0;
+  return u > now + 21600 ? now : u;
+}
+void tf__ep_holds_file(TfEndpoints *e, const char *path) {
+  if (!e || !path) return;
+  tf_mutex_lock(&e->lock);
+  free(e->holds);
+  e->holds = (char *)malloc(strlen(path) + 1);
+  if (e->holds) strcpy(e->holds, path);
+  char *text = NULL;
+  size_t n = 0;
+  TfJson *j = !tf_read_file(path, &text, &n) ? tf_json_parse(text, n, NULL) : NULL;
+  const double now = gate_now();
+  const TfJson *h = tf_json_get(j, "holds"), *rows = tf_json_get(j, "rows");
+  int g = 0;
+  for (int i = 0; h && h->type == TJ_ARR && i < h->n && g < TF_EP_GATES; ++i) {
+    const TfJson *x = &h->kids[i];
+    const char *route = tf_json_str(tf_json_get(x, "route")), *host = tf_json_str(tf_json_get(x, "host")), *err = tf_json_str(tf_json_get(x, "error"));
+    const TfJson *role = tf_json_get(x, "role"), *slow = tf_json_get(x, "slow");
+    const double until = kept_until(tf_json_get(x, "until"), now);
+    if (!route || strlen(route) >= TF_EP_ROUTE || !host || strlen(host) >= TF_EP_HOST || !role || role->type != TJ_NUM || until <= now) continue;
+    e->gate[g].role = role->num == TF_EP_MODELS ? TF_EP_MODELS : TF_EP_API;
+    e->gate[g].slow = slow && slow->type == TJ_NUM && slow->num != 0;
+    snprintf(e->gate[g].route, sizeof e->gate[g].route, "%s", route);
+    snprintf(e->gate[g].host, sizeof e->gate[g].host, "%s", host);
+    snprintf(e->gate[g].err, sizeof e->gate[g].err, "%s", token_ok(err) ? err : "");
+    e->gate[g++].until = until;
+  }
+  for (int k = 0; rows && rows->type == TJ_ARR && k < 3 && k < rows->n; ++k) {
+    const TfJson *row = tf_json_get(&rows->kids[k], "row");
+    const int r = row && row->type == TJ_NUM && row->num > 0 && row->num <= 30 ? (int)row->num : 0;
+    e->slow[k].row = r;
+    e->slow[k].until = r ? kept_until(tf_json_get(&rows->kids[k], "until"), now) : 0;
+  }
+  tf_json_free(j);
+  free(text);
+  tf_mutex_unlock(&e->lock);
+}
+void tf__ep_gate_note(TfEndpoints *e, int role, const char *path, const char *host, const TfHttpResponse *r) {
+  if (!e || !host || !r || r->retry_after <= 0 || (r->status != 429 && r->status != 503)) return;
+  char route[TF_EP_ROUTE], err[33] = "";
+  tf__ep_route(role, path, route);
+  if (r->body && r->body_n && r->body_n < 4096) {
+    TfJson *j = tf_json_parse(r->body, r->body_n, NULL);
+    const char *x = tf_json_str(tf_json_get(j, "error"));
+    if (token_ok(x)) snprintf(err, sizeof err, "%s", x);
+    tf_json_free(j);
+  }
+  const double now = gate_now(), until = now + (r->retry_after > 21600 ? 21600 : r->retry_after);
+  tf_mutex_lock(&e->lock);
+  int at = -1, oldest = 0;
+  for (int i = 0; i < TF_EP_GATES && at < 0; ++i)
+    if (e->gate[i].until > 0 && e->gate[i].role == role && !strcmp(e->gate[i].route, route) && !strcmp(e->gate[i].host, host)) at = i;
+  for (int i = 0; i < TF_EP_GATES && at < 0; ++i)
+    if (e->gate[i].until <= now) at = i;
+  for (int i = 1; at < 0 && i < TF_EP_GATES; ++i)
+    if (e->gate[i].until < e->gate[oldest].until) oldest = i;
+  if (at < 0) at = oldest;
+  if (e->gate[at].until <= now || strcmp(e->gate[at].route, route) || strcmp(e->gate[at].host, host) || e->gate[at].role != role ||
+      until > e->gate[at].until) {
+    e->gate[at].role = role;
+    e->gate[at].slow = r->status == 429;
+    snprintf(e->gate[at].route, sizeof e->gate[at].route, "%s", route);
+    snprintf(e->gate[at].host, sizeof e->gate[at].host, "%s", host);
+    snprintf(e->gate[at].err, sizeof e->gate[at].err, "%s", err);
+    e->gate[at].until = until;
+  }
+  holds_save(e);
+  tf_mutex_unlock(&e->lock);
+}
+long long tf__ep_gate(TfEndpoints *e, int role, const char *path, const char *host, int *slow, char err[33]) {
+  if (slow) *slow = 0;
+  if (err) err[0] = 0;
+  if (!e || !host) return 0;
+  char route[TF_EP_ROUTE];
+  tf__ep_route(role, path, route);
+  long long left = 0;
+  tf_mutex_lock(&e->lock);
+  const double now = gate_now();
+  for (int i = 0; i < TF_EP_GATES; ++i)
+    if (e->gate[i].until > now && e->gate[i].role == role && !strcmp(e->gate[i].route, route) && !strcmp(e->gate[i].host, host)) {
+      left = (long long)(e->gate[i].until - now + 0.999);
+      if (slow) *slow = e->gate[i].slow;
+      if (err) snprintf(err, 33, "%s", e->gate[i].err);
+    }
+  tf_mutex_unlock(&e->lock);
+  return left;
+}
+/* 28.11 item 4: optional traffic (telemetry, error reports, shared-recording uploads) after a 429. Its next attempt
+ * waits the larger of the Retry-After (300 s without one) and its own next send point; the wait doubles at each 429
+ * in a row on the route, to 3600 s (a longer Retry-After stands); an accepted answer ends the row. Kept with the
+ * holds across restarts. */
+int tf__ep_optional(const char *path) {
+  if (!path) return -1;
+  if (!strcmp(path, "/v1/events")) return TF_SLOW_EVENTS;
+  if (!strcmp(path, "/v1/issues")) return TF_SLOW_ISSUES;
+  return !strncmp(path, "/v1/uploads", 11) ? TF_SLOW_UPLOADS : -1;
+}
+long long tf__ep_slow_429(TfEndpoints *e, int kind, int retry_after) {
+  if (!e || kind < 0 || kind > 2) return 0;
+  const long long ra = retry_after > 0 ? (retry_after > 21600 ? 21600 : retry_after) : 0;
+  tf_mutex_lock(&e->lock);
+  if (e->slow[kind].row < 30) e->slow[kind].row++;
+  long long wait = ra > 0 ? ra : 300;
+  for (int i = 1; i < e->slow[kind].row && wait < 3600; ++i) wait *= 2;
+  if (wait > 3600) wait = 3600;
+  if (wait < ra) wait = ra;
+  e->slow[kind].until = gate_now() + (double)wait;
+  holds_save(e);
+  tf_mutex_unlock(&e->lock);
+  return wait;
+}
+void tf__ep_slow_ok(TfEndpoints *e, int kind) {
+  if (!e || kind < 0 || kind > 2) return;
+  tf_mutex_lock(&e->lock);
+  const int had = e->slow[kind].row || e->slow[kind].until > 0;
+  e->slow[kind].row = 0;
+  e->slow[kind].until = 0;
+  if (had) holds_save(e);
+  tf_mutex_unlock(&e->lock);
+}
+long long tf__ep_slow_left(TfEndpoints *e, int kind) {
+  if (!e || kind < 0 || kind > 2) return 0;
+  tf_mutex_lock(&e->lock);
+  const double left = e->slow[kind].until - gate_now();
+  tf_mutex_unlock(&e->lock);
+  return left > 0 ? (long long)(left + 0.999) : 0;
+}
+/* an answer no host gave: what a host's hold stands for while it lasts (its status, the error it answered) */
+void tf__ep_gated(TfHttpResponse *r, int status, long long left, const char *err) {
+  memset(r, 0, sizeof *r);
+  r->status = status;
+  r->retry_after = left > 21600 ? 21600 : (int)left;
+  char body[64];
+  const int n = err && *err ? snprintf(body, sizeof body, "{\"error\":\"%s\"}", err) : snprintf(body, sizeof body, "{}");
+  r->body = (char *)malloc((size_t)n + 1);
+  if (r->body) {
+    memcpy(r->body, body, (size_t)n + 1);
+    r->body_n = (size_t)n;
+  }
+}
+
 /* a 4xx is a refusal only with the API's own body: JSON whose `error` is a string */
 static int api_error(const TfHttpResponse *r) {
   if (!r->body || !r->body_n || r->body_n >= 65536) return 0;
@@ -344,7 +546,9 @@ int tf__ep_http(TfEndpoints *e, const TfEpReq *er, TfHttpRequest *q, TfHttpRespo
   memset(&first_state, 0, sizeof first_state);
   TfHttpResponse first;
   memset(&first, 0, sizeof first);
-  int rc_first = -1, max_ra = 0, rc = -1;
+  /* 4.0.2: first_asked, the request asked its first host; n_asked, the hosts it asked; by_asked, it asked the host it
+   * ended on (a host a Retry-After holds, 28.11, is not asked) */
+  int rc_first = -1, max_ra = 0, rc = -1, first_asked = 0, n_asked = 0, by_asked = 0;
   char url[4096], origin[320];
   for (int i = 0; i < ord.n; ++i) {
     if (i > 0 && q->cancel && *q->cancel) break; /* the call is being abandoned: no other host */
@@ -358,12 +562,39 @@ int tf__ep_http(TfEndpoints *e, const TfEpReq *er, TfHttpRequest *q, TfHttpRespo
     q->url = url;
     TfHttpResponse ri;
     memset(&ri, 0, sizeof ri);
-    rc = tf_http(q, &ri);
+    /* 4.0.2 (28.11 item 2): a host whose Retry-After for this route has not passed is not asked: after a 429 the
+     * request ends as that 429 (no other host is asked), after a 503 the next host is */
+    int slow = 0, asked = 0;
+    char err[33];
+    double t_sent = 0, t_end = 0;
+    const long long left = tf__ep_gate(e, er->role, er->path, ord.host[i], &slow, err);
+    if (left > 0) {
+      tf__ep_gated(&ri, slow ? 429 : 503, left, err);
+      rc = 0;
+    } else {
+      t_sent = tf__dl_now();
+      rc = tf_http(q, &ri);
+      t_end = tf__dl_now();
+      asked = 1;
+      n_asked++;
+      first_asked |= i == 0;
+      if (!rc) tf__ep_gate_note(e, er->role, er->path, ord.host[i], &ri);
+    }
     q->timeout_s = timeout0;
     const int cls = tf__ep_class(er, rc, &ri);
+    /* 4.0.2 (STEERING_40.md 34.6, contracts 0d9f5d7 and ec46782): a model request in its Client's per-host counts; the
+     * manifest taken is one of `files` on its host (a small body: its status and body together); unreachable as 28.3
+     * item 3 reads it, never a cancel */
+    if (asked && er->hosts_client && er->role == TF_EP_MODELS) {
+      const int status_came = !rc || tf__http_failure(NULL, NULL) == TF__FAIL_ANSWER;
+      const int cancelled = rc && (tf__http_failure(NULL, NULL) == TF__FAIL_CANCELLED || (q->cancel && *q->cancel));
+      tf__client_count_host(er->hosts_client, ord.host[i], cls == TF_EP_UNREACHABLE && !cancelled, status_came ? (t_end - t_sent) * 1000.0 : -1.0,
+                            rc ? 0 : (long long)ri.body_n, 0, cls == TF_EP_TAKEN);
+    }
     o.asked = i + 1;
     if (cls != TF_EP_UNREACHABLE) {
       o.cls = cls;
+      by_asked = asked;
       snprintf(o.by, sizeof o.by, "%s", ord.host[i]);
       tf__ep_settle(e, er->role, ord.host[i], ord.probe);
       *r = ri;
@@ -381,7 +612,8 @@ int tf__ep_http(TfEndpoints *e, const TfEpReq *er, TfHttpRequest *q, TfHttpRespo
       tf_http_response_free(&ri);
     }
   }
-  o.fallback = o.asked > 1;
+  /* 24.2 (4.0.2): fallback, the request asked more than one host; a host it skipped for a hold is not one of them */
+  o.fallback = n_asked > 1;
   if (o.cls == TF_EP_UNREACHABLE) {
     /* every host asked was unreachable: the first host's answer is the request's (28.3 item 4) */
     *r = first;
@@ -398,9 +630,13 @@ int tf__ep_http(TfEndpoints *e, const TfEpReq *er, TfHttpRequest *q, TfHttpRespo
     tf__error_restore(before, 0);
     if (o.asked > 1) {
       tf__ep_failed_over(e, er->role, ord.host[0], o.by, o.first_reason, o.first_status);
-      /* 28.7, 24.1 item 2: answered on another host after the first was unreachable, silently reported */
-      tf__ep_note(er->role, 1);
-      if (er->stage) tf__rep_silent(er->stage, "failover", o.first_status, NULL, o.first_reason);
+      /* 28.7, 24.1 item 2: answered on another host after the first was unreachable, silently reported, when this
+       * request asked both: a first host it skipped for a Retry-After hold (28.11) is no failover, and a 429 hold on the
+       * next host is no answer of that host */
+      if (er->stage && first_asked && by_asked) {
+        tf__ep_note(er->role, o.fallback);
+        tf__rep_silent(er->stage, "failover", o.first_status, NULL, o.first_reason);
+      }
     }
   }
   tf_http_response_free(&first);

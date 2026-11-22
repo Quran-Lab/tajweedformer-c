@@ -75,7 +75,6 @@ static int fail(TfClient *c, int rc) {
 }
 
 void tf__client_cancel_calls(TfClient *c, int on);
-void tf__model_detach(TfModel *m);
 
 static void launch_thread(void *arg) { tf__client_launch((TfClient *)arg); }
 
@@ -174,6 +173,9 @@ TfClient *tf_client_create2(const TfClientOptions *options, const TfClientOption
 
 void tf_client_destroy(TfClient *c) {
   if (!c) return;
+  /* 4.0.2: a model key request in flight gets up to 3 s to finish, so the lease it brings is kept; then every request in
+   * flight is cancelled */
+  tf__pm_closing(c, TF_CLOSE_LEASE_S);
   Api *a = api(c);
   if (a) {
     /* the launch thread may be inside a request: it is abandoned, not waited for */
@@ -181,12 +183,15 @@ void tf_client_destroy(TfClient *c) {
     if (a->launch_on) tf_thread_join(a->launch);
     api_lock(a);
     if (a->model) {
-      tf__model_detach(a->model); /* a Model that outlives its Client keeps running, alone */
+      /* a Model that outlives its Client keeps running, alone, with the Client's count of its holders (4.0.2) */
+      tf__model_detach(a->model, a->refs);
       a->orphan = 1;
     }
     a->model = NULL;
     api_unlock(a);
   }
+  /* 4.0.2: a call of the Model or its Session that still uses the Client ends before the Client goes */
+  tf__client_wait_unheld(c);
   tf__client_close(c); /* stops the timer, sends what was counted, frees */
   if (a) {
     free(a->storage_json);
@@ -198,6 +203,16 @@ void tf_client_destroy(TfClient *c) {
   spin_lock();
   if (g_client == c) g_client = NULL;
   spin_unlock();
+}
+
+/* tests (tf40_tests lifetime): m as the Client's Model, given out `holders` times */
+void tf__client_test_model(TfClient *c, TfModel *m, int holders) {
+  Api *a = api(c);
+  if (!a) return;
+  api_lock(a);
+  a->model = m;
+  a->refs = holders;
+  api_unlock(a);
 }
 
 /* tf_model_close of a Model the Client gave out: 1 while another holder remains (the Model stays open) */
@@ -275,7 +290,6 @@ int tf_client_prefetch(TfClient *c, const TfPrefetchOptions *options) {
   memset(&f, 0, sizeof f);
   if (options) {
     f.version = options->version;
-    f.unmetered_only = options->unmetered_only;
     f.on_progress = options->on_progress;
     f.user = options->user;
   }

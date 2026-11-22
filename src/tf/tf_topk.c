@@ -97,9 +97,16 @@ TfTopK *tf__session_topk(const TfSession *s, int head, int k) {
   /* the take so far as the Core keeps it (a head the stream does not compute is absent) */
   TfRawHeads all;
   int frames = 0;
-  const float *v = tf__session_take_heads(s, &all) ? NULL : tf__heads_array(&all, head, &frames);
+  /* 4.0.2: read under the streams' lock and copied: another Model's take, or this Model's next, may destroy the
+   * stream once the lock is let go */
+  tf__model_stream_lock();
+  const float *in = tf__session_take_heads(s, &all) ? NULL : tf__heads_array(&all, head, &frames);
+  float *v = in ? (float *)malloc(((size_t)frames * cols + 1) * sizeof(float)) : NULL;
+  if (v) memcpy(v, in, (size_t)frames * cols * sizeof(float));
+  tf__model_stream_unlock();
   if (!v) {
-    tf__fail(TF_ERR_INVALID_ARGUMENT, "%s is not computed by this stream (see TfSessionOptions.heads)", tf_head_info(head)->name);
+    if (in) tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
+    else tf__fail(TF_ERR_INVALID_ARGUMENT, "%s is not computed by this stream (see TfSessionOptions.heads)", tf_head_info(head)->name);
     return NULL;
   }
   int *ids2 = (int *)malloc(((size_t)frames * k2 + 1) * sizeof(int));
@@ -110,6 +117,7 @@ TfTopK *tf__session_topk(const TfSession *s, int head, int k) {
   else t = finish(head, frames, cols, k, k2, ids2, vals2);
   free(ids2);
   free(vals2);
+  free(v);
   return t;
 }
 

@@ -145,6 +145,9 @@ static long long now_s(void) { return tf__now_override ? tf__now_override : (lon
  * wall clock, not a monotonic one: a computer that slept between two takes must not join them. Tests set
  * tf__share_now_ms (0: the system's clock). */
 long long tf__share_now_ms;
+/* tests: every write of a recording fails, as on a full disk: its pages, markers, capture.json,
+ * take list, and the recovery's own rewrite */
+int tf__share_test_disk_full;
 static long long now_ms(void) {
   if (tf__share_now_ms) return tf__share_now_ms;
 #ifdef _WIN32
@@ -287,6 +290,7 @@ static TfJson *read_json(const Share *s, const char *id, const char *name) {
   return j;
 }
 static int write_text(const Share *s, const char *id, const char *name, const char *text) {
+  if (tf__share_test_disk_full) return -1;
   char *p = sess_path(s, id, name);
   const int rc = p ? tf_write_file(p, text, strlen(text)) : -1;
   free(p);
@@ -522,12 +526,16 @@ static int round_gap(long long gap) {
 /* the join window in force: flags.share_join_ms, a whole number 0 to 60000, else 3000 */
 static int join_window(const TfClient *c) { return tf__client_flag_int(c, "share_join_ms", 0, JOIN_MS_MAX, JOIN_MS_DEFAULT); }
 
-static void capture_save(Rec *x, int ended, int completed) {
-  char t[360], codec[48] = "";
+static void capture_text(Rec *x, int ended, int completed, char *t, size_t n) {
+  char codec[48] = "";
   if (x->flac) snprintf(codec, sizeof codec, ",\"codec\":\"flac\",\"rate\":%d", x->input_rate);
-  snprintf(t, sizeof t, "{\"v\":1,\"created\":%lld,\"closed\":%d,\"ended\":%s,\"completed\":%s,\"duration_ms\":%lld,\"pre_skip\":%d,\"samples\":%lld%s}",
+  snprintf(t, n, "{\"v\":1,\"created\":%lld,\"closed\":%d,\"ended\":%s,\"completed\":%s,\"duration_ms\":%lld,\"pre_skip\":%d,\"samples\":%lld%s}",
            x->created, x->closed, ended ? "true" : "false", completed ? "true" : "false", rec_ms(x), x->flac ? 0 : x->enc.pre_skip, x->samples,
            codec);
+}
+static void capture_save(Rec *x, int ended, int completed) {
+  char t[360];
+  capture_text(x, ended, completed, t, sizeof t);
   write_text(sh(x->c), x->id, "capture.json", t);
 }
 /* a FLAC segment closed (its last page written, tf_flac.c): its marker gets the granule of that page */
@@ -567,7 +575,7 @@ static int before_packet(void *user, long long packet) {
   x->next_start = tf_ogg_segment_start(x->next_seg);
   return 0;
 }
-static int put_packet(void *user, const uint8_t *p, int n) { return tf_ogg_packet(&((Rec *)user)->ogg, p, n); }
+static int put_packet(void *user, const uint8_t *p, int n) { return tf__share_test_disk_full ? -1 : tf_ogg_packet(&((Rec *)user)->ogg, p, n); }
 static int put_samples(void *user, const float *x, int n) {
   Rec *s = (Rec *)user;
   return tf_enc_encode(&s->enc, x, n, put_packet, s);
@@ -854,7 +862,7 @@ static void rec_release(Share *s, Rec *o) {
   wake(s);
   free(o);
 }
-/* nothing of the recording is kept: sharing went off, what was shared was deleted, or a write failed */
+/* the recording's writer stops; with rec_drop nothing of it is kept (sharing went off, what was shared was deleted) */
 static void rec_abandon(Rec *o) {
   if (o->flac) tf_flac_abandon(&o->fm);
   else tf_ogg_abandon(&o->ogg);
@@ -865,9 +873,15 @@ static void rec_drop(Share *s, Rec *o) {
   rec_release(s, o);
 }
 /* The end of a recording, as a 2.0.2 session ends: the resampler and the encoder are flushed, the last page gets
- * EOS, capture.json says ended. Nothing is kept when sharing went off, a write failed, or the last take with audio
- * was cancelled and the recording holds under 2 s with no segment closed. Returns the milliseconds kept. */
+ * EOS, capture.json says ended. Nothing is kept when sharing went off, or the last take with audio was cancelled and
+ * the recording holds under 2 s with no segment closed. A recording whose write failed ends through the crash
+ * recovery instead (rec_fail_close: its finished segments stay). Returns the milliseconds kept. */
+static void rec_fail_close(Share *s, Rec *o);
 static int rec_close(Share *s, Rec *o) {
+  if (o->failed && tf__client_sharing_state(o->c)) { /* a write failed: contract section 29 */
+    rec_fail_close(s, o);
+    return 0;
+  }
   int ms = 0;
   const double dur = o->input_rate ? (double)o->samples / o->input_rate : 0;
   const int keep = o->opened && !o->failed && tf__client_sharing_state(o->c) && dur > 0 &&
@@ -999,7 +1013,8 @@ static Rec *rec_open(TfClient *c, Share *s, int rate, const char *route, const c
   return x;
 }
 
-/* audio into the recording's stream; a failed write ends the recording for good (it is deleted when it closes) */
+/* audio into the recording's stream; a failed write ends the recording for good: when it closes, the crash recovery
+ * keeps what was written in whole pages (rec_fail_close, contract section 29) */
 static int rec_encode(Rec *o, const float *pcm, long long n) {
   if (o->flac) {
     /* 19.3: the samples as 16-bit integers, as they were captured (no resampling, no gain, no dither) */
@@ -1008,7 +1023,7 @@ static int rec_encode(Rec *o, const float *pcm, long long n) {
       const int k = n > 4096 ? 4096 : (int)n;
       for (int i = 0; i < k; ++i) q[i] = tf_pcm16(pcm[i]);
       o->samples += k;
-      if (tf_flac_push(&o->fm, q, k)) {
+      if (tf__share_test_disk_full || tf_flac_push(&o->fm, q, k)) {
         o->failed = 1;
         return -1;
       }
@@ -1312,7 +1327,8 @@ static int finish_locked(Share *s, TfShareSession *x, int completed) {
   x->rec = NULL;
   const int take_ms = (int)((double)x->samples / x->input_rate * 1000 + 0.5);
   if (o->failed || !on) {
-    rec_drop(s, o);
+    if (on) rec_fail_close(s, o); /* a write failed: the finished segments stay */
+    else rec_drop(s, o);
     return 0;
   }
   const int win = join_window(x->c);
@@ -1509,7 +1525,7 @@ static void recover(Share *s, const char *id, const TfJson *cap) {
     long long granule = 0;
     const size_t good = whole_pages((const uint8_t *)data, n, &audio, &granule);
     if (audio > 0) {
-      tf_write_file(p, data, good);
+      if (!tf__share_test_disk_full) tf_write_file(p, data, good);
       kept = closed + 1;
       last_granule = granule;
       /* the segment closes at its last whole page, with the bitrate its marker recorded when it opened */
@@ -1542,6 +1558,30 @@ static void recover(Share *s, const char *id, const TfJson *cap) {
            "{\"v\":1,\"created\":%lld,\"closed\":%d,\"ended\":true,\"completed\":false,\"duration_ms\":%lld,\"pre_skip\":%lld,\"recovered\":true%s}",
            created, kept, duration_ms, skip, fl);
   write_text(s, id, "capture.json", t);
+}
+
+/* Contract section 29 (4.0.2): a write of the recording failed (a full disk, an I/O error) while sharing is on. The
+ * recording ends as a crash would, and the crash recovery closes it now: the closed segments stay, the open one keeps
+ * its whole pages (a torn page is cut), and what is kept is a finished recording that the uploader sends, now or at a
+ * later launch. Nothing is kept when no segment had closed, or when its folder is gone (the server refused the
+ * session). If the recovery cannot write either, capture.json stays as the capture last wrote it (not ended), and the
+ * next pass or launch recovers it. Until 4.0.2, finish and close deleted a failed recording whole, closed segments
+ * included; Android, Apple and web already kept them. */
+static void rec_fail_close(Share *s, Rec *o) {
+  rec_abandon(o);
+  char *sp = sess_path(s, o->id, "session.json");
+  const int there = sp && tf_file_exists(sp);
+  free(sp);
+  if (o->closed > 0 && there) {
+    char t[360];
+    capture_text(o, 0, 0, t, sizeof t);
+    TfJson *cap = tf_json_parse(t, strlen(t), NULL);
+    if (cap) recover(s, o->id, cap);
+    tf_json_free(cap);
+  } else {
+    remove_session(s, o->id);
+  }
+  rec_release(s, o);
 }
 
 /* ------------------------------------------------------------------ the uploader */
@@ -1760,6 +1800,13 @@ static void retry(Item *it, const char *why, int immediately, int lng) {
   it->next_at = now_s() + (immediately ? 0 : (long long)(base * (0.8 + 0.4 * frand())));
 }
 
+/* 4.0.2 (ENDPOINTS_40.md 28.11 item 4): after a 429 on the uploads route (its API requests or a PUT) a recording
+ * waits at least as long as the route does: the larger of the Retry-After (300 s without one) and its own backoff,
+ * doubling at each 429 in a row to 3600 s */
+static void route_wait(TfClient *c, Item *it) {
+  const long long left = tf__ep_slow_left(tf__client_endpoints(c), TF_SLOW_UPLOADS);
+  if (left > 0 && it->next_at < now_s() + left) it->next_at = now_s() + left;
+}
 /* outcome of a Worker answer: 1 URLs taken; 0 retry scheduled / paused; -1 the session is gone (deleted) */
 enum { ANS_URLS = 1, ANS_WAIT = 0, ANS_GONE = -1, ANS_OFFLINE = -2 };
 /* 24.1: a shared recording the server refused for good will not be uploaded: a silent report (sharing, the answer's
@@ -1830,6 +1877,7 @@ static int answer(TfClient *c, Share *s, const char *id, Item *it, int call_rc, 
   }
   if (r->status == 401) retry(it, why, it->attempts < 3, 0);
   else if (r->status >= 500 || r->status == 408 || r->status == 425 || r->status == 429) retry(it, why, 0, 0);
+  if (r->status == 429) route_wait(c, it);
   else if (!strcmp(code, "contributions_disabled") || !strcmp(code, "attestation_required")) retry(it, why, 0, 1);
   else {
     live_remove(c, s, id); /* a refused body (an SDK bug) is never retried */
@@ -1862,7 +1910,7 @@ static int fetch_urls(TfClient *c, Share *s, const char *id, Item *it, int from)
 }
 
 /* one PUT of one segment, content-type audio/ogg only (signed into the URL), no credential */
-static int put_segment(Share *s, const char *id, int n, const char *url, int *status) {
+static int put_segment(Share *s, const char *id, int n, const char *url, int *status, int *retry_after) {
   char name[32];
   snprintf(name, sizeof name, "seg-%05d.opus", n);
   char *p = sess_path(s, id, name);
@@ -1878,6 +1926,7 @@ static int put_segment(Share *s, const char *id, int n, const char *url, int *st
   TfHttpResponse r;
   const int rc = p ? tf_http(&q, &r) : -1;
   *status = rc ? 0 : r.status;
+  *retry_after = rc ? 0 : r.retry_after;
   if (!rc) tf_http_response_free(&r);
   free(p);
   return rc;
@@ -1949,6 +1998,7 @@ static int step_takes(TfClient *c, Share *s, const char *id, Item *it) {
   snprintf(why, sizeof why, "takes: HTTP %d", st);
   if (st == 401) tf__client_token_forget(c);
   retry(it, why, st == 401 && it->attempts < 3, 0);
+  if (st == 429) route_wait(c, it);
   live_save(c, s, id, it);
   return 0;
 }
@@ -2111,9 +2161,14 @@ static int step(TfClient *c, Share *s, const char *id) {
     char *url = (char *)malloc(strlen(u->url) + 1);
     if (!url) goto out;
     strcpy(url, u->url);
-    int status = 0;
+    int status = 0, ra = 0;
+    if (tf__ep_slow_left(tf__client_endpoints(c), TF_SLOW_UPLOADS) > 0) { /* 28.11: the route waits after a 429 */
+      free(url);
+      route_wait(c, &it);
+      goto out;
+    }
     /* asked again right before the audio goes: URLs may have been fetched since the look above */
-    const int rc = live(c, s) ? put_segment(s, id, n, url, &status) : -1;
+    const int rc = live(c, s) ? put_segment(s, id, n, url, &status, &ra) : -1;
     free(url);
     if (s->cancel || !live(c, s)) goto out; /* aborted (a stop, the client closing), or sharing went off */
     if (rc) {
@@ -2122,7 +2177,9 @@ static int step(TfClient *c, Share *s, const char *id) {
       stop = 1;
       goto out;
     }
+    if (status == 429) tf__ep_slow_429(tf__client_endpoints(c), TF_SLOW_UPLOADS, ra);
     if (status >= 200 && status < 300) {
+      tf__ep_slow_ok(tf__client_endpoints(c), TF_SLOW_UPLOADS);
       item_mark(&it, n);
       item_drop_url(&it, n);
       it.error[0] = 0;
@@ -2151,6 +2208,7 @@ static int step(TfClient *c, Share *s, const char *id) {
       }
     }
     retry(&it, why, 0, 0);
+    if (status == 429) route_wait(c, &it);
     goto out;
   }
   /* while the session runs: the next batch once 5 unused URLs remain */

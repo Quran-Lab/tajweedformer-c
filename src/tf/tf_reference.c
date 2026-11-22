@@ -28,13 +28,17 @@ int tf_reference_fetch(TfReference *r) {
   tf__clear_error();
   if (!r) return tf__raise(tf__fail(TF_ERR_INVALID_ARGUMENT, "no reference data"));
   if (tf_reference_is_downloaded(r)) return 0;
-  TfClient *c = tf__model_client(r->m);
+  TfClient *c = tf__model_client_hold(r->m);
   if (!c) return tf__raise(tf__fail(TF_ERR_REFERENCE_MISSING, NULL)); /* a folder opened by hand: nothing to download from */
   int rc = tf__model_engine_release(r->m);
-  if (rc) return tf__raise(rc);
+  if (rc) {
+    tf__client_unhold(c);
+    return tf__raise(rc);
+  }
   tf__app_call++; /* its failure reaches the app (24.1) */
   rc = tf__store_fetch_role(c, r->m, NULL, "reference");
   tf__app_call--;
+  tf__client_unhold(c);
   if (rc || !tf_reference_is_downloaded(r)) {
     /* the app is told the reference data is missing; the report names why (the download's cause, when one failed) */
     if (rc) tf__cause_force();
@@ -93,7 +97,10 @@ static int read_ayah(TfReference *r, int surah, int ayah, int at) {
     tf__pm_lock(pm);
     const int detail = qlc_detail(tf__pm_core(pm));
     tf__pm_unlock(pm);
-    return tf__pm_error(n, detail);
+    const int here = tf__cause_files_here(1); /* 24.13 item 3: the reference data is here; the lease is what is missing */
+    const int rc = tf__pm_error(n, detail);
+    tf__cause_files_here(here);
+    return rc;
   }
   int *word = (int *)malloc(sizeof(int) * (size_t)(n ? n : 1));
   if (!word) {

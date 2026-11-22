@@ -673,7 +673,7 @@ static int t_eval(const char *fixture, const char *list, const char *work) {
     CHECK(files >= 4 && held == 0, "eval: no plaintext of the %d model files on disk after both runs (%d found)", files, held);
   }
   for (int i = 0; i < 8; ++i) tf_json_free(L1[i]), tf_json_free(L2[i]);
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf_json_free(fx);
   return done("eval");
 }

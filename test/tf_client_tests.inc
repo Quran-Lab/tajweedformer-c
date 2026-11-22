@@ -253,7 +253,7 @@ static int client_tests(const char *fx_path, const char *dir) {
 
   /* the sharing state machine, SDK 4.0 (SHARE_ASK_40.md 20; share_ask.json replays every rule in tf40_tests): an
    * ask only at a good moment, offered only by the config; the first ask and two re-asks, then never again */
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf__now_override = 0;
   char sdir[1024];
   snprintf(sdir, sizeof sdir, "%s/sharing", dir);
@@ -485,7 +485,7 @@ static int sharing_tests(const char *vdir, const char *fx_path, const char *dir)
   CHECK(tf__client_sharing_delete(c) == 0, "delete: %s", tf_last_error() ? tf_last_error() : "");
   CHECK(tf__client_sharing_recovery_code(c, code) != 0, "the local contributor survived the deletion");
   tf__client_close(c);
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf_json_free(g_rp.fx);
   printf("deletion flow (recorded exchanges): %s\n", fails ? "FAIL" : "ok");
   return fails ? 1 : 0;
@@ -582,7 +582,7 @@ static int download_tests(const char *cdn, const char *dest, const char *key) {
   CHECK(!tf_file_exists(gzleft), "the stored gz file was kept");
   free(c24);
   free(gzleft);
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   TfModelOpen mo;
   memset(&mo, 0, sizeof mo);
   mo.trusted_key_hex = key;

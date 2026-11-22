@@ -365,7 +365,7 @@ static int t_lanes(const char *fixture, const char *work) {
   }
   tf__download_lanes = 4;
   tf__download_pause_ms = 1000;
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf_json_free(fx);
   tf_mutex_destroy(&g_l_lock);
   return done("lanes");

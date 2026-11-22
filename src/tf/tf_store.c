@@ -372,13 +372,7 @@ int tf__store_fetch(TfClient *c, const TfFetch *f, char *out_dir, size_t n, TfMo
     if (partly_here(out_dir)) return tf__fail(TF_ERR_DOWNLOAD_FAILED, "no connection, and the download of this build is not complete");
     return tf__fail(TF_ERR_NEEDS_CONNECTION, NULL);
   }
-  /* an unmetered-only prefetch downloads on an unmetered connection and on one of unknown kind, and waits on a
-   * metered one and without one (what is on disk stays usable). This library's answer is always unknown. */
-  const int kind = tf__connection();
-  if (f->unmetered_only && (kind == TF__CONNECTION_METERED || kind == TF__CONNECTION_NONE)) {
-    if (complete) return 0;
-    return tf__fail(TF_ERR_DOWNLOAD_FAILED, "this prefetch waits for an unmetered connection (the connection is %s)", tf__connection_name(kind));
-  }
+  /* 4.0.2 (NO_WAIT_40.md 33.1): the download goes out on whatever network there is; nothing waits for Wi-Fi */
   /* which context's files: the caller's, else the config's inference.context, else c16_l64 (the default of every
    * build so far; a build with another default gets it on first use, as any other context) */
   char cfg_ctx[32] = "";
@@ -417,7 +411,10 @@ int tf__store_fetch(TfClient *c, const TfFetch *f, char *out_dir, size_t n, TfMo
   d.want_recited = want_recited(c);
   /* the record is written before the first byte of the build is asked for */
   if (pst == REC_NONE && rec_write(c, p.build, "downloading")) return rec_failed();
+  /* 24.13 item 3: with the whole build here, a lease that cannot be had during the check needs the lease */
+  const int here = tf__cause_files_here(complete);
   const int rc = tf__download_model(&d);
+  tf__cause_files_here(here);
   /* the day's telemetry: one attempt for this build (none when nothing was fetched and nothing failed) */
   if (rc || fetched > 0) tf__client_count_download(c, p.version, p.build, fetched, rc == 0, resumed);
   /* refused while this download ran (by the model host, or by the API on another thread): nothing of it stays,

@@ -99,7 +99,9 @@ typedef struct {
 typedef struct {
   Run *run;
   const char *host;       /* 4.0.1: the host this request goes to (the validator of a file is kept with its host) */
-  int fallback;           /* 4.0.1: this file has been asked of more than one host (24.2 fallback) */
+  int fallback;           /* 4.0.1: this file has been asked of more than one host (24.2 fallback); 4.0.2: when this
+                           * request asks its host, that host counted */
+  int fallback_held;      /* 4.0.2: the same when this request's host is held (28.11) and not asked */
   const char *part;       /* the partial file the body goes to; NULL for the manifest */
   const char *whole;      /* where a whole file sent for a range goes, beside the partial file */
   long long from;         /* the request's first byte */
@@ -107,6 +109,9 @@ typedef struct {
   char etag[80];          /* the validator of a whole file that came for a range, until it is in place */
   TfSha256 sha;           /* 4.0.1: the file's bytes from its first, as they are written */
   long long hashed;       /* how many went into sha */
+  double t_sent, t_head;  /* 4.0.2 (34.6): when this request went out and when its status came (tf__dl_now) */
+  int asked, headed;      /* 4.0.2: this request went to its host (a held host's answer is none); its status came */
+  long long got;          /* and the bytes its body brought */
 } Xfer;
 
 /* The network failures of one file that one call rides out: after each the call waits (tf__download_pause_ms,
@@ -241,6 +246,7 @@ static void set_counted(Run *run, long long v) {
 }
 /* bytes that came over the network in this call (the telemetry's downloads entry counts them) */
 static void net_bytes(void *user, long long n) {
+  ((Xfer *)user)->got += n;
   Run *run = ((Xfer *)user)->run;
   Shared *sh = run->sh;
   run->touched = 1;
@@ -325,6 +331,8 @@ static void etag_read(const char *part, char out[80], char host[TF_EP_HOST]) {
 /* the status and the headers of a file request are in, the file is open and no byte of the body is written */
 static void on_head(void *user, const TfHttpResponse *r) {
   Xfer *x = (Xfer *)user;
+  x->t_head = tf__dl_now(); /* 34.6: the time to the status */
+  x->headed = 1;
   if (!x->part || r->status != 200) return; /* a 206 continues the partial file: its validator stays */
   if (x->from > 0) {
     /* a whole file for a range request: it is written beside the partial file, which keeps its bytes and
@@ -414,8 +422,21 @@ static int get(Run *run, const char *host, const char *rel, Xfer *x, const char 
     }
     int hrc;
     if (host) {
-      tf__ep_note(TF_EP_MODELS, x->fallback); /* the token request above was the api role's */
-      hrc = tf_http(&q, r);
+      /* 4.0.2 (28.11 item 2): a host whose Retry-After has not passed is not asked; its answer stands until then */
+      int slow = 0;
+      char err[33];
+      const long long left = tf__ep_gate(run->ep, TF_EP_MODELS, path, host, &slow, err);
+      /* the token request above was the api role's; 24.2 (4.0.2): a held host is not one of the hosts asked */
+      tf__ep_note(TF_EP_MODELS, left > 0 ? x->fallback_held : x->fallback);
+      if (left > 0) {
+        tf__ep_gated(r, slow ? 429 : 503, left, err);
+        hrc = 0;
+      } else {
+        x->t_sent = tf__dl_now(); /* after the token: the time to the status is the model host's */
+        x->asked = 1;
+        hrc = tf_http(&q, r);
+        if (!hrc) tf__ep_gate_note(run->ep, TF_EP_MODELS, path, host, r);
+      }
     } else {
       TfEpReq er;
       memset(&er, 0, sizeof er);
@@ -425,6 +446,7 @@ static int get(Run *run, const char *host, const char *rel, Xfer *x, const char 
       er.stage = "manifest";
       er.taken = manifest_taken;
       er.user = run;
+      er.hosts_client = o->client; /* 34.6: the manifest is a model request of its host */
       hrc = tf__ep_http(run->ep, &er, &q, r, NULL);
     }
     if (hrc) {
@@ -502,6 +524,13 @@ static int http_error(const Run *run, const char *rel, const TfHttpResponse *r) 
   return tf__fail(TF_ERR_DOWNLOAD_FAILED, "HTTP %d for %s", r->status, rel);
 }
 
+/* how many bits of v are set (the hosts a file was asked of) */
+static int bits_n(unsigned v) {
+  int n = 0;
+  for (; v; v &= v - 1) n++;
+  return n;
+}
+
 /* The pause before the `nth` resume (0 for the first). 1 when the download was cancelled, at once. */
 void (*tf__download_on_pause)(long long ms);
 static int pause_before_resume(const TfDownload *o, int nth) {
@@ -558,7 +587,8 @@ static int fetch_raw(Run *run, const char *rel, long long size, const char *sha,
    * first host's failure is what a failover reports */
   TfEpOrder ord;
   tf__ep_order(run->ep, TF_EP_MODELS, run->first[0] ? run->first : NULL, &ord);
-  int k = 0, answered = 0, first_status = 0, installed = 0;
+  int k = 0, answered = 0, first_status = 0, installed = 0, first_asked = 0, last_asked = 0;
+  unsigned asked_hosts = 0; /* 4.0.2 (24.2): bit i, this call asked ord.host[i] for the file (a held host it did not) */
   char first_reason[20] = "";
   const char *host = ord.host[0];
   for (;;) {
@@ -585,8 +615,11 @@ static int fetch_raw(Run *run, const char *rel, long long size, const char *sha,
     x.run = run;
     host = ord.host[k % ord.n];
     x.host = host;
-    /* 24.2: this file's requests are of the models role; more than one host asked from the second host on */
-    x.fallback = (k + 1 < ord.n ? k + 1 : ord.n) > 1;
+    /* 24.2: this file's requests are of the models role; fallback when more than one host was asked for it (4.0.2: hosts
+     * really asked, the hosts cycle and a held one is not asked) */
+    const unsigned bit = 1u << (k % ord.n);
+    x.fallback = bits_n(asked_hosts | bit) > 1;
+    x.fallback_held = bits_n(asked_hosts) > 1;
     x.part = part;
     x.whole = whole;
     x.from = from;
@@ -602,7 +635,17 @@ static int fetch_raw(Run *run, const char *rel, long long size, const char *sha,
       int again = 0; /* 1: a failed attempt of the kind a resume is for */
       int st = 0;
       run->touched = 1; /* this call asked for bytes of the file: what comes of it is this call's */
+      x.t_sent = x.t_head = 0;
+      x.asked = x.headed = 0;
+      x.got = 0;
       rc = get(run, host, rel, &x, tag[0] ? tag : NULL, &r, &again);
+      const double t_end = tf__dl_now();
+      /* a request for the file went to the host (a held host's answer is none, and the token's request is not this one) */
+      const int asked = x.asked;
+      first_asked |= asked && k == 0;
+      last_asked = asked;
+      if (asked) asked_hosts |= bit;
+      const int status_came = asked && (!rc || tf__http_failure(NULL, NULL) == TF__FAIL_ANSWER || x.headed);
       if (rc) st = tf__http_failure(NULL, NULL) == TF__FAIL_ANSWER ? r.status : 0;
       if (!rc) {
         st = r.status;
@@ -648,6 +691,13 @@ static int fetch_raw(Run *run, const char *rel, long long size, const char *sha,
         }
         tf_http_response_free(&r);
       }
+      /* 34.6: this model request in the day's per-host counts; unreachable: what a resume goes to the
+       * next host for (no answer, a cut or stalled body, a 5xx, a 2xx that is not the file), never a refusal, a 429, a
+       * cancel or a write that failed on the device; a cut transfer of 256 KiB or more counts at its rate over what came */
+      if (asked && run->o->client) {
+        const double head = x.headed ? x.t_head : t_end;
+        tf__client_count_host(run->o->client, host, rc && again, status_came ? (head - x.t_sent) * 1000.0 : -1.0, x.got, t_end - head, 0);
+      }
       if (rc) {
         remove(whole); /* part of a whole file that did not all come */
         if (again && k == 0) { /* the first host's failure (28.7) */
@@ -680,6 +730,8 @@ static int fetch_raw(Run *run, const char *rel, long long size, const char *sha,
       etag_write(part, NULL, NULL);
       set_counted(run, size);
       installed = !rc;
+      /* 34.6: the file's last byte came from this host */
+      if (installed && run->o->client) tf__client_count_host(run->o->client, host, 0, -1.0, 0, 0, 2);
       break;
     }
     remove(part); /* the full size and not the file: it goes with its validator, and the file is fetched once more */
@@ -697,8 +749,10 @@ static int fetch_raw(Run *run, const char *rel, long long size, const char *sha,
       /* 28.7: lastFailover however the file ended, back on its first host too; the silent report only when another
        * host answered */
       tf__ep_failed_over(run->ep, TF_EP_MODELS, ord.host[0], host, first_reason, first_status);
-      if (strcmp(host, ord.host[0])) {
-        tf__ep_note(TF_EP_MODELS, 1);
+      /* 4.0.2: only when this call asked the first host and the host the file ended on: a first host a Retry-After held
+       * (28.11) is no failover, and a 429 hold on the next host is no answer of that host */
+      if (strcmp(host, ord.host[0]) && first_asked && last_asked) {
+        tf__ep_note(TF_EP_MODELS, bits_n(asked_hosts) > 1);
         tf__rep_silent("download", "failover", first_status, NULL, first_reason);
       }
     }

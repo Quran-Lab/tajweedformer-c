@@ -64,6 +64,15 @@
  *                                           28.3's table (tf40_endpoints_tests.inc)
  *   tf40_tests loopback <fixture> <work>    4.0.1, 28.8's checks on this platform's real HTTP code (WinHTTP, libcurl)
  *                                           against stand-in servers on 127.0.0.1 (tf40_endpoints_tests.inc)
+ *   tf40_tests requests <fixture> <work>    4.0.2, SPEC 16.7: one request per model file, a resume from the cut, a
+ *                                           partial file completed (tf40_requests_tests.inc)
+ *   tf40_tests hosts <nowait40> <test/data/sdk_4.0.0> <work>   4.0.2, STEERING_40.md 34.6: the per-host counts
+ *                                           (tf40_requests_tests.inc)
+ *   tf40_tests load <fixture> <work>        4.0.2 under load: the lease's retries (PROTECTED_MODEL.md 18.4.7.3) and
+ *                                           a 429 (ENDPOINTS_40.md 28.10) on fixed clocks (tf40_load_tests.inc)
+ *   tf40_tests no_wait <flow40> <nowait40> <test/data/sdk_4.0.0> <work>   4.0.2, NO_WAIT_40.md (section 33): the
+ *                                           no_wait_40.json cases that name c against the stand-in, the platform's
+ *                                           connection report set to each case's (tf40_nowait_tests.inc)
  * <vectors>: the contract's sdk_4.0.0/vectors. Nothing here reaches a network: every request goes to the stand-in. */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
@@ -78,6 +87,7 @@
 #include "tajweedformer.h"
 #include "tf_flac.h"
 #include "tf_internal.h"
+#include "tf_test_net.h"
 #include "tf_thread.h"
 #if defined(_WIN32)
 #include <windows.h>
@@ -387,6 +397,23 @@ static int accept_hex(Host *h, const char *lease_hex, int64_t *exp) {
   free(l);
   if (exp) *exp = e;
   return st;
+}
+/* 4.0.2 (18.4.7.3 item 5): a new process that starts after the retry time the last one kept: the kept row's time is
+ * now (the SDK's own clock does not move with the Core's test clock) */
+static void lease_row_passed(const char *work) {
+  char p[1200];
+  snprintf(p, sizeof p, "%s/install/lease_row.json", work);
+  char *text = NULL;
+  size_t n = 0;
+  TfJson *j = !tf_read_file(p, &text, &n) ? tf_json_parse(text, n, NULL) : NULL;
+  const TfJson *f = tf_json_get(j, "fails");
+  if (f && f->type == TJ_NUM) {
+    char out[96];
+    const int k = snprintf(out, sizeof out, "{\"fails\":%d,\"next_try\":%lld}\n", (int)f->num, (long long)time(NULL));
+    tf_write_file(p, out, (size_t)k);
+  }
+  tf_json_free(j);
+  free(text);
 }
 static void set_clock(long long wall_s, long long boot_ms, const char *boot_id) {
   tf__plat_test_wall_ms = wall_s * 1000;
@@ -731,8 +758,29 @@ typedef struct {
   int slow_ms;
   /* a request whose URL holds stall_url gets an answer that begins (200) and then stalls: the transport's timeout */
   const char *stall_url;
+  /* 4.0.2 (tf40_tests no_wait): every request's URL, in the order the stand-in took them (under g_f_lock) */
+  char req[160][200];
+  int n_req;
+  long long req_from[160]; /* 4.0.2 (SPEC 16.7): each request's Range (bytes=N-), 0 for none */
+  int req_ifr[160];        /* and whether it sent If-Range */
+  /* 4.0.2 (SPEC 16.7): the next cut_n answers for a model file whose URL holds cut_url end half way (a cut transfer);
+   * every model file's answer carries a strong ETag and, for a range, its Content-Range */
+  const char *cut_url;
+  int cut_n, cut_pct; /* a cut keeps cut_pct percent of the answer (0: half) */
+  /* 4.0.2 (STEERING_40.md 34.6): a second failing URL (fail2_status 0: no answer); and known timings on the calling
+   * thread's clock (tf__dl_clock = fake_clock): every answer's status ttfb_ms after it is asked, a model file's body at
+   * rate_kBps (1000 bytes) */
+  const char *fail2_url;
+  int fail2_status;
+  double ttfb_ms, rate_kBps;
+  /* 4.0.2 (tf40_tests load, the Client's close): a request whose URL holds hold_url waits hold_ms before it is answered,
+   * and a cancel of its flag ends it at once as the transport's would; holding: 1 while it waits, 2 cancelled, 3 answered */
+  const char *hold_url;
+  int hold_ms, holding;
 } Fake;
 static Fake g_f;
+static _Thread_local double t_fake_clock; /* seconds, on each thread its own (a lane's requests run on its thread) */
+static double fake_clock(void) { return t_fake_clock; }
 /* 4.0.1: the downloader's lanes ask for files from several threads at once, beside the lease on the caller's thread:
  * the model host's counts are kept under this lock */
 static TfMutex g_f_lock;
@@ -847,8 +895,28 @@ static int fake(const TfHttpRequest *q, TfHttpResponse *r, void *user) {
   const TfJson *fx = g_f.fx;
   const int host = api_host_of(q->url);
   if (host >= 0) g_f.api_asked[host]++;
+  tf_mutex_lock(&g_f_lock);
+  if (g_f.n_req < 160) {
+    g_f.req_from[g_f.n_req] = q->range_from > 0 ? q->range_from : 0;
+    g_f.req_ifr[g_f.n_req] = q->if_range && *q->if_range;
+    snprintf(g_f.req[g_f.n_req++], sizeof g_f.req[0], "%s", q->url);
+  }
+  tf_mutex_unlock(&g_f_lock);
   TfJson *b = q->body ? tf_json_parse((const char *)q->body, q->body_n, NULL) : NULL;
   int rc = 0;
+  if (g_f.hold_url && strstr(q->url, g_f.hold_url)) {
+    __atomic_store_n(&g_f.holding, 1, __ATOMIC_SEQ_CST);
+    for (int waited = 0; waited < g_f.hold_ms; waited += 10) {
+      if (q->cancel && __atomic_load_n(q->cancel, __ATOMIC_SEQ_CST)) {
+        tf_json_free(b);
+        __atomic_store_n(&g_f.holding, 2, __ATOMIC_SEQ_CST);
+        tf__http_note(TF__FAIL_CANCELLED, "ERROR_WINHTTP_OPERATION_CANCELLED", 0);
+        return tf__fail(TF__ERR_NETWORK, "cancelled");
+      }
+      tf__sleep_ms(10);
+    }
+    __atomic_store_n(&g_f.holding, 3, __ATOMIC_SEQ_CST);
+  }
   if (g_f.stall_url && strstr(q->url, g_f.stall_url)) {
     tf_json_free(b);
     r->status = 200;
@@ -859,6 +927,13 @@ static int fake(const TfHttpRequest *q, TfHttpResponse *r, void *user) {
     tf_json_free(b);
     tf__sleep_ms(g_f.slow_ms);
     answer(r, 503, "{}");
+    return 0;
+  }
+  t_fake_clock += g_f.ttfb_ms / 1000.0; /* the status comes ttfb_ms after the request */
+  if (g_f.fail2_url && strstr(q->url, g_f.fail2_url)) {
+    tf_json_free(b);
+    if (!g_f.fail2_status) return tf__fail(TF__ERR_NETWORK, "the stand-in does not answer");
+    answer(r, g_f.fail2_status, "{}");
     return 0;
   }
   if (g_f.fail_url && strstr(q->url, g_f.fail_url) && (!g_f.fail_with || tf_json_get(b, g_f.fail_with)) &&
@@ -1056,13 +1131,32 @@ static int fake(const TfHttpRequest *q, TfHttpResponse *r, void *user) {
         tf_mutex_unlock(&g_f_lock);
         const long long from = q->range_from > 0 ? q->range_from : 0;
         if (g_f.corrupt && n > 0) data[n - 1] ^= 1; /* not the file the manifest names */
-        FILE *f = fopen(q->download_file, from > 0 ? "ab" : "wb");
+        int cut = 0;
+        tf_mutex_lock(&g_f_lock);
+        if (g_f.cut_url && strstr(q->url, g_f.cut_url) && g_f.cut_n > 0) {
+          g_f.cut_n--;
+          cut = 1;
+        }
+        tf_mutex_unlock(&g_f_lock);
+        size_t len = n - (size_t)from;
+        if (cut) len = g_f.cut_pct > 0 ? len * (size_t)g_f.cut_pct / 100 : len / 2;
+        /* the head first, as the real transports give it: the status, the length, the range, a strong ETag */
+        r->status = from > 0 ? 206 : 200;
+        r->content_length = (long long)(n - (size_t)from);
+        r->range_start = r->range_total = -1;
+        if (from > 0) r->range_start = from, r->range_total = (long long)n;
+        snprintf(r->etag, sizeof r->etag, "\"e-%.16s\"", rel);
+        if (q->accept && !q->accept(q->bytes_user, r)) len = 0;
+        else if (q->on_head) q->on_head(q->bytes_user, r);
+        if (g_f.rate_kBps > 0) t_fake_clock += (double)len / 1000.0 / g_f.rate_kBps; /* the body at its rate */
+        FILE *f = len ? fopen(q->download_file, from > 0 ? "ab" : "wb") : NULL;
         if (f) {
-          fwrite(data + from, 1, n - (size_t)from, f);
+          fwrite(data + from, 1, len, f);
           fclose(f);
         }
-        if (q->on_bytes) q->on_bytes(q->bytes_user, (long long)(n - (size_t)from));
-        r->status = from > 0 ? 206 : 200;
+        if (len && q->on_data) q->on_data(q->bytes_user, data + from, len);
+        if (len && q->on_bytes) q->on_bytes(q->bytes_user, (long long)len);
+        if (cut) rc = tf__fail(TF__ERR_NETWORK, "connection reset (simulated)");
       }
       free(data);
     }
@@ -1385,7 +1479,7 @@ static int t_flow(const char *fixture, const char *work) {
   }
   tf__plat_test_wall_ms = tf__plat_test_boot_ms = -1;
   tf__plat_test_boot_id = NULL;
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf_json_free(fx);
   return done("flow");
 }
@@ -1456,6 +1550,7 @@ static int t_lease_clock(const char *fixture, const char *work) {
   /* 3 */
   fake_reset(LEASE_OK);
   tf__plat_test_boot_ms = b0 + (exp - iat + 10800) * 1000;
+  lease_row_passed(w); /* an hour on: the retry time step 2 kept (18.4.7.3, 600 to 1800 s) has passed */
   c = flow_client_in(w);
   rc = c ? tf__pm_lease(c, tf__pm(c), mt, strlen(mt), mj, build) : -1;
   /* 4.0.1 (ENDPOINTS_40.md 28.5): a lease the Core refuses is that host unreachable, so the same request goes to each
@@ -1475,6 +1570,7 @@ static int t_lease_clock(const char *fixture, const char *work) {
   if (c) tf_client_destroy(c);
   /* 4 */
   fake_reset(LEASE_LATER);
+  lease_row_passed(w);
   c = flow_client_in(w);
   rc = c ? tf__pm_lease(c, tf__pm(c), mt, strlen(mt), mj, build) : -1;
   CHECK(rc == 0 && g_f.leases == 1, "lease_clock 4: the server's clock with the device's: the next lease accepted (%s, leases %d)", rc ? tf_error_name(rc) : "ok",
@@ -1485,7 +1581,7 @@ static int t_lease_clock(const char *fixture, const char *work) {
   if (c) tf_client_destroy(c);
   tf__plat_test_wall_ms = tf__plat_test_boot_ms = -1;
   tf__plat_test_boot_id = NULL;
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf_json_free(mj);
   tf_json_free(fx);
   return done("lease_clock");
@@ -1586,8 +1682,9 @@ static int t_grace(const char *fixture, const char *vec, const char *work) {
   int rc = c ? tf__pm_lease(c, p, mt, strlen(mt), mj, build) : -1;
   CHECK(rc == 0 && tf__pm_grace(p, &until) && until == exp + 86400 && g_f.leases == 0,
         "grace: 503 lease_unavailable past exp opens in grace (%s, until - exp %lld)", rc ? tf_error_name(rc) : "ok", until - exp);
-  CHECK(tf__pm_next_try(p) >= before + 30 && tf__pm_next_try(p) <= (long long)time(NULL) + 30,
-        "grace: the next attempt after the Retry-After of 30 s (in %lld s)", tf__pm_next_try(p) - (long long)time(NULL));
+  /* 18.4.7.3 (4.0.2): the wait is drawn from 600 to 1800 s; the Retry-After of 30 s is a floor below it (4.0.1: 30 s) */
+  CHECK(tf__pm_next_try(p) >= before + 600 && tf__pm_next_try(p) <= (long long)time(NULL) + 1800,
+        "grace: the next attempt 600 to 1800 s on, not the Retry-After's 30 (in %lld s)", tf__pm_next_try(p) - (long long)time(NULL));
   {
     const char *dj = tf_client_diagnose_json(c);
     CHECK(dj && strstr(dj, "\"lease\":\"grace\""), "grace: the diagnosis names the grace");
@@ -1655,20 +1752,25 @@ static int t_grace(const char *fixture, const char *vec, const char *work) {
   rc = c ? tf__pm_lease(c, p, mt, strlen(mt), mj, build) : -1;
   CHECK(rc == 0 && tf__pm_grace(p, NULL), "grace: an unreachable attempt opens it");
   tf__lease_reuse_s = 0; /* every open asks */
+  /* 18.4.7.3 (4.0.2): an open in the grace waits for the row's next attempt; these opens come after it */
+  tf__now_override = tf__pm_next_try(p);
   g_f.fail_status = 403;
   g_f.fail_body = "{\"error\":\"sdk_too_old\",\"min_sdk\":\"4.1.0\"}";
   rc = tf__pm_lease(c, p, mt, strlen(mt), mj, build);
   CHECK(rc == TF_ERR_SDK_TOO_OLD && !tf__pm_grace(p, NULL), "grace: a refusal ends it (%s)", tf_error_name(rc));
   g_f.fail_status = 503;
   g_f.fail_body = NULL;
+  tf__now_override = tf__pm_next_try(p) > tf__now_override ? tf__pm_next_try(p) : tf__now_override;
   rc = tf__pm_lease(c, p, mt, strlen(mt), mj, build);
   CHECK(rc == TF_ERR_DOWNLOAD_FAILED && !tf__pm_grace(p, NULL), "grace: an unreachable attempt after a refusal gives none back (%s)", tf_error_name(rc));
   /* a new lease clears it all */
   fake_reset(LEASE_LATER);
   rc = tf__pm_lease(c, p, mt, strlen(mt), mj, build);
   tf__pm_status(p, &ls);
-  CHECK(rc == 0 && ls.valid && ls.exp == N(later, "exp") && !tf__pm_grace(p, NULL), "grace: a new lease clears it (%s)", rc ? tf_error_name(rc) : "ok");
+  CHECK(rc == 0 && ls.valid && ls.exp == N(later, "exp") && !tf__pm_grace(p, NULL) && tf__pm_fails(p) == 0,
+        "grace: a new lease clears it, and the row (%s)", rc ? tf_error_name(rc) : "ok");
   tf__lease_reuse_s = 60;
+  tf__now_override = 0;
   /* the background refresh: lease_later past its refresh_after, still valid; a 503 with Retry-After 30 sets the next try */
   tf__plat_test_boot_ms = b0 + (t0 - iat) * 1000 + (N(later, "refresh_after") - N(later, "iat") + 60) * 1000;
   fake_reset(LEASE_OK);
@@ -1678,8 +1780,8 @@ static int t_grace(const char *fixture, const char *vec, const char *work) {
   g_f.retry_after = 30;
   tf__store_tick(c);
   tf__pm_status(p, &ls);
-  CHECK(g_f.leases == 0 && ls.valid && ls.refresh_due && tf__pm_next_try(p) > (long long)time(NULL) && tf__pm_next_try(p) <= (long long)time(NULL) + 30,
-        "grace: the background refresh's 503 lease_unavailable waits its Retry-After (next try in %lld s, valid %d)",
+  CHECK(g_f.leases == 0 && ls.valid && ls.refresh_due && tf__pm_next_try(p) >= (long long)time(NULL) + 599 && tf__pm_next_try(p) <= (long long)time(NULL) + 1800,
+        "grace: the background refresh's 503 lease_unavailable waits 600 to 1800 s, its Retry-After of 30 a floor (next try in %lld s, valid %d)",
         tf__pm_next_try(p) - (long long)time(NULL), ls.valid);
   if (c) tf_client_destroy(c);
   /* a 7-day lease of this unattested desktop install (lease_grace capped_7d): valid 3 days on, as its exp says */
@@ -1824,7 +1926,7 @@ static int t_grace(const char *fixture, const char *vec, const char *work) {
   }
   tf__plat_test_wall_ms = tf__plat_test_boot_ms = -1;
   tf__plat_test_boot_id = NULL;
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf_json_free(mj);
   tf_json_free(gv);
   tf_json_free(fx);
@@ -2424,7 +2526,7 @@ static int t_share_moments(const char *fixture, const char *work) {
   tf__ask_now_ms = 0;
   tf__ask_tz_min = -100000;
   g_cfg_body = NULL;
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf_json_free(fx);
   return done("share_moments");
 }
@@ -2509,7 +2611,7 @@ static int t_share_flac(const char *fixture, const char *work) {
   free(f);
   free(pcm);
   g_cfg_body = NULL;
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf_json_free(fx);
   return done("share_flac");
 }
@@ -2624,7 +2726,7 @@ static int t_piece_order(const char *fixture, const char *vectors, const char *w
   }
   CHECK(sequences == 4, "piece_order: the four sequences (%d)", sequences);
   free(lease);
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf_json_free(po);
   tf_json_free(fx);
   return done("piece_order");
@@ -2980,7 +3082,7 @@ static int t_learner(const char *work) {
   tf__client_close(c);
   tf__now_override = 0;
   tf__learner_test_tz_s = -999999;
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   days_key(0);
   return done("learner");
 }
@@ -3033,7 +3135,7 @@ static int t_switches(const char *fixture, const char *work) {
   g_cfg_body = NULL;
   tf__now_override = 0;
   tf__learner_test_tz_s = -999999;
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf_json_free(fx);
   days_key(0);
   return done("switches");
@@ -3211,7 +3313,7 @@ static int t_conformance(const char *fixture, const char *list, const char *outp
   /* nothing of the plaintext on disk after a whole run: the folder holds containers, the state and public files */
   tf_model_close(m);
   tf_client_destroy(c);
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf_json_free(fx);
   return done("conformance");
 }
@@ -3221,8 +3323,13 @@ static int t_conformance(const char *fixture, const char *list, const char *outp
 #include "tf40_endpoints_tests.inc"
 #include "tf40_lanes_tests.inc"
 #include "tf40_qos_tests.inc"
+#include "tf40_nowait_tests.inc"
+#include "tf40_load_tests.inc"
+#include "tf40_requests_tests.inc"
+#include "tf40_lifetime_tests.inc"
 
 int main(int argc, char **argv) {
+  tf_http_set_transport(tf_test_net, NULL); /* no test reaches a host but this machine (tf_test_net.h) */
   if (argc < 4 && !(argc >= 3 && !strcmp(argv[1], "json_leak"))) {
     fprintf(stderr, "usage: tf40_tests <test> <vectors|fixture|-> <work dir> (see the file's comment)\n");
     return 2;
@@ -3257,6 +3364,11 @@ int main(int argc, char **argv) {
   if (!strcmp(t, "loopback")) return t_loopback(argv[2], argv[3]);
   if (!strcmp(t, "lanes")) return t_lanes(argv[2], argv[3]);
   if (!strcmp(t, "qos")) return t_qos();
+  if (!strcmp(t, "no_wait") && argc >= 6) return t_no_wait(argv[2], argv[3], argv[4], argv[5]);
+  if (!strcmp(t, "load")) return t_load(argv[2], argv[3]);
+  if (!strcmp(t, "requests")) return t_requests(argv[2], argv[3]);
+  if (!strcmp(t, "hosts") && argc >= 5) return t_hosts(argv[2], argv[3], argv[4]);
+  if (!strcmp(t, "lifetime") && argc >= 4) return t_lifetime(argv[2], argv[3]);
   fprintf(stderr, "unknown test %s\n", t);
   return 2;
 }

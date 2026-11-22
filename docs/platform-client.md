@@ -143,7 +143,10 @@ The SDK sends a delta: what happened since the previous delta of the same UTC da
 with a fresh random `report_id` (32 lower-case hex, drawn per delta). It sends one every 15 minutes while
 the app is in use and one when the app goes to the background; unsent deltas are kept up to 7 days. A retry
 sends the same body with the same `report_id`, which the server counts once. 202 deletes the delta; 400 drops
-it; 401 renews the token and retries; 429, 5xx, 503 and network errors keep it for a retry with backoff.
+it; 401 renews the token and retries; 429, 5xx, 503 and network errors keep it for a retry with backoff. After a 429
+the next send waits for the answer's `Retry-After` (or five minutes without one), and longer at each 429 in a row; the
+same holds for error reports and shared-recording uploads. No request is sent before its `Retry-After`, and
+these waits are kept across restarts.
 
 The body is telemetry v2 (`"v": 2`, `day`, `product`, `platform`, `sdk_version`, `app_version`, `device`,
 `cohorts` (may be `[]`), `downloads`) with these fields added, each left out when zero:
@@ -157,6 +160,7 @@ The body is telemetry v2 (`"v": 2`, `day`, `product`, `platform`, `sdk_version`,
 | `reported` | which of the six fields above this body carries, so the dashboard labels them as reported by the app |
 | `share_asked`, `share_yes`, `share_no` | the sharing sheet was shown, the learner chose to share, the learner declined |
 | `promotions` | iOS, macOS and Android only: per accelerator, model revision and context, the promotions that ended and the failovers (below) |
+| `hosts` | 4.0.2: per model host the install read model files from that day (at most 8): `files` (the build's manifest among them), `bytes`, `requests` (resumes included), `unreachable`, `hedged` and `slow_switches` (0 in 4.0.2), `ttfb_ms` (the time to each answer's status in 9 buckets: under 100, 250, 500, 1000, 1500, 3000, 6000, 10000 ms, and over) and `kbps` (each transfer of at least 256 KiB, its rate in 10 buckets of kB/s: under 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, and over). Host names only, never a path or a key |
 
 Each `promotions` entry (at most 8; zero counts left out):
 
@@ -194,7 +198,7 @@ the day; a day stamp on the device), not at every launch, so the server counts d
 1. **First run.** The first install downloads only the CPU files of the default context, and the first session
    runs on the exact CPU engine. Nothing else is downloaded or compiled before it.
 2. **In the background,** one step at a time, remembered across launches for each model revision, context,
-   accelerator build, OS build and device: download the accelerator's program (Wi-Fi or an unmetered network,
+   accelerator build, OS build and device: download the accelerator's program (on whatever network the device has,
    resumable, verified against the signed manifest; usually as a small delta that the SDK applies to the CPU
    weights already on the device, checking the rebuilt program's SHA-256 before the runtime sees it); compile
    it for this device at low priority (the Neural Engine compiler on Apple, the NPU program on Android, kept and

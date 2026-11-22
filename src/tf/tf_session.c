@@ -38,6 +38,7 @@ struct TfSession {
   TfModel *m;
   TfClient *client;
   qlc_stream *zs;
+  unsigned zs_gen; /* 4.0.2: the generation of the Model's stream this Session began on (tf__model_stream_of) */
   unsigned mask;
   char context[32];
   char route[16];
@@ -75,9 +76,15 @@ struct TfSession {
 
 qlc_stream *tf__session_engine(const TfSession *s) { return s ? s->zs : NULL; }
 qlc_stream *tf__session_stream(const TfSession *s) { return s ? s->zs : NULL; }
+/* the take's heads as the Core keeps them, called under tf__model_stream_lock: only while the Model's stream is still
+ * the one this Session began on (4.0.2: a later Session, the Model's close or another Model's take may have destroyed
+ * it) */
 int tf__session_take_heads(const TfSession *s, TfRawHeads *out) {
-  return s && s->zs && qlc_stream_heads(s->zs, out) == QLC_OK ? 0 : -1;
+  qlc_stream *zs = s ? tf__model_stream_of(s->m, s->zs_gen) : NULL;
+  return zs && zs == s->zs && qlc_stream_heads(zs, out) == QLC_OK ? 0 : -1;
 }
+/* 4.0.2: the Session's Client, held while a call uses it (tf__client_unhold), NULL once its Model is not the Client's */
+static TfClient *client_hold(const TfSession *s) { return tf__model_client_hold(s->m); }
 
 static void backend_cpu(TfBackend *b) {
   b->kind = "cpu";
@@ -233,6 +240,10 @@ static TfSession *session_new(TfModel *m, const TfSessionOptions *opt, int rate_
     return NULL;
   }
   tf__clear_error();
+  if (tf__model_closed(m)) {
+    tf__fail(TF_ERR_INVALID_ARGUMENT, "the model is closed");
+    return NULL;
+  }
   TfSessionOptions o;
   memset(&o, 0, sizeof o);
   if (opt) o = *opt;
@@ -282,6 +293,8 @@ static TfSession *session_new(TfModel *m, const TfSessionOptions *opt, int rate_
   s->m = m;
   s->client = tf__model_client(m);
   s->zs = zs;
+  s->zs_gen = tf__model_stream_gen(m);
+  tf__model_session_add(m);
   s->mask = mask;
   s->rate = rate;
   s->top_k = o.top_k;
@@ -299,8 +312,10 @@ static TfSession *session_new(TfModel *m, const TfSessionOptions *opt, int rate_
   qlc_stream_set_heads(zs, mask | TF_HEAD_BIT(TF_HEAD_TIMING)); /* timing always: the speech rule */
   qlc_stream_set_callback(zs, (qlc_chunk_fn)on_engine_chunk, s);
   /* the recited journal (17.6): the take begins there (off without an index, without analytics) */
-  if (s->client) tf__recited_begin(s->client, tf__model_pm(m), &s->take_id);
-  if (s->client) tf__sharing_take_start(s->client); /* 4.0: an ask not yet on screen waits for this take's end */
+  TfClient *c = client_hold(s);
+  if (c) tf__recited_begin(c, tf__model_pm(m), &s->take_id);
+  if (c) tf__sharing_take_start(c); /* 4.0: an ask not yet on screen waits for this take's end */
+  tf__client_unhold(c);
   return s;
 }
 
@@ -313,23 +328,30 @@ TfSession *tf_session_create(TfModel *m, const TfSessionOptions *options) {
 /* the shared copy of the take: begun at its first samples (when sharing is on), finished with the take. Takes in
  * a row continue the client's open recording (tf_share.c): the Session only says where its take begins and ends. */
 static void share_push(TfSession *s, const float *x, int n) {
-  if (!s->client || n <= 0) return;
-  if (!s->share) {
-    s->share = tf__share_begin(s->client, s->rate, s->route, tf_model_version(s->m), tf_model_build(s->m));
-    if (!s->share) {
-      tf__clear_error(); /* sharing off is not an error of the take */
-      return;
-    }
+  if (n <= 0) return;
+  /* 4.0.2: under the Model's link, so the Client's destroy (which ends this copy there) is never in between */
+  tf__model_link_lock(s->m);
+  TfClient *c = s->client ? tf__model_client(s->m) : NULL;
+  if (c && !s->share) {
+    s->share = tf__share_begin(c, s->rate, s->route, tf_model_version(s->m), tf_model_build(s->m));
+    if (!s->share) tf__clear_error(); /* sharing off is not an error of the take */
   }
-  tf__sharing_session_push(s->share, x, n);
+  if (c && s->share) tf__sharing_session_push(s->share, x, n);
+  tf__model_link_unlock(s->m);
 }
-static void share_end(TfSession *s, int completed) {
+static void share_end_locked(TfSession *s, int completed) {
   if (s->share) tf__sharing_session_finish(s->share, completed);
   s->share = NULL;
 }
+static void share_end(TfSession *s, int completed) {
+  tf__model_link_lock(s->m);
+  share_end_locked(s, completed);
+  tf__model_link_unlock(s->m);
+}
 
+/* the Client is being destroyed (under the Model's link): this take's shared copy ends now, as the Client goes */
 void tf__session_detach(TfSession *s) {
-  share_end(s, 0);
+  share_end_locked(s, 0);
   s->client = NULL;
 }
 
@@ -338,7 +360,8 @@ static int g_takes; /* takes started in this process: the first one is the launc
 /* the take for the day's telemetry (SPEC section 6): every take is a session; one that ended with its Heads also
  * counts in takes, audio_s, speech_s, silence_s, tokens and compute_s, and counts its recited report */
 static void count_take(TfSession *s, int aborted, int end) {
-  if (!s->client) return;
+  TfClient *const c = client_hold(s);
+  if (!c) return;
   TfSessionStats st;
   memset(&st, 0, sizeof st);
   st.end = end;
@@ -368,20 +391,26 @@ static void count_take(TfSession *s, int aborted, int end) {
     }
     tf__clear_error();
   }
-  tf__client_session_finished(s->client, &st);
+  tf__client_session_finished(c, &st);
   /* the recited range (17.1): measured by the Core's detector, else the app's report; a take that did not end
    * with its Heads counts neither, and its journaled units are dropped */
   if (!aborted && s->have_take) {
-    s->measured = tf__recited_finish(s->client, tf__model_pm(s->m), s->zs, s->take_id, s->recited.surah ? &s->recited : NULL, &s->range);
+    s->measured = tf__recited_finish(c, tf__model_pm(s->m), s->zs, s->take_id, s->recited.surah ? &s->recited : NULL, &s->range);
     if (s->recited.surah) s->recited.counted = 1;
     s->take_id = 0;
   } else {
-    tf__recited_cancel(s->client, tf__model_pm(s->m), s->take_id);
+    tf__recited_cancel(c, tf__model_pm(s->m), s->take_id);
     s->take_id = 0;
   }
-  tf__recited_end(&s->recited, s->client, 0);
+  tf__recited_end(&s->recited, c, 0);
+  tf__client_unhold(c);
 }
 
+/* 24.3 session: the cause of a take's failure (the engine's status when it stopped) */
+static void take_cause(const TfSession *s) {
+  const char *qn = s->failed_status == QLC_E_NOMEM ? "QLC_E_NOMEM" : s->failed_status == QLC_E_ENGINE ? "QLC_E_ENGINE" : NULL;
+  tf__cause("session", s->failed_memory ? "memory" : "engine", 0, qn, s->failed_status ? s->failed_status_text : NULL);
+}
 /* the engine reported an error: the take is over, with nothing kept */
 static int fail_take(TfSession *s, int code) {
   char text[256];
@@ -393,8 +422,7 @@ static int fail_take(TfSession *s, int code) {
   count_take(s, 1, 2);
   emit(s, TF_EVENT_ENDED, 0, 0, TF_ENDED_ERROR, code);
   /* the callbacks may have used the thread's error: put this one back, with its cause (24.3 session) */
-  const char *qn = s->failed_status == QLC_E_NOMEM ? "QLC_E_NOMEM" : s->failed_status == QLC_E_ENGINE ? "QLC_E_ENGINE" : NULL;
-  tf__cause("session", s->failed_memory ? "memory" : "engine", 0, qn, s->failed_status ? s->failed_status_text : NULL);
+  take_cause(s);
   if (code == TF_ERR_ENGINE_FAILED) tf__fail(code, "%s", "the engine stopped");
   else tf__fail(code, "%s", "the take's heads could not be kept");
   return code;
@@ -522,7 +550,8 @@ const TfHeads *tf_session_heads(TfSession *s) {
   tf__clear_error();
   if (s->state == CANCELLED) tf__fail(TF_ERR_CANCELLED, NULL);
   else if (s->state == FAILED) {
-    /* the take's failure, reported when it happened: handed over again, not reported again */
+    /* the take's failure, reported when it happened: handed over again with its cause (24.13), not reported again */
+    take_cause(s);
     tf__fail(s->failed_code == TF_ERR_ENGINE_FAILED || !s->failed_code ? TF_ERR_ENGINE_FAILED : s->failed_code, "the take ended on an error");
     tf__raise_again(-1);
     return NULL;
@@ -686,23 +715,43 @@ int tf_session_report_recited_outcome(TfSession *s, int surah, int ayah_from, in
       k.surah = s->range.surah, k.first = s->range.first, k.last = s->range.last;
       k.ties = s->range.ties > 0 ? s->range.ties : 0; /* a tie take's outcomes: not toward first or repeat */
       k.app = &tmp;
-      if (s->client && (outcome || n_per_ayah)) tf__client_count_take_range(s->client, &k);
+      TfClient *c = outcome || n_per_ayah ? client_hold(s) : NULL;
+      if (c) tf__client_count_take_range(c, &k);
+      tf__client_unhold(c);
       s->recited.counted = 1;
     }
     free(tmp.per);
     return tf__raise(rc);
   }
   int rc = tf__recited_outcome(&s->recited, surah, ayah_from, ayah_to, outcome, per_ayah, n_per_ayah);
-  if (!rc) rc = tf__recited_report(&s->recited, state == 1 ? NULL : s->client, state, surah, ayah_from, ayah_to);
-  if (!rc && state == 0) tf__recited_report_pending(s->client, s->take_id, &s->recited);
-  if (!rc && state == 1 && s->client) {
+  TfClient *c = client_hold(s); /* 4.0.2: none once the Client is destroyed or the Model closed */
+  if (!rc) rc = tf__recited_report(&s->recited, state == 1 ? NULL : c, state, surah, ayah_from, ayah_to);
+  if (!rc && state == 0) tf__recited_report_pending(c, s->take_id, &s->recited);
+  if (!rc && state == 1 && c) {
     /* after the end of a take the detector did not count: the app's report, with its outcomes, counts now */
     TfRecited app = s->recited;
     s->recited.counted = 0;
-    tf__recited_finish(s->client, NULL, NULL, 0, &app, NULL);
+    tf__recited_finish(c, NULL, NULL, 0, &app, NULL);
     s->recited.counted = 1;
   }
+  tf__client_unhold(c);
   return tf__raise(rc);
+}
+
+/* tests (tf40_tests lifetime): an ended Session of m with no engine stream, as a Session is after its take when the
+ * stand-in Core opens no engine */
+TfSession *tf__session_test_ended(TfModel *m) {
+  TfSession *s = m && !tf__model_closed(m) ? (TfSession *)calloc(1, sizeof *s) : NULL;
+  if (!s) return NULL;
+  s->m = m;
+  s->client = tf__model_client(m);
+  s->zs_gen = tf__model_stream_gen(m);
+  tf__model_session_add(m);
+  s->state = ENDED;
+  s->rate = 16000;
+  snprintf(s->context, sizeof s->context, "%s", tf__model_default_context(m));
+  snprintf(s->route, sizeof s->route, "unknown");
+  return s;
 }
 
 void tf_session_destroy(TfSession *s) {
@@ -714,7 +763,9 @@ void tf_session_destroy(TfSession *s) {
   if (s->have_take) tf__heads_release(&s->take);
   for (int i = 0; i < s->n_kept; ++i) tf__heads_release(&s->kept[i].heads);
   free(s->kept);
+  TfModel *const m = s->m;
   free(s);
+  tf__model_session_freed(m); /* 4.0.2: a Model its holders closed goes with its last Session */
 }
 
 /* ------------------------------------------------------------------ a sample clip through the same path */

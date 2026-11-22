@@ -22,6 +22,7 @@ EXPORTS
   tf_heads_greedy
   tf_heads_name
   tf_last_error
+  tf_last_error_cause
   tf_last_error_code
   tf_last_error_fix
   tf_model_backend

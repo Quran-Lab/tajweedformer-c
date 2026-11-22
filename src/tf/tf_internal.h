@@ -103,7 +103,11 @@ void tf__cause_silent(void); /* the cause, as a silent report, unless an app cal
 /* >0 while the app's own call (a model, a prefetch, the reference data, a deletion) runs on this thread: its
  * failures reach the app and are reported there, never as silent ones */
 extern _Thread_local int tf__app_call;
-void tf__rep_raised(int code);
+void tf__rep_raised(int code, int report); /* report 0: the same failure handed over again (its cause, no report) */
+/* 4.0.2 (24.13 item 3): while set, every file the call in flight needs is on the device, so a needs_connection it
+ * makes needs the lease, not the model; returns what was set before (put it back after) */
+int tf__cause_files_here(int here);
+unsigned tf__error_serial(void); /* tf_util.c: changes whenever an error is set on the thread */
 void tf__rep_silent(const char *stage, const char *reason, int status, const char *error_name, const char *error_code);
 /* the queue machine (tools/errors40.py Reporter): one install's reports, the days' signatures, the reported list */
 typedef struct {
@@ -360,10 +364,11 @@ typedef struct {
   int (*taken)(void *user, const TfHttpResponse *r);
   void *user;
   double deadline;        /* tf__now_s after which no host is asked (18.4.7.1's 10 s); 0 for none */
+  TfClient *hosts_client; /* 34.6: each model request counted in this Client's per-host telemetry (NULL: none) */
 } TfEpReq;
 typedef struct {
   int cls;                /* TF_EP_TAKEN, TF_EP_REFUSED, TF_EP_SLOW, TF_EP_UNREACHABLE */
-  int asked, fallback;    /* the hosts asked; more than one */
+  int asked, fallback;    /* the hosts tried (one a hold skipped too); 4.0.2: more than one really asked (24.2) */
   char by[TF_EP_HOST];    /* the host the request ended on ("" when every host was unreachable) */
   char first_reason[20];  /* the first host's 24.3 reason when it was unreachable ("" when not) */
   int first_status;       /* its status, 0 for none */
@@ -374,6 +379,33 @@ const char *tf__ep_reason(int rc, const TfHttpResponse *r); /* an unreachable an
  * request ends as that answer (rc, r), or, when every host was unreachable, as the FIRST host's, with the largest
  * Retry-After any host gave. out may be NULL. */
 int tf__ep_http(TfEndpoints *e, const TfEpReq *er, TfHttpRequest *q, TfHttpResponse *r, TfEpOut *out);
+/* 4.0.2 (STEERING_40.md 34.6): the day's model requests per models host (at most 8 hosts a day), kept with the
+ * telemetry state from the first start and sent in `hosts` while tf__telemetry_hosts is set (1: the server's
+ * /v1/events takes `hosts` from 2026-11-21; 0 keeps them on the device). file_done: 1 this request brought the file's last byte; 2 only that (no
+ * request of its own). ttfb_ms < 0: no status came. tf__dl_now: the clock of these timings (tests: tf__dl_clock). */
+#define TF_HOSTS_MAX 8
+extern int tf__telemetry_hosts;
+extern double (*tf__dl_clock)(void);
+double tf__dl_now(void);
+void tf__client_count_host(TfClient *c, const char *host, int unreachable, double ttfb_ms, long long bytes, double body_s, int file_done);
+const char *tf__hosts_problem(const TfJson *hosts); /* NULL when `hosts` passes the server's check */
+/* 4.0.2 (ENDPOINTS_40.md 28.11): every route honours Retry-After. A host's 429 or 503 with a Retry-After (1 to 21600 s)
+ * holds that route off that host until it passes (tf__ep_http and the file requests then answer for it, as that
+ * answer with its error: a 429 ends the request, a 503 sends it to the next host). The route: tf__ep_route. The holds
+ * and the optional routes' rows are kept across restarts in the file tf__ep_holds_file names (<storage>/holds.json). */
+#define TF_EP_GATES 32
+#define TF_EP_ROUTE 256 /* a route's name: a model file's path, or an API route */
+void tf__ep_route(int role, const char *path, char out[TF_EP_ROUTE]);
+void tf__ep_holds_file(TfEndpoints *e, const char *path); /* reads what an earlier process kept, then keeps it there */
+void tf__ep_gate_note(TfEndpoints *e, int role, const char *path, const char *host, const TfHttpResponse *r);
+long long tf__ep_gate(TfEndpoints *e, int role, const char *path, const char *host, int *slow, char err[33]); /* s left */
+void tf__ep_gated(TfHttpResponse *r, int status, long long left, const char *err); /* the answer a hold stands for */
+/* 28.11 item 4: optional traffic after a 429 (tf_endpoints.c); kind: TF_SLOW_*, -1 for another route */
+enum { TF_SLOW_EVENTS = 0, TF_SLOW_ISSUES = 1, TF_SLOW_UPLOADS = 2 };
+int tf__ep_optional(const char *path);
+long long tf__ep_slow_429(TfEndpoints *e, int kind, int retry_after); /* a 429: the row grows; returns the wait */
+void tf__ep_slow_ok(TfEndpoints *e, int kind);                        /* an accepted answer ends the row */
+long long tf__ep_slow_left(TfEndpoints *e, int kind);                 /* seconds the route still waits, 0 none */
 /* the thread's last request to Quran Lab's hosts: its role and whether more than one host was asked (24.2's host_role
  * and fallback); noted by tf__ep_http and the model download, read by the error reports */
 void tf__ep_note(int role, int fallback);
@@ -385,11 +417,10 @@ extern const char *(*tf__ep_test_origin)(const char *host); /* tests: a host's s
 TfEndpoints *tf__client_endpoints(TfClient *c);       /* the Client's set, its lists brought to the config in force */
 void tf__clean27(const char *v, char out[33]); /* APP_VERSION_40.md 27.1: app_version and app_build cleaned ("" for none) */
 int _tf_strnicmp(const char *a, const char *b, size_t n);
-/* 1 when the system says the connection in use is metered (Windows); 0 when not or when it cannot tell */
-/* The kind of connection the machine has. Neither system gives this library a dependable answer it can use
- * without a new dependency (NetworkManager's D-Bus API on Linux; the Network List Manager's COM object on
- * Windows, which an app may have initialised differently), so the answer is always unknown, the diagnose report
- * says so, and an unmetered-only prefetch downloads (it waits on metered and none, which only a test sets). */
+/* The kind of connection the machine has, for the diagnose report only. Neither system gives this library a
+ * dependable answer it can use without a new dependency (NetworkManager's D-Bus API on Linux; the Network List
+ * Manager's COM object on Windows, which an app may have initialised differently), so the answer is always unknown.
+ * 4.0.2: nothing reads it to decide whether or when a request goes out. */
 enum { TF__CONNECTION_UNMETERED = 0, TF__CONNECTION_METERED = 1, TF__CONNECTION_NONE = 2, TF__CONNECTION_UNKNOWN = 3 };
 extern int tf__connection_override; /* tests: one of the four instead of the platform's answer; -1: the platform's */
 int tf__connection(void);
@@ -721,6 +752,35 @@ int tf__pm_lease(TfClient *c, TfPm *p, const char *manifest, size_t mn, const Tf
 /* 18.4.7.1: 1 while the Core's expired lease is in its grace (until: exp + 86400 while a lease is held, else 0) */
 int tf__pm_grace(TfPm *p, long long *until);
 long long tf__pm_next_try(TfPm *p); /* tests: the background refresh's next attempt (unix s), 0 for at the next tick */
+/* 4.0.2: the Client is being destroyed: a lease attempt in flight gets up to max_s (TF_CLOSE_LEASE_S) to end */
+#define TF_CLOSE_LEASE_S 3.0
+void tf__pm_closing(TfClient *c, double max_s);
+/* tests (tf40_tests lifetime): counted frees and makes, an engine-less ended Session, the Client's Model as given out,
+ * lease.json written as from a lease issued at iat */
+extern int tf__model_frees, tf__pm_made;
+TfSession *tf__session_test_ended(TfModel *m);
+void tf__client_test_model(TfClient *c, TfModel *m, int holders);
+void tf__pm_test_rec_save(TfPm *p, const char *build, long long iat);
+/* 4.0.2: a Model's or Session's call that reaches the Client holds it (taken through the Model's link, NULL once the
+ * Model is no longer the Client's); tf_client_destroy waits for the last hold to go */
+void tf__client_hold(TfClient *c);
+void tf__client_unhold(TfClient *c);
+void tf__client_wait_unheld(TfClient *c);
+TfClient *tf__model_client_hold(TfModel *m);
+void tf__model_link_lock(TfModel *m);
+void tf__model_link_unlock(TfModel *m);
+void tf__model_detach(TfModel *m, int holders);
+/* 4.0.2: a Model's memory stays while a Session of it lives; the stream a Session reads is its own only while its
+ * generation is the one the Session began with */
+int tf__model_closed(TfModel *m);
+int tf__model_session_add(TfModel *m);
+void tf__model_session_freed(TfModel *m);
+unsigned tf__model_stream_gen(TfModel *m);
+void tf__model_stream_lock(void);
+void tf__model_stream_unlock(void);
+qlc_stream *tf__model_stream_of(TfModel *m, unsigned gen);
+int tf__pm_fails(TfPm *p);           /* tests: 18.4.7.3's failed attempts in a row */
+long long tf__pm_lease_step(void);   /* tests: 18.4.7.3's wait after a failure (drawn afresh) */
 void tf__pm_tick(TfClient *c, const char *build_dir, const char *build);
 int tf__pm_install(TfPm *p, const char *build_dir, const char *manifest, size_t mn, const char *decoded_path);
 qlc_model *tf__pm_open(TfPm *p, const char *build_dir, const char *manifest, size_t mn, const char *context, int threads, int rate, int pin);
@@ -1074,7 +1134,6 @@ int tf__download_model(const TfDownload *o);
  * folder. progress may be NULL. 0, or a catalogue code. */
 typedef struct {
   const char *version;        /* a pin, or NULL */
-  int unmetered_only;
   void (*on_progress)(void *user, long long done, long long total);
   void *user;
   const char *context;        /* the context whose files are needed: NULL = the one in force */

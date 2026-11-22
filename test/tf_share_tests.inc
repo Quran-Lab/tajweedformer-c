@@ -152,6 +152,7 @@ static struct {
   int stall_puts;        /* PUTs wait until cancelled */
   volatile int put_waiting, put_cancelled;
   const char *start_error; /* POST /v1/uploads answers 409 with this code */
+  int start_429;           /* 4.0.2: the next this many POST /v1/uploads answer 429 rate_limited (no Retry-After) */
   StubSession s[8];
   int n_s;
   int starts, url_calls, puts, put_403, put_failed;
@@ -348,7 +349,10 @@ static int stub(const TfHttpRequest *q, TfHttpResponse *r, void *u) {
     for (int i = 1; j && i < j->n; ++i)
       if (strcmp(j->kids[i - 1].key, j->kids[i].key) >= 0) g_st.bad_session_body++;
     tf_json_free(j);
-    if (g_st.start_error) {
+    if (g_st.start_429 > 0) {
+      g_st.start_429--;
+      reply(r, 429, "{\"error\":\"rate_limited\"}");
+    } else if (g_st.start_error) {
       char b[160];
       snprintf(b, sizeof b, "{\"error\":\"%s\",\"message\":\"test\"}", g_st.start_error);
       reply(r, 409, b);
@@ -724,8 +728,86 @@ static int upload_tests(const char *dir) {
     free(dg);
   }
 
+  /* M, 4.0.2: a finished recording uploads while the
+   * platform reports a metered network (this library's own report is unknown; nothing reads it to hold a request) */
+  {
+    stub_reset();
+    tf__connection_override = TF__CONNECTION_METERED;
+    char *dm = tf_path_join(dir, "m");
+    c = share_client(dm);
+    tf__client_sharing_answer(c, 1);
+    tf__sharing_outbox_resume(c);
+    ss = tf__sharing_session_begin(c, rate, NULL);
+    for (int i = 0; ss && i < 150; ++i) tf__sharing_session_push(ss, x + i * 960, 960); /* 3 s */
+    const int ms_m = ss ? share_finish(c, ss, 1) : -1;
+    left = tf__sharing_outbox_wait(c, 20000);
+    segs = 0;
+    CHECK(ms_m == 3000 && left == 0 && g_st.starts == 1 && g_st.puts >= 3 && g_st.n_s == 1 && joined_ok(&g_st.s[0], 1, &segs),
+          "metered: a finished recording uploads (%d ms, %d left, %d starts, %d PUTs)", ms_m, left, g_st.starts, g_st.puts);
+    printf("sharing_upload_metered: the platform reports metered, the take uploaded (%d starts, %d PUTs, %d segments)\n", g_st.starts, g_st.puts, segs);
+    tf__connection_override = -1;
+    tf__client_close(c);
+    free(dm);
+  }
+
+  /* N, 4.0.2: three 429s in a row without Retry-After on the uploads route:
+   * the recording waits 300, 600 and 1200 s (its own backoff would be about 30, 60 and 120), on a fixed clock; the
+   * fourth start is taken and the recording goes up */
+  {
+    stub_reset();
+    g_st.start_429 = 3;
+    long long t = (long long)time(NULL);
+    tf__now_override = t;
+    tf__ep_now_override = (double)t;
+    char *dn = tf_path_join(dir, "n");
+    c = share_client(dn);
+    tf__client_sharing_answer(c, 1);
+    ss = tf__sharing_session_begin(c, rate, NULL);
+    for (int i = 0; ss && i < 150; ++i) tf__sharing_session_push(ss, x + i * 960, 960); /* 3 s */
+    if (ss) share_finish(c, ss, 1);
+    long long waits[3] = {0, 0, 0};
+    int starts[3] = {0, 0, 0};
+    for (int k = 0; k < 3; ++k) {
+      const int passes = tf__share_passes(c);
+      tf__sharing_outbox_resume(c);
+      for (int i = 0; i < 500 && tf__share_passes(c) <= passes; ++i) SLEEP_MS(10);
+      starts[k] = g_st.starts;
+      char ob[1200], names[8][256], ip[1400];
+      snprintf(ob, sizeof ob, "%s/outbox", dn);
+      const int nn = tf__list_dir(ob, names, 8);
+      long long next = 0;
+      for (int i = 0; i < nn; ++i) {
+        if (strlen(names[i]) != 32) continue;
+        snprintf(ip, sizeof ip, "%s/%s/item.json", ob, names[i]);
+        char *text = NULL;
+        size_t tn = 0;
+        TfJson *ij = !tf_read_file(ip, &text, &tn) ? tf_json_parse(text, tn, NULL) : NULL;
+        const TfJson *na = tf_json_get(ij, "next_at");
+        if (na && na->type == TJ_NUM) next = (long long)na->num;
+        tf_json_free(ij);
+        free(text);
+      }
+      waits[k] = next - t;
+      t = next; /* the next pass at the recording's next attempt */
+      tf__now_override = t;
+      tf__ep_now_override = (double)t;
+    }
+    left = tf__sharing_outbox_wait(c, 20000);
+    CHECK(waits[0] == 300 && waits[1] == 600 && waits[2] == 1200 && starts[0] == 1 && starts[1] == 2 && starts[2] == 3,
+          "uploads after 429s in a row: waits %lld, %lld, %lld s (want 300, 600, 1200), starts %d %d %d", waits[0], waits[1], waits[2], starts[0],
+          starts[1], starts[2]);
+    CHECK(left == 0 && g_st.starts == 4 && g_st.n_s == 1, "uploads after the 429s: the fourth start taken, uploaded (%d left, %d starts)", left,
+          g_st.starts);
+    printf("uploads after three 429s: waits %lld, %lld, %lld s, then uploaded (%d starts, %d PUTs)\n", waits[0], waits[1], waits[2], g_st.starts,
+           g_st.puts);
+    tf__now_override = 0;
+    tf__ep_now_override = 0;
+    tf__client_close(c);
+    free(dn);
+  }
+
   stub_reset();
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   free(x);
   free(da);
   free(db);
@@ -811,7 +893,7 @@ static int session_share_tests(const char *folder, const char *key, const char *
   }
   tf_model_close(m);
   tf__client_close(c);
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   stub_reset();
   free(pcm);
   return fails ? 1 : 0;

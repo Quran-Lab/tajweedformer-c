@@ -117,7 +117,7 @@ static int t_app27(const char *fixture, const char *work) {
           wire[i].build ? wire[i].build : "(none)", wire[i].tail, app27_tail(), wire[i].reg, g_f.last_register);
     if (c) tf_client_destroy(c);
   }
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf_json_free(fx);
   return done("app27");
 }
@@ -367,7 +367,7 @@ static int t_endpoints(const char *vec, const char *fixture, const char *work) {
     d.dest = dest;
     d.base_hint = tf_json_str(tf_json_get(k, "lease_base"));
     const int rc = tf__download_model(&d);
-    tf_http_set_transport(NULL, NULL);
+    tf_http_set_transport(tf_test_net, NULL);
     CHECK(rc && ep_asked_is(tf_json_get(k, "asks_with_p_first")), "first_manifest: %s: every host asked once, in order (%d asked)", S(k, "name"), g_ep_n);
     CHECK(!strcmp(g_ep_path, S(k, "path")), "first_manifest: %s: the path asked %s", S(k, "name"), g_ep_path);
     char folder[600] = "", host[TF_EP_HOST] = "";
@@ -455,7 +455,7 @@ static int t_endpoints(const char *vec, const char *fixture, const char *work) {
     }
     tf__ep_free(e);
   }
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf__ep_now_override = 0;
   printf("  requests: %d sequences, %d steps (the web_frame sequence is web's)\n", seqs, steps);
   /* downloads (16.2, 28.4) and downloads_if_range */
@@ -513,7 +513,7 @@ static int t_endpoints(const char *vec, const char *fixture, const char *work) {
     free(g_dl.data);
     tf__clear_error();
   }
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf__download_on_pause = NULL;
   tf__ep_now_override = 0;
   printf("  downloads: %d\n", dls ? dls->n : 0);
@@ -637,8 +637,10 @@ static int t_endpoints(const char *vec, const char *fixture, const char *work) {
         const TfJson *ra = tf_json_get(k, "retry_after");
         int ra_ok = 1;
         if (ra && ra->type == TJ_NUM && c) {
-          const long long next = tf__pm_next_try(tf__pm(c));
-          ra_ok = next >= before + (long long)ra->num && next <= (long long)time(NULL) + (long long)ra->num;
+          /* 4.0.2 (18.4.7.3): the wait is drawn from 600 to 1800 s, the Retry-After its floor (4.0.1: the Retry-After) */
+          const long long next = tf__pm_next_try(tf__pm(c)), lo = (long long)ra->num > 600 ? (long long)ra->num : 600,
+                          hi = (long long)ra->num > 1800 ? (long long)ra->num : 1800;
+          ra_ok = next >= before + lo && next <= (long long)time(NULL) + hi;
         }
         CHECK(good && hosts_ok && ra_ok, "attempts: %s: want %s, got %s (valid %d, grace %d); answers given %d of %d on the hosts named %d; Retry-After %d",
               S(k, "name"), want, rc ? tf_error_name(rc) : "ok", ls.valid, grace, g_f.at, script ? script->n : 0, hosts_ok, ra_ok);
@@ -650,7 +652,7 @@ static int t_endpoints(const char *vec, const char *fixture, const char *work) {
       printf("  attempts: %d\n", at->n);
       tf_json_free(mj);
     }
-    tf_http_set_transport(NULL, NULL);
+    tf_http_set_transport(tf_test_net, NULL);
     tf_json_free(fx);
   }
   tf_json_free(v);
@@ -834,7 +836,7 @@ static int t_loopback(const char *fixture, const char *work) {
   {
     TfJson *fx = flow_setup(fixture);
     if (!fx) return 2;
-    tf_http_set_transport(NULL, NULL); /* the real HTTP code */
+    tf_http_set_transport(tf_test_net, NULL); /* the real HTTP code */
     static const int modes[] = {LB_REFUSE, LB_FAKE, LB_REFUSE, LB_REFUSE, LB_REFUSE, LB_FAKE, LB_REFUSE, LB_REFUSE};
     lb_setup(api, modes, 8);
     fake_reset(LEASE_OK);
@@ -873,7 +875,7 @@ static int t_loopback(const char *fixture, const char *work) {
     CHECK(api_fo >= 1 && models_fo == 1 && !named, "loopback 1: the silent failover reports (api %d, manifest %d, a host named %d; %d reports)", api_fo,
           models_fo, named, g_f.n_err);
     tf_json_free(fx);
-    tf_http_set_transport(NULL, NULL);
+    tf_http_set_transport(tf_test_net, NULL);
   }
   /* 2. request by request: a 503, a refusal on either host, a 429, the probe back (28.8 checks 1, 2 and 5) */
   {
