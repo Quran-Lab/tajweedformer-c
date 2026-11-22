@@ -1,5 +1,47 @@
 # Changelog
 
+## 4.0.2
+
+Nothing waits for Wi-Fi, an error says what caused it, and the SDK steps back further when Quran Lab's servers are
+busy. No result changes by a bit.
+
+- **Removed: `TfPrefetchOptions.unmetered_only`. Nothing waits for Wi-Fi.** Downloads and uploads use whatever
+  network the machine has: the first download, an update, another context's files, `tf_client_prefetch`, the
+  reference data, shared recordings and reports. There is no replacement option and no compatibility shim: an app
+  that sets `unmetered_only` no longer compiles; delete that line. The struct is smaller, so a program that passes
+  `TfPrefetchOptions` to `tf_client_prefetch` must be rebuilt with the 4.0.2 header before it runs with this library.
+  `TfDiagnosis.connection` stays a report only.
+- **Added: `tf_last_error_cause` and `TfErrorCause`: what caused the error.** The calling thread's last failure, in
+  the same tokens as the error report Quran Lab receives: `stage`, `reason`, `http_status`, `error_name`,
+  `error_code`, and for `TF_ERR_NEEDS_CONNECTION` `needs`: `"model"` (the model files are not on the machine yet:
+  connect to download them) or `"lease"` (the model is here and needs Quran Lab's answer to open). Log them or send
+  them with a support request. The strings stay valid until the thread's next failure; a call used wrongly
+  (`invalid_argument` and the like) has no cause.
+- **Changed: when Quran Lab's servers are busy, the SDK steps back further.** Every request honours the server's
+  `Retry-After`: nothing is asked again before that time, and the waits are kept in the storage folder across
+  restarts. A model that can open is never held up by them. Telemetry, error reports and shared recordings keep what
+  they were sending and send it later; nothing is dropped.
+- **Added: download counts per Quran Lab download server in the daily telemetry.** For each download server the
+  install read the model from that day: the files, bytes and requests, the requests that failed, the time to each
+  answer and the rate of each large file, in buckets. Host names only, never a path, a key or an identifier. They help
+  keep model downloads fast.
+- **Fixed: a session on another context with no network** answers `TF_ERR_NEEDS_CONNECTION` when none of that
+  context's files are on the machine yet, as a first install does. It answered `TF_ERR_DOWNLOAD_FAILED`.
+- **Changed: `tf_client_destroy` gives a model key request in flight up to 3 seconds to finish.** The call can block
+  that long, and the answer is kept. Any other request in flight is cancelled at once, as before.
+- **Changed: closing a Model while a take is still open cancels that take.** Its Session stays valid: its later calls
+  fail cleanly, and `tf_session_destroy` frees it.
+- **Fixed: the ends of objects are safe in any order.** `tf_client_destroy`, `tf_model_close` and
+  `tf_session_destroy` are called once per object (`tf_model_close` once per holder: each `tf_client_model` that gave
+  the Model out); a NULL is a no-op. A Model given out twice whose Client was destroyed now needs both closes. A
+  Session's calls after its Model's close or its Client's destroy, and `tf_client_destroy` while another thread uses
+  that Client's Model or Session, no longer touch freed memory.
+- **Fixed: a new Client on the same storage folder while an earlier Client's Model is still open** shares that
+  Model's state, so an older copy can no longer overwrite newer state on disk.
+- **Fixed: a write that fails during a shared recording keeps the finished segments.** A full disk or an I/O error
+  deleted the whole recording, finished segments included. The finished segments are now kept while sharing is on,
+  and they upload now or at a later launch, as on Android, Apple and web.
+
 ## 4.0.1
 
 A faster first start, backup servers, and room for new options without a rebuild. No result changes by a bit.

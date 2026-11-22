@@ -430,7 +430,7 @@ static int bitrate_tests(const char *vdir, const char *dir) {
          "uploaded as one stream\n", b1, b2, b3, g_st.puts, opened_up + 1, b_up, segs_up);
   tf__now_override = 0;
   tf__client_close(c);
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   stub_reset();
   free(ob);
   free(d3);
@@ -754,7 +754,7 @@ static int consent_tests(const char *vdir, const char *fx_path, const char *dir)
       CHECK(tf__client_sharing_delete(c) == 0, "delete under an older custom version: %s", tf_last_error() ? tf_last_error() : "");
       CHECK(tf__client_sharing_recovery_code(c, code) != 0 && tf__sharing_outbox_pending(c) == 0, "the contributor or the queue survived the deletion");
       deleted = 1;
-      tf_http_set_transport(NULL, NULL);
+      tf_http_set_transport(tf_test_net, NULL);
       tf_json_free(g_rp.fx);
       g_rp.fx = NULL;
     }
@@ -1429,7 +1429,7 @@ static int telemetry_tests(const char *dir) {
   CHECK(events_seen() == e0 && count_files(d, "telemetry-") == 0 && count_files(d, "report-") == 0, "telemetry off sent or kept something");
 
   for (int i = 0; i < 64; ++i) free(g_ts.bodies[i]);
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf__now_override = 0;
   printf("telemetry deltas: %s\n", fails ? "FAIL" : "ok");
   return fails ? 1 : 0;
@@ -1494,7 +1494,7 @@ static int sdk_latest_tests(const char *configs, const char *dir) {
   if (!g_sl.fx) return 2;
   tf_mkdirs(dir);
   tf_http_set_transport(sl_stub, NULL);
-  static const char want[] = "Quran Lab SDK 4.0.2 is available (recommended), you have " TF_SDK_VERSION ": https://github.com/Quran-Lab/tajweedformer-c/releases";
+  static const char want[] = "Quran Lab SDK 4.0.3 is available (recommended), you have " TF_SDK_VERSION ": https://github.com/Quran-Lab/tajweedformer-c/releases";
   char d[1100];
   /* newer: one line at launch; a second newer config (a refresh) adds none */
   snprintf(d, sizeof d, "%s/newer", dir);
@@ -1541,7 +1541,7 @@ static int sdk_latest_tests(const char *configs, const char *dir) {
   }
   printf("sdk_latest quiet: %d/%d (equal, older, absent, malformed: no line, no error, config accepted); release build: no line\n", ok,
          (int)(sizeof quiet / sizeof quiet[0]));
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf_json_free(g_sl.fx);
   printf("sdk_latest: %s\n", fails ? "FAIL" : "ok");
   return fails ? 1 : 0;

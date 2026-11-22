@@ -30,7 +30,7 @@ Everything an assistant needs to integrate this SDK correctly: use only the name
 </td>
 <td valign="top">
 
-**Nothing to host**<br>The SDK downloads the model (56.2 MB for the default context) from our CDN in six regions and verifies it.
+**Nothing to host**<br>The SDK downloads the model (56.2 MB for the default context) from Quran Lab's servers and verifies it.
 
 </td>
 <td valign="top">
@@ -65,7 +65,7 @@ Copy the setup prompt from [sdk.quranlab.ai](https://sdk.quranlab.ai) and paste 
   V4.1 on is published only encrypted, for SDK 4.0 and later.
 - **Coming from 3.x:** [docs/migrating-to-4.md](docs/migrating-to-4.md) says what changes. SDK 3.x stops receiving the
   V4 model on 15 January 2027, 00:00 UTC.
-- **Status:** 4.0.1, not released yet. 4.0.0 was built and tested on Windows x86-64 (MinGW-w64 GCC 13): the 35
+- **Status:** 4.0.2 (2026-11-22). 4.0.0 was built and tested on Windows x86-64 (MinGW-w64 GCC 13): the 35
   conformance clips through the whole 4.0 path (download, install, the model key, the Core) give outputs byte-identical to the 3.1.3 C SDK's; the
   contract's 4.0 vectors (lease, clock, container, attest proof) and a stand-in server's flow pass. Linux x86-64:
   built and tested on every change (GCC, the full `ctest` against the Core's test release for `linux-x64`); the
@@ -79,10 +79,10 @@ hands out its weights or keys. The SDKs around it are open source.
 
 | Repository | What it is | Platforms | Install |
 | - | - | - | - |
-| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR), the exact CPU engine on every phone | Android 8.0+ on arm64-v8a and armeabi-v7a | Maven Central `ai.quranlab:tajweedformer:4.0.0` |
+| [tajweedformer-android](https://github.com/Quran-Lab/tajweedformer-android) | Kotlin SDK (AAR), the exact CPU engine on every phone | Android 8.0+ on arm64-v8a and armeabi-v7a | Maven Central `ai.quranlab:tajweedformer:4.0.1` |
 | [tajweedformer-apple](https://github.com/Quran-Lab/tajweedformer-apple) | Swift SDK: Neural Engine (CoreML) with the exact CPU engine as fallback | iOS 15+, macOS 12+, Apple silicon | SwiftPM, `from: "4.0.1"`, product `TajweedFormer` |
 | [tajweedformer-web](https://github.com/Quran-Lab/tajweedformer-web) | Web SDK: a hosted loader, and the engine in Quran Lab's frame on your page | Browsers, and Node for desktop apps | `<script src="https://web.quranlab.ai/4/loader.js">`, or `npm install @quran-lab/tajweedformer` |
-| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C library and CLI | Windows, Linux (x86-64) | CMake `FetchContent`, tag 4.0.1 |
+| [tajweedformer-c](https://github.com/Quran-Lab/tajweedformer-c) | C library and CLI | Windows, Linux (x86-64) | CMake `FetchContent`, tag 4.0.2 |
 | [tajweedformer-flutter](https://github.com/Quran-Lab/tajweedformer-flutter) | Flutter plugin over the Android and Apple SDKs | Android and iOS | pub.dev, `flutter pub add quranlab_tajweedformer` |
 
 The model is Quran-Lab/tajweedformer-v4 (`sdk/v4.0`), encrypted end to end, hosted by Quran Lab and served by
@@ -94,8 +94,8 @@ revision your learners get, and see the problems your app's learners hit.
 
 The library builds from this repository's tag inside your project, over the Quran Lab Core, which is not built from
 source: download the Core's binary for your target from the release's folder,
-`https://cdn.quranlab.ai/sdk/native/4.0.1/` (`qlcore-4.0.1-windows-x64.zip` with `qlcore.dll` and
-`libwinpthread-1.dll`, or `qlcore-4.0.1-linux-x64.tar.gz` with `qlcore.so`; `SHA256SUMS` beside them), and unpack
+`https://cdn.quranlab.ai/sdk/native/4.0.2/` (`qlcore-4.0.2-windows-x64.zip` with `qlcore.dll` and
+`libwinpthread-1.dll`, or `qlcore-4.0.2-linux-x64.tar.gz` with `qlcore.so`; `SHA256SUMS` beside them), and unpack
 it into a folder of your project, here `qlcore/`. `CMakeLists.txt`:
 
 ```cmake
@@ -106,7 +106,7 @@ include(FetchContent)
 set(QLCORE_DIR "${CMAKE_SOURCE_DIR}/qlcore" CACHE PATH "the Core's binary for this target")
 FetchContent_Declare(tajweedformer
   GIT_REPOSITORY https://github.com/Quran-Lab/tajweedformer-c.git
-  GIT_TAG        4.0.1)
+  GIT_TAG        4.0.2)
 FetchContent_MakeAvailable(tajweedformer)
 
 add_executable(quickstart quickstart.c)
@@ -167,7 +167,8 @@ this install, gets the key that opens it on this install, opens it and warms the
 1.5 s of silence following speech (`end_on_silence_ms`). In a noisy room a take may not end on silence, so keep
 a way to stop (here the end of the input; an app calls `tf_session_finish`); the 20-minute limit ends it in any
 case. Values under 1000 can end a take in a breath pause between two words. A call on a NULL object fails and keeps the first error, so one check at the
-end is enough: `tf_last_error()`, `tf_last_error_fix()` and `tf_error_docs()` say what went wrong and what to do.
+end is enough: `tf_last_error()`, `tf_last_error_fix()` and `tf_error_docs()` say what went wrong and what to do, and
+`tf_last_error_cause()` what caused it (where and why, as short tokens to log or send with a support request).
 
 This library has no microphone: pipe the system's recorder in as raw mono float samples at 16 kHz.
 
@@ -265,7 +266,7 @@ where it says `...`. The output is plain ASCII: the units' letters are `\u` esca
 The last line holds the totals:
 
 ```json
-{"total":{"files":6,"evaluated":6,"failed":0,"with_reference":6,"audio_s":27.507,"processing_s":7.804,"rtf":0.2837,"units":{"ref":138,"hyp":143,"sub":3,"del":0,"ins":5,"rate":0.057971},"words":{"ref":25,"wrong":2,"rate":0.080000},"sdk":"4.0.1","model":"4.1.0","context":"c16_l64","threads":2}}
+{"total":{"files":6,"evaluated":6,"failed":0,"with_reference":6,"audio_s":27.507,"processing_s":7.804,"rtf":0.2837,"units":{"ref":138,"hyp":143,"sub":3,"del":0,"ins":5,"rate":0.057971},"words":{"ref":25,"wrong":2,"rate":0.080000},"sdk":"4.0.2","model":"4.1.0","context":"c16_l64","threads":2}}
 ```
 
 `transcript` is what the public API gives: the decoded text, each unit with its id, time and confidence, and the
@@ -310,8 +311,7 @@ What happens the first time `tf_client_model` runs, and what stays on the device
    attest**; when an attest fails, the new key is deleted and the old one kept.
 3. **The model key.** A challenge, the Core's proof, and `POST /v1/model-key`: the server answers the key to the
    model for this install's key and this Core release. While the machine is online the SDK keeps it up to date in
-   the background (after an answer's `Retry-After` where there is one; a `503 lease_unavailable` is never a
-   refusal), and an open never waits for that. The clock is the Core's own. An answer may carry a data piece (signed
+   the background, honouring the server's `Retry-After`, and an open never waits for that. The clock is the Core's own. An answer may carry a data piece (signed
    data, never code); the SDK hands it to the Core after the answer is accepted, and the Core uses it from the next
    request on.
 4. **The files.** The signed config names the build and its key id (no download address); the signed manifest must
@@ -512,9 +512,20 @@ signing, not exportable, a new agreement key per attest), `tf40_recited` and `tf
 weekly trend), `tf40_eval_units` (tajweedformer-eval without a model: the edit distance and its split, the reference's
 words, ayah ranges, CSV and JSONL references, JSON escapes, every WAV form it reads, FLAC from this SDK's encoder and
 from ffmpeg's: LPC, stereo decorrelation, 24-bit, wasted bits), `tf40_switches` (a signed config with every group off, and without), `tf40_json_leak` (the JSON parser frees a half-parsed child: quranlab-core's sdk-patches/0001),
-`tf40_errors` (section 24's `errors_40.json`, a copy in `test/data/sdk_4.0.0`: every `codes`, `queue`, `telemetry` and
-`signatures` case), `tf40_errors_flow` (with `TF_CONTRACT`: each stage this SDK reports, from its failure against the
-stand-in server, the code the app gets and the report it sends), the
+`tf40_errors` (section 24's `errors_40.json`, a copy in `test/data/sdk_4.0.0`: every `codes`, `queue`, `telemetry`,
+`signatures` and `causes` case), `tf40_errors_flow` (with `TF_CONTRACT`: each stage this SDK reports, from its failure
+against the stand-in server, the code the app gets, the report it sends and the same cause on the app's error),
+`tf40_no_wait` (with `TF_CONTRACT`: section 33's `no_wait_40.json`, a copy in `test/data/sdk_4.0.0`: every case that
+names C against the stand-in server with the platform reporting each case's network, and the requests that went out),
+`tf40_hosts` (with `TF_CONTRACT`: the daily per-host download counts against a stand-in with known timings, and the
+server's check of the bodies), `tf40_requests` (with `TF_CONTRACT`: one request per model file on a full install, one resume from the cut when a
+transfer breaks, with `If-Range`, a partial file completed from its end), `tf40_load` (with `TF_CONTRACT`, on fixed clocks: a 429 with `Retry-After` on each route, also across a restart;
+events after a 429;
+`tf_client_destroy` while a model key request is in flight), `tf40_lifetime` (a call after an object's end: a Session
+after its Model's close, a Model given out twice after its Client's destroy, a late report after the destroy, one Core
+per storage folder, a verified stop then a restart offline, and 1000 rounds of a destroy while the Model and Session
+are in use on another thread; built with AddressSanitizer too on Linux),
+`tf_share_write` (section 29's `share_write_40.json`: a write that fails keeps the finished segments), the
 3.x library tests that need no model (client, sharing, consent, bitrate, telemetry, sdk_latest, errors, crypto), and
 with `TF_CONTRACT` (a quranlab-contract checkout; its test keys only, never a server's): `tf40_lease`, `tf40_clock`,
 `tf40_container`, `tf40_attest` (the contract's vectors through this library and the Core), `tf40_flac` (section
@@ -580,7 +591,11 @@ cli/      tajweedformer.c     info, decode, serve, download, diagnose (each thro
 examples/ quickstart.c        the example app; its marked region is the README's quick start
 test/     tf40_tests.c        SDK 4.0's tests; make_flow40.py makes the stand-in server's data;
                               tf40_eval_tests.inc tests tajweedformer-eval (data/eval: make_eval_flac.py);
-                              tf40_errors_tests.inc the error reports (data/sdk_4.0.0: the contract's errors_40.json)
+                              tf40_errors_tests.inc the error reports (data/sdk_4.0.0: the contract's errors_40.json);
+                              tf40_nowait_tests.inc nothing waits for Wi-Fi (data/sdk_4.0.0: no_wait_40.json);
+                              tf40_load_tests.inc the retries under load (Retry-After, 429);
+                              tf40_requests_tests.inc one request per model file;
+                              tf40_lifetime_tests.inc the objects' ends and one Core per storage folder
           tf_tests.c, *.inc   the 3.x library tests that need no model
 tools/    build.py            build, test and package one target
 docs/     api.md, migrating-to-3.md, migrating-to-4.md, platform-client.md

@@ -1,7 +1,8 @@
 """The public surface of the C SDK is the naming table's and nothing else (SDK 3.0.0; SDK 4.0.0 adds 17.9's
 report of the recited range with the app's outcome: TfRecitedOutcome, TfRecitedAyah,
 tf_session_report_recited_outcome, a function of its own since C has no optional arguments; and section 20's ask:
-TfAskKind, tf_sharing_shown, tf_sharing_open).
+TfAskKind, tf_sharing_shown, tf_sharing_open; SDK 4.0.2 adds 24.13's cause on the app's error: TfErrorCause,
+tf_last_error_cause).
 
   python test/api_scan.py        exit 1 with what differs
 
@@ -29,9 +30,9 @@ bad = []
 
 TYPES = """TfClient TfModel TfSession TfHeads TfBackend TfClientOptions TfClientOptionsExt TfSessionOptions TfChunk TfDecoded TfToken TfWord
 TfFrame TfHead TfEvent TfTokens TfCalibration TfReference TfClip TfSharing TfDiagnosis TfError
-TfModelOptions TfPrefetchOptions TfUnits TfConsentRequest TfRecitedOutcome TfRecitedAyah TfAskKind""".split()
+TfModelOptions TfPrefetchOptions TfUnits TfConsentRequest TfRecitedOutcome TfRecitedAyah TfAskKind TfErrorCause""".split()
 
-FUNCTIONS = """tf_version tf_last_error_code tf_last_error tf_last_error_fix tf_error_name tf_error_fix tf_error_docs
+FUNCTIONS = """tf_version tf_last_error_code tf_last_error tf_last_error_fix tf_last_error_cause tf_error_name tf_error_fix tf_error_docs
 tf_decoded_json tf_heads_count tf_heads_name tf_heads_get tf_heads_greedy tf_heads_decoded
 tf_client_create tf_client_create2 tf_client_destroy tf_client_model tf_client_prefetch tf_client_storage_json tf_client_remove_models
 tf_client_diagnose tf_client_diagnose_json tf_client_report_checks tf_client_background tf_client_foreground

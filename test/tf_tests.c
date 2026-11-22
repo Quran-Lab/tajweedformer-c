@@ -7,6 +7,7 @@
  *   tf_tests vectors30 <data dir> <work dir>
  *   tf_tests ogg | codec | sharing | upload | client | bitrate | consent | sdk_latest   (as in 3.x)
  *   tf_tests join_window <work>   flags.share_join_ms read as 0 to 60000 (SDK 4.0, contract section 23)
+ *   tf_tests share_write <share_write_40.json> <work>   a failed write keeps the finished segments
  *
  * The work folder (the last argument) is emptied before the test runs. */
 #ifndef _CRT_SECURE_NO_WARNINGS
@@ -24,6 +25,7 @@
 
 #include "tajweedformer.h"
 #include "tf_internal.h"
+#include "tf_test_net.h"
 #if defined(_WIN32)
 #include <windows.h>
 #include <psapi.h>
@@ -193,6 +195,7 @@ static int crypto_tests(void) {
 #include "tf_share_tests.inc"
 #include "tf_201_tests.inc"
 #include "tf_30_tests.inc"
+#include "tf_share_write_tests.inc"
 
 /* Every run starts from an empty work folder, as tf40_tests' do. A test that meets the folder of an earlier run (ctest
  * --repeat, or one test run again without tf_work_clean) finds that run's outbox, consent, ask and counters, and fails
@@ -203,7 +206,8 @@ static int fresh_work(int argc, char **argv) {
     const char *name;
     int argc, work; /* the arguments the test needs, and the one that is its work folder */
   } k[] = {{"vectors30", 4, 3}, {"sharing", 5, 4}, {"ogg", 4, 3},    {"codec", 4, 3},      {"upload", 3, 2},   {"join_window", 3, 2},
-           {"client", 4, 3},    {"bitrate", 4, 3}, {"consent", 5, 4}, {"sdk_latest", 4, 3}, {"telemetry", 3, 2}};
+           {"client", 4, 3},    {"bitrate", 4, 3}, {"consent", 5, 4}, {"sdk_latest", 4, 3}, {"telemetry", 3, 2},
+           {"share_write", 4, 3}};
   for (size_t i = 0; argc >= 2 && i < sizeof k / sizeof k[0]; ++i)
     if (argc >= k[i].argc && !strcmp(argv[1], k[i].name)) {
       /* a folder that will not go (a file still held open) stops the run here, not as a test failure later */
@@ -216,6 +220,7 @@ static int fresh_work(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+  tf_http_set_transport(tf_test_net, NULL); /* no test reaches a host but this machine (tf_test_net.h) */
   cap_own_memory();
   tf__client_no_timer = 1; /* the replayed exchanges and stubs run on the test's thread */
   if (fresh_work(argc, argv)) return 2;
@@ -232,6 +237,7 @@ int main(int argc, char **argv) {
   if (argc >= 5 && !strcmp(argv[1], "consent")) return consent_tests(argv[2], argv[3], argv[4]);
   if (argc >= 4 && !strcmp(argv[1], "sdk_latest")) return sdk_latest_tests(argv[2], argv[3]);
   if (argc >= 3 && !strcmp(argv[1], "telemetry")) return telemetry_tests(argv[2]);
+  if (argc >= 4 && !strcmp(argv[1], "share_write")) return share_write_tests(argv[2], argv[3]);
   fprintf(stderr, "usage: see the comment at the top of test/tf_tests.c%c", 10);
   return 2;
 }

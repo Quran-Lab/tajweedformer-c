@@ -203,8 +203,15 @@ typedef struct {
   char stage[16], reason[33], name[49], code[33];
   char role[8]; /* 4.0.1 (28.7): the role of the request the cause is, "" for none */
   int fallback; /* 0 none, 1 false, 2 true */
+  int here;     /* 4.0.2 (24.13 item 3): every file the call needs was on the device when the cause was seen */
 } Cause;
 static _Thread_local Cause t_cause;
+static _Thread_local int t_here; /* tf__cause_files_here */
+int tf__cause_files_here(int here) {
+  const int was = t_here;
+  t_here = here ? 1 : 0;
+  return was;
+}
 typedef char tf__cause_fits_err_state[sizeof(Cause) <= sizeof(((TfErrState *)0)->cause) ? 1 : -1];
 _Thread_local int tf__app_call;
 /* 4.0.1 (ENDPOINTS_40.md 28.7, ERRORS_40.md 24.2): a cause that is a request to Quran Lab's hosts carries the role of
@@ -238,6 +245,7 @@ void tf__cause(const char *stage, const char *reason, int status, const char *er
   t_cause.retries = -1;
   if (name_ok(error_name)) snprintf(t_cause.name, sizeof t_cause.name, "%s", error_name);
   if (code_ok(error_code)) snprintf(t_cause.code, sizeof t_cause.code, "%s", error_code);
+  t_cause.here = t_here;
   host_of(&t_cause);
 }
 void tf__cause_force(void) { t_cause.force = t_cause.set; }
@@ -655,14 +663,54 @@ static void occur(const Cause *k, const char *code) {
   }
   gunlock();
 }
-/* tf__raise: `code` reached the app */
-void tf__rep_raised(int code) {
+/* ------------------------------------------------------------------ 24.13: the cause on the app's error (4.0.2) */
+/* The tokens of the report, made where the report is made, kept on the thread for tf_last_error_cause until its
+ * next failure. `serial` is the error's (tf__error_serial): a later error, raised or not, never shows this cause. */
+typedef struct {
+  int set, code, status;
+  unsigned serial;
+  char stage[16], reason[33], name[49], ecode[33], needs[8];
+} PubCause;
+static _Thread_local PubCause t_pub;
+static void pub_set(const Cause *k, int code) {
+  t_pub.set = 1;
+  t_pub.code = code;
+  t_pub.serial = tf__error_serial();
+  t_pub.status = k->status;
+  snprintf(t_pub.stage, sizeof t_pub.stage, "%s", k->stage);
+  snprintf(t_pub.reason, sizeof t_pub.reason, "%s", k->reason);
+  snprintf(t_pub.name, sizeof t_pub.name, "%s", k->name);
+  snprintf(t_pub.ecode, sizeof t_pub.ecode, "%s", k->code);
+  /* item 3: needs_connection needs the lease when every file the call needs was on the device, else the model */
+  snprintf(t_pub.needs, sizeof t_pub.needs, "%s", code == TF_ERR_NEEDS_CONNECTION ? (k->here ? "lease" : "model") : "");
+}
+int tf_last_error_cause(TfErrorCause *out) {
+  if (!out) return 0;
+  memset(out, 0, sizeof *out);
+  const int code = tf_last_error_code();
+  if (!code || !t_pub.set || t_pub.code != code || t_pub.serial != tf__error_serial()) return 0;
+  out->stage = t_pub.stage;
+  out->reason = t_pub.reason;
+  out->error_name = t_pub.name[0] ? t_pub.name : NULL;
+  out->error_code = t_pub.ecode[0] ? t_pub.ecode : NULL;
+  out->needs = t_pub.needs[0] ? t_pub.needs : NULL;
+  out->http_status = t_pub.status;
+  return 1;
+}
+/* tf__raise: `code` reached the app (report 0: the same failure handed over again, never reported twice) */
+void tf__rep_raised(int code, int report) {
   const char *name = tf_error_name(code);
   if (name && code < 0 && tf__rep_reported(NULL, name)) {
     Cause k;
-    if (t_cause.set && t_cause.bound == code) k = t_cause;
+    const int own = t_cause.set && t_cause.bound == code;
+    if (own) k = t_cause;
     else default_cause(name, &k);
-    occur(&k, name);
+    /* 24.13 item 1: the cause is the report's; an error handed over again with no cause of its own keeps the one it
+     * has (a call on a NULL object after a failed one) */
+    if (own || !t_pub.set || t_pub.serial != tf__error_serial()) pub_set(&k, code);
+    if (report) occur(&k, name);
+  } else {
+    t_pub.set = 0; /* the codes of the app's own misuse carry no cause (24.13 item 1) */
   }
   tf__cause_clear();
 }

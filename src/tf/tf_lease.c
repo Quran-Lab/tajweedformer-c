@@ -64,9 +64,12 @@ struct TfPm {
   char build[41];     /* the build of the lease this install last had accepted (lease.json) */
   char base[512];     /* where that build's containers are (the lease answer's base; lease.json) */
   char *rec;          /* <storage>/install/lease.json */
+  char *row;          /* 4.0.2 (18.4.7.3 item 5): <storage>/install/lease_row.json, the row of failures kept */
   long long next_try; /* the background refresh's next attempt (unix s) */
-  int fails;
+  int fails;          /* 18.4.7.3: the failed attempts in a row, kept across restarts; a lease accepted or a stop ends it */
   int route_off;      /* the lease route answered 404 not_found in this launch */
+  char *dir;          /* 4.0.2: the storage folder; one host per folder in the process (the registry below) */
+  long long lease_iat; /* 4.0.2: the server's issue time of the lease in lease.json (0: not known) */
   int open_err;       /* why the key store or the Core could not be made (0 when they were) */
   /* 18.4.7.1, this process's lease attempts */
   TfCond cv;           /* an attempt ended */
@@ -95,23 +98,66 @@ static void rec_load(TfPm *p) {
   size_t n = 0;
   TfJson *j = p->rec && !tf_read_file(p->rec, &text, &n) ? tf_json_parse(text, n, NULL) : NULL;
   const char *b = tf_json_str(tf_json_get(j, "build")), *u = tf_json_str(tf_json_get(j, "base"));
+  const TfJson *iat = tf_json_get(j, "iat");
   if (b && strlen(b) == 40 && strspn(b, "0123456789abcdef") == 40) {
     snprintf(p->build, sizeof p->build, "%s", b);
     if (u && (base_ok(u) || tf__lease_test_base) && strlen(u) < sizeof p->base) snprintf(p->base, sizeof p->base, "%s", u);
+    p->lease_iat = iat && iat->type == TJ_NUM && iat->num > 0 ? (long long)iat->num : 0;
   }
   tf_json_free(j);
   free(text);
 }
+/* the issue time of the lease lease.json holds now (0: none, or not known) */
+static long long rec_iat_now(const TfPm *p) {
+  char *text = NULL;
+  size_t n = 0;
+  TfJson *j = p->rec && !tf_read_file(p->rec, &text, &n) ? tf_json_parse(text, n, NULL) : NULL;
+  const TfJson *iat = tf_json_get(j, "iat");
+  const long long v = tf_json_str(tf_json_get(j, "build")) && iat && iat->type == TJ_NUM && iat->num > 0 ? (long long)iat->num : 0;
+  tf_json_free(j);
+  free(text);
+  return v;
+}
+/* 18.4.7.3 item 5 (4.0.2): the row of failures and its next attempt, kept across restarts; a next attempt more than
+ * 21600 s ahead of the clock at start (a clock that moved back) is read as now */
+static long long now_s(void);
+static void row_load(TfPm *p) {
+  char *text = NULL;
+  size_t n = 0;
+  TfJson *j = p->row && !tf_read_file(p->row, &text, &n) ? tf_json_parse(text, n, NULL) : NULL;
+  const TfJson *f = tf_json_get(j, "fails"), *t = tf_json_get(j, "next_try");
+  if (f && f->type == TJ_NUM && f->num >= 1 && f->num <= 100 && t && t->type == TJ_NUM && t->num > 0) {
+    p->fails = (int)f->num;
+    p->next_try = (long long)t->num > now_s() + 21600 ? now_s() : (long long)t->num;
+  }
+  tf_json_free(j);
+  free(text);
+}
+static void row_save(TfPm *p) {
+  if (!p->row) return;
+  if (!p->fails) {
+    remove(p->row);
+    return;
+  }
+  char t[96];
+  const int n = snprintf(t, sizeof t, "{\"fails\":%d,\"next_try\":%lld}\n", p->fails, p->next_try);
+  tf_write_file(p->row, t, (size_t)n);
+}
+/* Under the host's lock (one host per folder in the process: the folder's lock). A clear (a verified stop, a refusal,
+ * the models removed: no build) always goes; a lease is never replaced by one the server issued earlier (4.0.2) */
 static void rec_save(TfPm *p) {
   if (!p->rec) return;
   if (!p->build[0]) {
     remove(p->rec);
     return;
   }
+  const long long kept = rec_iat_now(p);
+  if (kept > 0 && p->lease_iat > 0 && p->lease_iat < kept) return;
   TfBuf b;
   tf_buf_init(&b);
   tf_buf_printf(&b, "{\"build\":\"%s\",\"base\":", p->build);
   tf_buf_json_str(&b, p->base);
+  if (p->lease_iat > 0) tf_buf_printf(&b, ",\"iat\":%lld", p->lease_iat);
   tf_buf_puts(&b, "}\n");
   if (b.p) tf_write_file(p->rec, b.p, b.n);
   tf_buf_free(&b);
@@ -227,10 +273,51 @@ static int core_make(TfPm *p, int pending) {
 
 /* the Client's Core host, made at first use: the install keys (made when there are none), the platform table, the
  * Core with the state it saved last. NULL and an error when the key store cannot be used. */
+/* 4.0.2: one Core host per storage folder in this process. A Client made while the folder's host still lives (a Model
+ * of an earlier Client open, holding it) takes that host, refcounted, so two Cores never save one folder's state; the
+ * entry goes with the host's last holder (pm_drop), and the next Client makes a new one. */
+#define TF_PM_REG 16
+static TfPm *g_reg[TF_PM_REG];
+static volatile char g_reg_spin;
+static void reg_lock(void) {
+  while (__atomic_test_and_set(&g_reg_spin, __ATOMIC_ACQUIRE)) {
+  }
+}
+static void reg_unlock(void) { __atomic_clear(&g_reg_spin, __ATOMIC_RELEASE); }
+static void pm_free(TfPm *p);
+/* one holder less; the host goes with its last (out of the registry first, so no Client takes it then) */
+static void pm_drop(TfPm *p) {
+  reg_lock();
+  tf_mutex_lock(&p->lock);
+  const int last = --p->refs == 0;
+  tf_mutex_unlock(&p->lock);
+  if (last)
+    for (int i = 0; i < TF_PM_REG; ++i)
+      if (g_reg[i] == p) g_reg[i] = NULL;
+  reg_unlock();
+  if (last) pm_free(p);
+}
+
+int tf__pm_made; /* tests: Core hosts made in this process */
 TfPm *tf__pm(TfClient *c) {
   if (!c) return NULL;
   TfPm **s = slot(c);
   if (*s) return *s;
+  const char *dir = tf__client_dir(c);
+  reg_lock();
+  for (int i = 0; dir && i < TF_PM_REG; ++i)
+    if (g_reg[i] && g_reg[i]->dir && !strcmp(g_reg[i]->dir, dir)) {
+      TfPm *live = g_reg[i];
+      tf_mutex_lock(&live->lock);
+      live->refs++;
+      live->client_gone = 0;
+      tf_mutex_unlock(&live->lock);
+      reg_unlock();
+      *s = live;
+      return live;
+    }
+  reg_unlock();
+  tf__pm_made++;
   TfPm *p = (TfPm *)calloc(1, sizeof *p);
   if (!p) {
     tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
@@ -258,8 +345,18 @@ TfPm *tf__pm(TfClient *c) {
   }
   char *inst = tf_path_join(tf__client_dir(c), "install");
   p->rec = inst ? tf_path_join(inst, "lease.json") : NULL;
+  p->row = inst ? tf_path_join(inst, "lease_row.json") : NULL;
   free(inst);
   rec_load(p);
+  row_load(p);
+  p->dir = dir ? strdup(dir) : NULL;
+  reg_lock();
+  for (int i = 0; p->dir && i < TF_PM_REG; ++i)
+    if (!g_reg[i]) {
+      g_reg[i] = p;
+      break;
+    }
+  reg_unlock();
   *s = p;
   return p;
 }
@@ -296,6 +393,8 @@ static void pm_free(TfPm *p) {
   tf_cond_destroy(&p->cv);
   tf_mutex_destroy(&p->lock);
   free(p->rec);
+  free(p->row);
+  free(p->dir);
   free(p);
 }
 void tf__pm_retain(TfPm *p) {
@@ -303,12 +402,7 @@ void tf__pm_retain(TfPm *p) {
   p->refs++;
   tf_mutex_unlock(&p->lock);
 }
-void tf__pm_release(TfPm *p) {
-  tf_mutex_lock(&p->lock);
-  const int last = --p->refs == 0;
-  tf_mutex_unlock(&p->lock);
-  if (last) pm_free(p);
-}
+void tf__pm_release(TfPm *p) { pm_drop(p); }
 /* the Client goes: the host stays while a model of its Core is open */
 void tf__pm_client_gone(TfClient *c) {
   TfPm **s = slot(c), *p = *s;
@@ -316,9 +410,8 @@ void tf__pm_client_gone(TfClient *c) {
   if (!p) return;
   tf_mutex_lock(&p->lock);
   p->client_gone = 1;
-  const int last = --p->refs == 0;
   tf_mutex_unlock(&p->lock);
-  if (last) pm_free(p);
+  pm_drop(p);
 }
 
 /* ------------------------------------------------------------------ attest */
@@ -412,6 +505,7 @@ static int refusal(TfClient *c, TfPm *p, const TfHttpResponse *r) {
   const int st = qlc_refusal_accept(p->core, r->body, r->body_n, kid ? kid : "");
   if (st == QLC_E_STOPPED) {
     p->build[0] = p->base[0] = 0; /* the Core cleared its lease */
+    p->lease_iat = 0;
     rec_save(p);
   }
   tf_mutex_unlock(&p->lock);
@@ -499,10 +593,13 @@ static int lease_taken(void *user, const TfHttpResponse *r) {
       snprintf(p->build, sizeof p->build, "%s", t->build);
       p->base[0] = 0;
       if (base && strlen(base) < sizeof p->base) snprintf(p->base, sizeof p->base, "%s", base);
+      const TfJson *iat = tf_json_get(j, "iat");
+      p->lease_iat = iat && iat->type == TJ_NUM && iat->num > 0 ? (long long)iat->num : 0;
       rec_save(p);
       if (cert) tf__ikey_set_cert(p->ik, cert);
       p->fails = 0;
       p->next_try = 0;
+      row_save(p);
       ok = t->accepted = 1;
     } else {
       why = 3;
@@ -722,6 +819,27 @@ static void attempt_done(TfPm *p, int leased) {
   tf_mutex_unlock(&p->lock);
 }
 long long tf__pm_next_try(TfPm *p) { return p ? p->next_try : 0; }
+/* 4.0.2: the Client is being destroyed. A lease attempt in flight (the timer's refresh, an open's) gets up to max_s to
+ * end before the close cancels the Client's requests, so a lease the server gives is accepted, and kept: the accept saves
+ * it (lease_taken). The wait wakes at each attempt's end. */
+void tf__pm_closing(TfClient *c, double max_s) {
+  TfPm *p = c ? *slot(c) : NULL;
+  if (!p) return;
+  const double until = tf__now_s() + max_s;
+  tf_mutex_lock(&p->lock);
+  for (;;) {
+    const double left = until - tf__now_s();
+    if (p->attempting <= 0 || left <= 0) break;
+    tf_cond_wait_ms(&p->cv, &p->lock, (long)(left * 1000) + 1);
+  }
+  tf_mutex_unlock(&p->lock);
+}
+/* an attempt that failed because the Client's close cancelled its requests: no failed attempt (no unreachable told to
+ * the Core, no failure row, no wait) */
+static int cut_by_close(TfClient *c, int rc) {
+  volatile int *f = rc ? tf__client_cancel_flag(c) : NULL;
+  return f && *f;
+}
 int tf__pm_grace(TfPm *p, long long *until) {
   int64_t u = 0;
   if (!p) return 0;
@@ -740,6 +858,31 @@ static void grace_report(TfPm *p) {
   tf_mutex_unlock(&p->lock);
   tf__rep_silent("lease", "grace", st, NULL, why);
 }
+
+/* 18.4.7.3 (4.0.2, contract dd76474): the wait after a failed attempt, drawn uniformly from 600 to 1800 s afresh at each
+ * failure from the platform's random source, so installs that failed together do not come back together */
+static long long lease_step(void) {
+  uint32_t r = 0;
+  if (tf_random_bytes((uint8_t *)&r, sizeof r)) r = (uint32_t)time(NULL) * 2654435761u;
+  return 600 + (long long)(r % 1201u);
+}
+long long tf__pm_lease_step(void) { return lease_step(); }
+/* an attempt that brought no lease (a 5xx, a 429, no answer; not a verified stop): the next background attempt waits
+ * the drawn time, or the answer's Retry-After when that is longer (a floor: it never shortens the wait); kept */
+static void row_failed(TfPm *p, int retry_after) {
+  if (p->fails < 100) p->fails++;
+  long long wait = lease_step();
+  if (retry_after > wait) wait = retry_after;
+  p->next_try = now_s() + wait;
+  row_save(p);
+}
+static void row_ended(TfPm *p) {
+  const int had = p->fails;
+  p->fails = 0;
+  p->next_try = 0;
+  if (had) row_save(p);
+}
+int tf__pm_fails(TfPm *p) { return p ? p->fails : 0; }
 
 int tf__pm_lease(TfClient *c, TfPm *p, const char *manifest, size_t mn, const TfJson *m, const char *build) {
   if (!p) return tf__error_code() ? tf__error_code() : tf__fail(TF_ERR_STORAGE_FAILED, "no install key store");
@@ -762,6 +905,9 @@ int tf__pm_lease(TfClient *c, TfPm *p, const char *manifest, size_t mn, const Tf
    * the running attempt, then gave its own attempt 10 s more, and a second call of the same open waited for the
    * running one again: 32 s on staging behind a hanging lease request (Stage B). */
   const int expired = s.has_lease && !s.valid && !s.stopped && same;
+  /* 18.4.7.3 item 3: an open while the lease is in its grace, during a row of failures, waits for the row's next
+   * attempt like the SDK's own attempts (no request now); a call with no usable lease asks at once (item 4) */
+  if (expired && p->fails > 0 && p->next_try > now_s() && tf__pm_grace(p, NULL)) return 0; /* the open reports it */
   double until = 0;
   if (expired) {
     tf_mutex_lock(&p->lock);
@@ -813,12 +959,15 @@ int tf__pm_lease(TfClient *c, TfPm *p, const char *manifest, size_t mn, const Tf
   }
   tf__client_deadline(0);
   if (rc == 1) rc = tf__fail(TF_ERR_SERVER_REJECTED, "the lease was refused twice"); /* rule 3: a refusal, not a stop */
-  tf__client_count_lease(c, rc ? t_cause : 0); /* 17.8 lease: a request was made */
+  /* 4.0.2: an attempt the Client's close cancelled is none: nothing told to the Core, counted or kept */
+  const int cut = cut_by_close(c, rc);
+  if (!cut) tf__client_count_lease(c, rc ? t_cause : 0); /* 17.8 lease: a request was made */
   const int stopped = t_stopped;
   /* no answer, or try later: a valid lease of this build still opens it */
   if (rc && (rc == TF__ERR_NETWORK || rc == TF__ERR_HTTP) && s.valid && same) {
-    attempt_ended(p, seq0, rc == TF__ERR_NETWORK ? net_code() : TF_ERR_DOWNLOAD_FAILED, stopped);
+    if (!cut) attempt_ended(p, seq0, rc == TF__ERR_NETWORK ? net_code() : TF_ERR_DOWNLOAD_FAILED, stopped);
     attempt_done(p, 0);
+    if (!cut && tf__http_answer(NULL, NULL) != seq0) row_failed(p, t_retry_after); /* 18.4.7.3: an attempt that asked */
     tf__clear_error();
     return 0;
   }
@@ -832,24 +981,19 @@ int tf__pm_lease(TfClient *c, TfPm *p, const char *manifest, size_t mn, const Tf
   /* 24.4 rule 2: a server's answer that is not a refusal (429, 5xx, a redirect, a 200 without a lease) is
    * download_failed, never the server_rejected an internal HTTP error would read as: try again later */
   if (rc == TF__ERR_HTTP) rc = tf__error_as(TF_ERR_DOWNLOAD_FAILED);
-  if (rc) attempt_ended(p, seq0, rc, stopped);
+  if (rc && !cut) attempt_ended(p, seq0, rc, stopped);
   attempt_done(p, !rc);
-  /* an answer that named when to ask again: the timer's next attempt is not before it */
-  if (rc && t_retry_after > 0) p->next_try = now_s() + t_retry_after;
+  /* 18.4.7.3: the app's attempt is a failed attempt like any other, its Retry-After a floor; a call that met a held
+   * route (28.11 item 2: it failed as that answer did, without a request) asked nothing and draws no new wait */
+  if (rc && !stopped && !cut && tf__http_answer(NULL, NULL) != seq0) row_failed(p, t_retry_after);
+  else if (stopped) row_ended(p);
   /* 18.4.7.1: the expired lease opens in its grace (the Core decides: an attempt ended unreachable since the lease,
-   * none refused, before exp + 86400); a request the 10 s cut is asked again at the timer's next tick */
+   * none refused, before exp + 86400); the timer asks again after the row's wait */
   if (rc && !stopped && same && tf__pm_grace(p, NULL)) {
-    if (expired && t_retry_after <= 0) p->next_try = now_s();
     tf__clear_error();
     return 0; /* the open reports it (tf__pm_open) */
   }
   return rc;
-}
-
-/* the delays of 18.4.7 after a failed background refresh */
-static long long backoff(int fails) {
-  static const long long d[] = {60, 300, 1800, 7200, 14400, 21600};
-  return d[fails < 6 ? fails : 5];
 }
 
 /* On the Client's timer: the Core's tick (the lease's clock, the day's audio, the recited journal, the saved state),
@@ -867,7 +1011,7 @@ void tf__pm_tick(TfClient *c, const char *build_dir, const char *build) {
   size_t n = 0;
   TfJson *m = mp && !tf_read_file(mp, &text, &n) ? tf_json_parse(text, n, NULL) : NULL;
   free(mp);
-  int rc = -1;
+  int rc = -1, asked = 0, cut = 0;
   if (m) {
     int renewed = 0;
     attempt_begin(p);
@@ -882,19 +1026,34 @@ void tf__pm_tick(TfClient *c, const char *build_dir, const char *build) {
       rc = lease_once(c, p, text, n, m, build, &renewed);
       if (rc != 1) break;
     }
-    /* 18.4.7.1: a background attempt that brought no lease is told to the Core too */
-    if (rc && rc != TF__ERR_NOT_AVAILABLE)
+    /* 18.4.7.1: a background attempt that brought no lease is told to the Core too; 4.0.2: one the Client's close cancelled
+     * is no attempt (read before attempt_done, which ends the close's wait) */
+    cut = rc && rc != TF__ERR_NOT_AVAILABLE && cut_by_close(c, rc);
+    if (rc && rc != TF__ERR_NOT_AVAILABLE && !cut)
       attempt_ended(p, seq0, rc == TF__ERR_NETWORK ? TF_ERR_NEEDS_CONNECTION : rc == 1 ? TF_ERR_SERVER_REJECTED : TF_ERR_DOWNLOAD_FAILED, t_stopped);
     attempt_done(p, !rc);
+    asked = tf__http_answer(NULL, NULL) != seq0;
+  }
+  if (cut) {
+    tf__clear_error();
+    tf_json_free(m);
+    free(text);
+    return;
   }
   if (m && rc != TF__ERR_NOT_AVAILABLE) tf__client_count_lease(c, rc ? (rc == 1 ? 6 : t_cause) : 0);
   if (rc && rc != TF__ERR_NOT_AVAILABLE) tf__cause_silent(); /* 24.1: the background refresh failed (not on the network) */
-  if (rc) {
-    /* 18.4.7's backoff; an answer's Retry-After (503 lease_unavailable) sets the next attempt instead */
-    p->next_try = now_s() + (t_retry_after > 0 ? t_retry_after : backoff(p->fails));
-    if (p->fails < 100) p->fails++;
+  if (rc && t_stopped) {
+    row_ended(p); /* 18.4.7.3 item 5: a verified stop ends the row */
+  } else if (rc && (asked || !p->next_try)) {
+    /* 18.4.7.3: 600 to 1800 s drawn afresh, the answer's Retry-After as a floor (4.0.1 let it replace the step: 503
+     * lease_unavailable's 30 s made a lease outage a 30 s retry loop) */
+    row_failed(p, t_retry_after);
+  } else if (rc) {
+    /* a refresh that met a held route asked nothing: the next attempt after the hold */
+    p->next_try = now_s() + (t_retry_after > 0 ? t_retry_after : lease_step());
+    row_save(p);
   } else {
-    p->next_try = 0;
+    row_ended(p);
   }
   tf__clear_error(); /* a background refresh is never the app's error */
   tf_json_free(m);
@@ -946,9 +1105,8 @@ void tf__pm_close(TfPm *p, qlc_model *m) {
   qlc_model_close(m);
   tf_mutex_lock(&p->lock);
   p->open_models--;
-  const int last = --p->refs == 0;
   tf_mutex_unlock(&p->lock);
-  if (last) pm_free(p);
+  pm_drop(p);
 }
 
 int tf__pm_status(TfPm *p, qlc_lease_status *s) {
@@ -960,6 +1118,15 @@ int tf__pm_status(TfPm *p, qlc_lease_status *s) {
   return rc;
 }
 
+/* tests (tf40_tests lifetime): lease.json written for `build` as from a lease issued at `iat` */
+void tf__pm_test_rec_save(TfPm *p, const char *build, long long iat) {
+  if (!p) return;
+  tf_mutex_lock(&p->lock);
+  snprintf(p->build, sizeof p->build, "%s", build);
+  p->lease_iat = iat;
+  rec_save(p);
+  tf_mutex_unlock(&p->lock);
+}
 void tf__pm_lock(TfPm *p) { tf_mutex_lock(&p->lock); }
 void tf__pm_unlock(TfPm *p) { tf_mutex_unlock(&p->lock); }
 

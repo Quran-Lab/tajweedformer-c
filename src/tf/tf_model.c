@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "tf_internal.h"
+#include "tf_thread.h"
 
 /* Quran Lab's manifest and config signing key (raw Ed25519, hex) and its key id (first 8 bytes of its
  * SHA-256), the public half of qlab-cdn's and qlab-api's MANIFEST_SIGNING_KEY, as in every SDK. */
@@ -68,6 +69,14 @@ struct TfModel {
   int eng_rate;
   double load_ms;
   TfSession *open;         /* the one open Session */
+  /* 4.0.2: the link to the Client (client, open, and the open Session's shared copy) changes and is read under
+   * `link`; a call that reaches the Client holds it (tf__client_hold). holders: the Client's count of holders, the
+   * Model's own once the Client is destroyed; sessions: the Sessions alive, for which the Model's memory stays;
+   * app_closed: tf_model_close has run; fetch_off: no download (tf__model_verify); zs_gen: the stream's generation,
+   * one more at each stream made or destroyed */
+  TfMutex link;
+  int holders, sessions, app_closed, fetch_off;
+  unsigned zs_gen;
   TfReference ref;
   int has_ref;
   char *info_json;
@@ -75,6 +84,16 @@ struct TfModel {
 
 const char *tf__model_dir(const TfModel *m) { return m->dir; }
 TfClient *tf__model_client(const TfModel *m) { return m ? m->client : NULL; }
+TfClient *tf__model_client_hold(TfModel *m) {
+  if (!m) return NULL;
+  tf_mutex_lock(&m->link);
+  TfClient *c = m->client;
+  if (c) tf__client_hold(c);
+  tf_mutex_unlock(&m->link);
+  return c;
+}
+void tf__model_link_lock(TfModel *m) { tf_mutex_lock(&m->link); }
+void tf__model_link_unlock(TfModel *m) { tf_mutex_unlock(&m->link); }
 const TfJson *tf__model_manifest(const TfModel *m) { return m->manifest; }
 const char *tf__model_default_context(const TfModel *m) { return m->default_context; }
 qlc_model *tf__model_engine(TfModel *m) { return m ? m->zm : NULL; }
@@ -108,7 +127,9 @@ int tf__resolve_context(const char *app, const char *config_json, const char *co
 const char *tf__model_context_in_force(TfModel *m, char *out, size_t n) {
   const char *list[MAX_CONTEXTS];
   for (int i = 0; i < m->n_contexts; ++i) list[i] = m->contexts[i];
-  tf__resolve_context(NULL, m->client ? tf__client_config_json(m->client) : NULL, list, m->n_contexts, m->default_context, out, n, NULL);
+  TfClient *c = tf__model_client_hold(m);
+  tf__resolve_context(NULL, c ? tf__client_config_json(c) : NULL, list, m->n_contexts, m->default_context, out, n, NULL);
+  tf__client_unhold(c);
   return out;
 }
 int tf__model_has_context(const TfModel *m, const char *context) {
@@ -702,15 +723,43 @@ static void engine_close(TfModel *m);
 int tf__client_model_release(TfClient *c, TfModel *m);
 void tf__session_detach(TfSession *s);
 
+int tf__model_frees; /* tests: Models freed in this process */
+static void model_free(TfModel *m);
 void tf_model_close(TfModel *m) {
-  if (!m) return;
-  /* a Model the Client gave out more than once stays open until its last holder closes it */
-  if (m->client && tf__client_model_release(m->client, m)) return;
-  TfClient *const client = m->client;
+  if (!m || m->app_closed) return; /* a Model kept for its Sessions was closed already */
+  /* a Model the Client gave out more than once stays open until its last holder closes it; once the Client is
+   * destroyed the count is the Model's own (4.0.2: it went with the Client, and a second close freed it twice) */
+  TfClient *const client = tf__model_client_hold(m);
+  if (client) {
+    if (tf__client_model_release(client, m)) {
+      tf__client_unhold(client);
+      return;
+    }
+  } else if (m->holders > 1) {
+    m->holders--;
+    return;
+  }
   if (client) tf__client_session_close(client); /* 17.8: the Model's close ends the analytics session */
+  /* 4.0.2: a take still open is cancelled; its Session stays valid, its take over */
+  if (m->open) tf_session_cancel(m->open);
   engine_close(m);
   tf__reference_release(&m->ref);
   if (m->pm) tf__pm_release(m->pm);
+  m->pm = NULL;
+  /* no longer the Client's (its destroy will not detach it); its memory stays while a Session of it lives */
+  tf_mutex_lock(&m->link);
+  m->client = NULL;
+  m->app_closed = 1;
+  const int last = m->sessions <= 0;
+  tf_mutex_unlock(&m->link);
+  if (last) model_free(m);
+  /* SPEC 15.3: a refusal arrived while this Model was open: its files go now */
+  if (client) {
+    tf__client_purge_models(client);
+    tf__client_unhold(client);
+  }
+}
+static void model_free(TfModel *m) {
   free(m->mbytes);
   tf_json_free(m->manifest);
   tf_json_free(m->calib_json);
@@ -720,9 +769,32 @@ void tf_model_close(TfModel *m) {
   free(m->repo);
   free(m->folder_path);
   free(m->info_json);
+  tf_mutex_destroy(&m->link);
+  tf__model_frees++;
   free(m);
-  /* SPEC 15.3: a refusal arrived while this Model was open: its files go now */
-  if (client) tf__client_purge_models(client);
+}
+/* 4.0.2: tf_model_close has run (a Model kept for its Sessions takes no new one) */
+int tf__model_closed(TfModel *m) {
+  tf_mutex_lock(&m->link);
+  const int c = m->app_closed;
+  tf_mutex_unlock(&m->link);
+  return c;
+}
+/* 4.0.2: a Session of m begins (0), or m is closed (-1: no Session of a closed Model) */
+int tf__model_session_add(TfModel *m) {
+  tf_mutex_lock(&m->link);
+  const int closed = m->app_closed;
+  if (!closed) m->sessions++;
+  tf_mutex_unlock(&m->link);
+  return closed ? -1 : 0;
+}
+/* a Session of m is gone: the last one frees a Model its holders closed */
+void tf__model_session_freed(TfModel *m) {
+  if (!m) return;
+  tf_mutex_lock(&m->link);
+  const int last = --m->sessions <= 0 && m->app_closed;
+  tf_mutex_unlock(&m->link);
+  if (last) model_free(m);
 }
 
 static char *dup_s(const char *s) {
@@ -742,6 +814,7 @@ TfModel *tf__model_open(const char *folder, const TfModelOpen *opt) {
     return NULL;
   }
   TfModel *m = (TfModel *)calloc(1, sizeof *m);
+  if (m) tf_mutex_init(&m->link);
   if (!m) {
     tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
     return NULL;
@@ -888,9 +961,22 @@ static void owner_lock(void) {
 }
 static void owner_unlock(void) { __atomic_clear(&g_stream_lock, __ATOMIC_RELEASE); }
 
+void tf__model_stream_lock(void) { owner_lock(); }
+void tf__model_stream_unlock(void) { owner_unlock(); }
+unsigned tf__model_stream_gen(TfModel *m) {
+  owner_lock();
+  const unsigned g = m->zs_gen;
+  owner_unlock();
+  return g;
+}
+/* the stream of m when it is still the one of generation `gen` (under tf__model_stream_lock), else NULL */
+qlc_stream *tf__model_stream_of(TfModel *m, unsigned gen) { return m && m->zs && m->zs_gen == gen ? m->zs : NULL; }
 static void stream_close(TfModel *m) {
   owner_lock();
-  if (m->zs) qlc_stream_destroy(m->zs);
+  if (m->zs) {
+    qlc_stream_destroy(m->zs);
+    m->zs_gen++;
+  }
   m->zs = NULL;
   if (g_stream_owner == m) g_stream_owner = NULL;
   owner_unlock();
@@ -903,13 +989,26 @@ static void engine_close(TfModel *m) {
   m->eng_rate = 0;
 }
 
+/* bytes of a file's CDN form in the build's folder: whole, or the partial file of a download that stopped */
+static int context_bytes_here(const char *dir, const char *path) {
+  static const char *const sfx[] = {".qle", ".qle.part"};
+  int here = 0;
+  for (int i = 0; path && !here && i < 2; ++i) {
+    char rel[1100];
+    snprintf(rel, sizeof rel, "cdn/%s%s", path, sfx[i]);
+    char *full = tf_path_join(dir, rel);
+    here = full && tf_file_exists(full);
+    free(full);
+  }
+  return here;
+}
 /* the context's files: every encrypted entry of the context (and the shared ones) installed as a device form. A
  * file that is not here yet is fetched and installed when the Model came from a Client (another context's files are
  * downloaded on first use; the Core installs only while none of its models is open). */
 static int engine_files(TfModel *m, const char *context) {
   const TfJson *files = tf_json_get(m->manifest, "files");
   for (int pass = 0; pass < 2; ++pass) {
-    int missing = 0;
+    int missing = 0, partly = 0;
     for (int i = 0; i < files->n; ++i) {
       const TfJson *f = &files->kids[i];
       const char *cx = tf_json_str(tf_json_get(f, "context")), *need = tf_json_str(tf_json_get(f, "need"));
@@ -924,10 +1023,18 @@ static int engine_files(TfModel *m, const char *context) {
       const int here = dev && tf_file_exists(dev);
       free(dev);
       if (!here) missing = 1;
+      /* 24.4, 24.13 item 3: something of the context's own files is here (installed, or a download that stopped) */
+      if (cx && !strcmp(cx, context) && !partly) partly = here || context_bytes_here(m->dir, tf_json_str(tf_json_get(local_of(f), "path")));
     }
     if (!missing) return 0;
-    if (pass || !m->client) return tf__fail(TF_ERR_MODEL_MISSING, "the files of %s are not on this device", context);
-    const int rc = tf__store_fetch_role(m->client, m, context, NULL);
+    TfClient *c = pass || m->fetch_off ? NULL : tf__model_client_hold(m);
+    if (!c) return tf__fail(TF_ERR_MODEL_MISSING, "the files of %s are not on this device", context);
+    const int rc = tf__store_fetch_role(c, m, context, NULL);
+    tf__client_unhold(c);
+    /* 4.0.2: another context's files are judged for the context the
+     * call opens. A request with no answer at all while none of them is here is needs_connection (its cause the
+     * request, needs model), as a first install's; part of them here is a download that stopped (download_failed) */
+    if (rc == TF_ERR_DOWNLOAD_FAILED && !partly && !strcmp(tf__cause_reason(), "network")) return tf__fail(TF_ERR_NEEDS_CONNECTION, NULL);
     if (rc) return rc;
   }
   return 0;
@@ -955,17 +1062,29 @@ qlc_stream *tf__model_stream(TfModel *m, const char *context, int rate) {
   if (!m->zm || strcmp(m->eng_context, context) || m->eng_rate != rate) {
     engine_close(m);
     if (engine_files(m, context)) return NULL;
+    /* 4.0.2 (24.13 item 3): every file of the context is on the device from here, so a lease that cannot be had
+     * (no answer, or the Core's needs_connection) needs the lease, not the model */
+    const int here = tf__cause_files_here(1);
     /* 18.4.7.1: past the lease's exp the open makes a lease attempt first (with no network too: unreachable), and
      * opens in the lease's grace when the Core allows it; a valid lease returns at once */
-    if (m->client && tf__pm_lease(m->client, m->pm, m->mbytes, m->mn, m->manifest, m->build)) return NULL;
+    TfClient *c = tf__model_client_hold(m);
+    const int no_lease = c && tf__pm_lease(c, m->pm, m->mbytes, m->mn, m->manifest, m->build);
+    tf__client_unhold(c);
+    if (no_lease) {
+      tf__cause_files_here(here);
+      return NULL;
+    }
     const double t0 = tf__now_s();
     m->zm = tf__pm_open(m->pm, m->dir, m->mbytes, m->mn, context, m->threads, rate, m->pin);
+    tf__cause_files_here(here);
     if (!m->zm) return NULL;
     snprintf(m->eng_context, sizeof m->eng_context, "%s", context);
     m->eng_rate = rate;
     m->load_ms = (tf__now_s() - t0) * 1000.0;
     /* the recited index (17.1) goes with the model: read by the Core from its device form when it is installed */
-    if (m->client) tf__recited_index(m->client, m->pm, m->dir, m->mbytes, m->mn);
+    TfClient *rc = tf__model_client_hold(m);
+    if (rc) tf__recited_index(rc, m->pm, m->dir, m->mbytes, m->mn);
+    tf__client_unhold(rc);
   }
   if (!m->zs) {
     owner_lock();
@@ -978,11 +1097,15 @@ qlc_stream *tf__model_stream(TfModel *m, const char *context, int rate) {
       }
       qlc_stream_destroy(other->zs);
       other->zs = NULL;
+      other->zs_gen++; /* 4.0.2: a Session of the other Model no longer reads it */
       g_stream_owner = NULL;
     }
     int st = 0;
     m->zs = qlc_stream_create(m->zm, &st);
-    if (m->zs) g_stream_owner = m;
+    if (m->zs) {
+      g_stream_owner = m;
+      m->zs_gen++;
+    }
     owner_unlock();
     if (!m->zs) {
       tf__pm_error(st, 0);
@@ -994,30 +1117,37 @@ qlc_stream *tf__model_stream(TfModel *m, const char *context, int rate) {
 }
 
 /* the Client is going away: the Model (and its open take) carry on without telemetry, sharing or downloads */
-void tf__model_detach(TfModel *m) {
+void tf__model_detach(TfModel *m, int holders) {
+  tf_mutex_lock(&m->link);
   if (m->open) tf__session_detach(m->open);
   m->client = NULL;
+  m->holders = holders;
+  tf_mutex_unlock(&m->link);
 }
 /* the context's files, now, without fetching anything: 0 when every one is installed (the Core checks their tags
  * when it opens them) */
 int tf__model_verify(TfModel *m, const char *context) {
-  TfClient *c = m->client;
   const int skip = m->skip_checks;
-  m->client = NULL;
+  m->fetch_off = 1; /* nothing is downloaded (4.0.2: the link to the Client stays as it is) */
   m->skip_checks = 0;
   const int rc = engine_files(m, context);
-  m->client = c;
+  m->fetch_off = 0;
   m->skip_checks = skip;
   return rc;
 }
 
 int tf__model_set_session(TfModel *m, TfSession *s) {
-  if (m->open && m->open != s) return -1;
-  m->open = s;
-  return 0;
+  tf_mutex_lock(&m->link);
+  const int busy = m->open && m->open != s;
+  if (!busy) m->open = s;
+  tf_mutex_unlock(&m->link);
+  return busy ? -1 : 0;
 }
 void tf__model_clear_session(TfModel *m, TfSession *s) {
-  if (m && m->open == s) m->open = NULL;
+  if (!m) return;
+  tf_mutex_lock(&m->link);
+  if (m->open == s) m->open = NULL;
+  tf_mutex_unlock(&m->link);
 }
 /* A take's Session is destroyed. With pinning asked for, the engine pins the calling thread while its stream lives:
  * the stream is given back now (no other take being open), so the caller's thread has its own affinity between
@@ -1166,12 +1296,20 @@ qlc_model *tf__model_engine_for_reference(TfModel *m) {
   }
   const char *ctx = m->warm_context[0] ? m->warm_context : m->default_context;
   if (engine_files(m, ctx)) return NULL;
-  if (m->client && tf__pm_lease(m->client, m->pm, m->mbytes, m->mn, m->manifest, m->build)) return NULL;
+  TfClient *c = tf__model_client_hold(m);
+  if (c && tf__pm_lease(c, m->pm, m->mbytes, m->mn, m->manifest, m->build)) {
+    tf__client_unhold(c);
+    return NULL;
+  }
   m->zm = tf__pm_open(m->pm, m->dir, m->mbytes, m->mn, ctx, m->threads, 16000, m->pin);
-  if (!m->zm) return NULL;
+  if (!m->zm) {
+    tf__client_unhold(c);
+    return NULL;
+  }
   snprintf(m->eng_context, sizeof m->eng_context, "%s", ctx);
   m->eng_rate = 16000;
-  if (m->client) tf__recited_index(m->client, m->pm, m->dir, m->mbytes, m->mn);
+  if (c) tf__recited_index(c, m->pm, m->dir, m->mbytes, m->mn);
+  tf__client_unhold(c);
   return m->zm;
 }
 /* The engine closed, so the Core can install a file of this build that the open model would read (the reference

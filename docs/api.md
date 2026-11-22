@@ -32,7 +32,7 @@ Five things, with the same names and the same order of calls as the Android, App
 
 Every options struct (`TfClientOptions`, `TfModelOptions`, `TfPrefetchOptions`, `TfSessionOptions`) may be NULL or
 zeroed: zero is the default of every field. Strings and arrays returned as `const` belong to the object they came
-from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"4.0.1"`.
+from and stay valid until the next call on it, or until it is closed or destroyed. `tf_version()` is `"4.0.2"`.
 
 ## Errors
 
@@ -53,12 +53,28 @@ if (!model) {
 | `tf_last_error_code()` | the calling thread's last failure, a `TfError` (0 when none) |
 | `tf_last_error()` | its message |
 | `tf_last_error_fix()` | what to do about it, one sentence |
+| `tf_last_error_cause(&cause)` | what caused it: 1 with a `TfErrorCause` filled, 0 when there is no cause (no failure, or a call used wrongly) |
 | `tf_error_name(error)` | the stable code of any `TfError`: `"invalid_argument"`, `"needs_connection"`, ... |
 | `tf_error_fix(error)` | the catalogue's fix for that code |
 | `tf_error_docs(error)` | `https://sdk.quranlab.ai/docs/errors#<code>` |
 
 A call on a NULL object fails and leaves an earlier error in place, so after a chain of calls (the quick start
 checks nothing until the end) the first failure is the one reported.
+
+`TfErrorCause` says what caused the failure, with the same tokens as the error report Quran Lab receives: `stage`
+(where: `config`, `lease`, `manifest`, `download`, `verify`, `storage`, `model_open`, `session`, ...), `reason` (why:
+`network` for no answer at all, `http`, `rate_limited`, `refused`, `hash`, `quota`, ...), `error_name` and
+`error_code` (the system's or the server's error, when there is one), `http_status` (0 when there was no answer) and,
+for `needs_connection` only, `needs`: `"model"` when the model files are not on the machine yet (connect to download
+them) and `"lease"` when the model is here and needs Quran Lab's answer to open. A field that is absent is NULL. The
+strings stay valid until the thread's next failure. Log them, or send them with a support request: they hold no
+message, path, URL or identifier.
+
+```c
+TfErrorCause cause;
+if (tf_last_error_cause(&cause))
+  fprintf(stderr, "cause: %s %s %d %s\n", cause.stage, cause.reason, cause.http_status, cause.needs ? cause.needs : "");
+```
 
 The codes: `invalid_argument`, `invalid_key`, `sdk_too_old`, `server_rejected`, `client_exists`,
 `model_unavailable`, `needs_connection`, `download_failed`, `storage_full`, `storage_failed`, `model_missing`,
@@ -81,7 +97,8 @@ TfClient *client = tf_client_create(&(TfClientOptions){.key = "qlk_v1_...", .app
 
 `tf_client_create` never waits for the network: registration, the signed config and the telemetry go in the
 background. One Client per process: a second one while the first is not destroyed is `client_exists`.
-`tf_client_destroy` sends what is counted and closes the shared recording.
+`tf_client_destroy` sends what is counted and closes the shared recording. It gives a model key request in flight
+up to 3 seconds to finish, so it can block that long; any other request in flight is cancelled at once.
 
 `TfClientOptions`: `key` and `app_id` (required), `app_version`, `storage` (a folder the app can write; default
 `%LOCALAPPDATA%/<app_id>/tajweedformer` on Windows, `$XDG_DATA_HOME` or `~/.local/share` on Linux),
@@ -111,7 +128,7 @@ nothing is left).
 | Call | What it does |
 | - | - |
 | `tf_client_model(client, options)` | the Model for this app: downloads on first use (resumed by itself after a break, see below), verifies every file, opens and warms the engine. The same Model while it is open. `needs_connection` without a network and without a model on disk; `model_unavailable` while Quran Lab has no build for this SDK version |
-| `tf_client_prefetch(client, options)` | downloads and verifies ahead of use. Safe at every start: a no-op when done, and it resumes where an earlier call stopped. `TfPrefetchOptions`: `unmetered_only` (this library cannot tell what kind of connection the machine has, so the download goes ahead), `on_progress(user, bytes_done, bytes_total)`, `version` |
+| `tf_client_prefetch(client, options)` | downloads and verifies ahead of use. Safe at every start: a no-op when done, and it resumes where an earlier call stopped. It downloads on whatever network the machine has: nothing waits for Wi-Fi. `TfPrefetchOptions`: `on_progress(user, bytes_done, bytes_total)`, `version` |
 | `tf_client_storage_json(client)` | `{"models":[{"version","build","bytes"}],"sharingQueueBytes":n}` |
 | `tf_client_remove_models(client)` | removes the model files, never the consent state or the sharing queue. Close the Model first |
 | `tf_client_diagnose(client, &d)`, `tf_client_diagnose_json(client)` | one report, safe to paste into an issue (below) |
@@ -127,7 +144,8 @@ against the signed manifest; another context's files come on first use, the refe
 asks. The files live under `<storage>/models/<build>/`.
 
 How a download goes: all of it over one kept connection, HTTP/2 where the system has it (WinHTTP on Windows,
-with HTTP/3 too on Windows 11; the system's libcurl on Linux), else HTTP/1.1. A request ends when no byte
+with HTTP/3 too on Windows 11; the system's libcurl on Linux), else HTTP/1.1. Each model file is one request for the
+whole file, read as it arrives; a `Range` is sent only to resume a transfer that broke, from its last byte. A request ends when no byte
 arrives for 30 seconds (on Windows up to 34) and has no limit on its whole time, so a slow link is never cut.
 A file whose transfer breaks (no answer, a connection that ends, a stall, a server error) is resumed inside
 the call from its partial file, with the server's ETag as the validator (`If-Range`), up to five times after
@@ -169,6 +187,12 @@ with its download record, and nothing else in that folder. `tf_client_model` and
 with `invalid_key`, or with `server_rejected` and that refusal's message and fix, until a later answer accepts
 the key; once the key is accepted again the model is downloaded again. A Model that is already open keeps
 running until it is closed, and its files are removed when it is closed, or at the next start. `tf_model_close` releases it.
+
+`tf_client_destroy`, `tf_model_close` and `tf_session_destroy` are called once per object (`tf_model_close` once
+per holder: each `tf_client_model` that gave the Model out); a NULL is a no-op, and the pointer is not valid after.
+A Session may outlive its Model: closing the Model cancels a take that is still open, and the Session's later calls
+fail cleanly. A Model may outlive its Client, and `tf_client_destroy` may run while another thread uses that
+Client's Model or Session.
 
 | Call | Gives |
 | - | - |

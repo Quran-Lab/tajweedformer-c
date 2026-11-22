@@ -38,6 +38,8 @@ static TF_TLS char g_msg[640];
 static TF_TLS char g_fix[640];
 static TF_TLS char g_raw[512]; /* the text given to tf__fail, as given */
 static TF_TLS int g_code;
+static TF_TLS unsigned g_serial; /* 4.0.2: one more for every error set on the thread (24.13: the cause is its error's) */
+unsigned tf__error_serial(void) { return g_serial; }
 
 static const TfErrorEntry *entry(int code) { return code <= -1 && code >= -TF_ERRORS_COUNT ? &kTfErrors[-code - 1] : NULL; }
 
@@ -64,6 +66,7 @@ static void fill(char *out, size_t n, const char *tmpl, const char *const *names
 static int set_error(int code, const char *const *names, const char *const *values, int count) {
   const TfErrorEntry *e = entry(code);
   g_code = code;
+  g_serial++;
   if (e) {
     fill(g_msg, sizeof g_msg, e->message, names, values, count);
     fill(g_fix, sizeof g_fix, e->fix, names, values, count);
@@ -112,6 +115,7 @@ int tf__fail_rejected(const char *code, const char *app) {
     static const char *const names[] = {"origin"};
     const char *values[] = {app && *app ? app : "this app"};
     g_code = TF_ERR_SERVER_REJECTED;
+    g_serial++;
     fill(g_msg, sizeof g_msg, kTfReasons[i].message, names, values, 1);
     fill(g_fix, sizeof g_fix, kTfReasons[i].fix, names, values, 1);
     tf__cause_bind(g_code);
@@ -158,6 +162,7 @@ TfErrSave *tf__error_save(void) {
 void tf__error_restore(TfErrSave *s, int free_it) {
   if (!s) return;
   g_code = s->code;
+  g_serial++;
   memcpy(g_msg, s->msg, sizeof g_msg);
   memcpy(g_fix, s->fix, sizeof g_fix);
   memcpy(g_raw, s->raw, sizeof g_raw);
@@ -173,6 +178,7 @@ void tf__err_save(TfErrState *s) {
 }
 void tf__err_restore(const TfErrState *s) {
   g_code = s->code;
+  g_serial++;
   memcpy(g_msg, s->msg, sizeof g_msg);
   memcpy(g_fix, s->fix, sizeof g_fix);
   memcpy(g_raw, s->raw, sizeof g_raw);
@@ -244,8 +250,9 @@ static int raise_code(int rc, int report) {
   if (rc < 0) {
     const int code = tf_last_error_code();
     if (code) __atomic_store_n(&g_last_raised, code, __ATOMIC_SEQ_CST);
-    /* 24.1: where a TfError reaches the app, the error report (the app's own misuse aside) */
-    if (code && report) tf__rep_raised(code);
+    /* 24.1: where a TfError reaches the app, the error report (the app's own misuse aside); 24.13: the cause on the
+     * error the app gets, made from the same cause (also for the same failure handed over again, with no report) */
+    if (code) tf__rep_raised(code, report);
     return code ? code : rc;
   }
   return rc;

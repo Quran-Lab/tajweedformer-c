@@ -6,14 +6,16 @@ library exports exactly these functions (`src/tf/tajweedformer.def`, `src/tf/taj
 [docs/api.md](docs/api.md) agree. The names are the naming table's (quranlab-contract `sdk_3.0.0/NAMING.md`), the
 same concepts as the Android, Apple and web SDKs: Client, Model, Session, Heads, Backend. 4.0 adds
 `TfRecitedOutcome`, `TfRecitedAyah` and `tf_session_report_recited_outcome`, and for the ask of section 20
-(`SHARE_ASK_40.md`) `TfAskKind` (the sheet or the card), `tf_sharing_shown` and `tf_sharing_open`. Nothing public reads, writes or names a
+(`SHARE_ASK_40.md`) `TfAskKind` (the sheet or the card), `tf_sharing_shown` and `tf_sharing_open`. 4.0.1 adds `TfClientOptionsExt` and
+`tf_client_create2` (`APP_VERSION_40.md` 27.4), and 4.0.2 `TfErrorCause` and `tf_last_error_cause`. Nothing public reads, writes or names a
 model file, a key or a path of one.
 
-## Types (28)
+## Types (30)
 
 | Type | Kind |
 | --- | --- |
 | `TfError` | enum (the catalogue's 26 errors) |
+| `TfErrorCause` | struct |
 | `TfBackend` | struct |
 | `TfHeads` | opaque handle |
 | `TfHead` | struct |
@@ -28,6 +30,7 @@ model file, a key or a path of one.
 | `TfAskKind` | enum |
 | `TfConsentRequest` | struct |
 | `TfClientOptions` | struct |
+| `TfClientOptionsExt` | struct |
 | `TfModelOptions` | struct |
 | `TfPrefetchOptions` | struct |
 | `TfDiagnosis` | struct |
@@ -42,7 +45,7 @@ model file, a key or a path of one.
 | `TfRecitedAyah` | struct |
 | `TfSharing` | struct |
 
-## Functions (69)
+## Functions (71)
 
 ### Errors
 
@@ -51,6 +54,7 @@ const char *tf_version(void);
 int tf_last_error_code(void);
 const char *tf_last_error(void);
 const char *tf_last_error_fix(void);
+int tf_last_error_cause(TfErrorCause *out);
 const char *tf_error_name(int error);
 const char *tf_error_fix(int error);
 const char *tf_error_docs(int error);
@@ -60,6 +64,7 @@ const char *tf_error_docs(int error);
 
 ```c
 TfClient *tf_client_create(const TfClientOptions *options);
+TfClient *tf_client_create2(const TfClientOptions *options, const TfClientOptionsExt *ext);
 void tf_client_destroy(TfClient *c);
 TfModel *tf_client_model(TfClient *c, const TfModelOptions *options);
 int tf_client_prefetch(TfClient *c, const TfPrefetchOptions *options);

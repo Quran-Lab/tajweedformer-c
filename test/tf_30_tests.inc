@@ -747,7 +747,7 @@ static void t30_telemetry(const char *data, const char *work) {
   CHECK(day && !tf_json_get(day, "rule_checks") && !tf_json_get(day, "reported") && !tf_json_get(day, "launches"), "analytics off counted something");
   tf_json_free(day);
   tf_client_destroy(c);
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf__now_override = 0;
   printf("telemetry_30.json: %d/%d cohorts (takes, audio_s, speech_s, silence_s, tokens, compute_s; removed fields gone); reportChecks %d/%d calls and "
          "%d/2 sequences; reportRecited %d/%d calls and %d/%d takes; reported lists exactly the fields present in %d/%d combinations\n",

@@ -42,13 +42,20 @@
  * Options: every options struct may be NULL or zeroed; zero is the default of every field.
  *
  * Errors: a function returns NULL or a negative TfError. tf_last_error_code() is the calling thread's last failure,
- * tf_last_error() its message and tf_last_error_fix() what to do about it; tf_error_name(), tf_error_fix() and
+ * tf_last_error() its message, tf_last_error_fix() what to do about it and tf_last_error_cause() what caused it
+ * (the same tokens as the error report); tf_error_name(), tf_error_fix() and
  * tf_error_docs() give the catalogue entry of any TfError (the same codes, texts and links as the other SDKs).
  * A call on a NULL object fails and leaves an earlier error in place, so after a chain of calls the first failure
  * is the one reported.
  *
  * Strings and arrays returned as `const` belong to the object they came from and stay valid until the next call on
  * that object, or until it is closed or destroyed.
+ *
+ * Ends: tf_client_destroy, tf_model_close and tf_session_destroy are called once per object (tf_model_close once per
+ * holder: each tf_client_model that gave the Model out); a NULL is a no-op. The pointer is not valid after. A Session
+ * may outlive its Model: closing the Model cancels a take that is still open, and the Session's later calls fail
+ * cleanly. A Model may outlive its Client, and tf_client_destroy may run while another thread uses that Client's
+ * Model or Session.
  *
  * Threads: a Client may be used from any thread. A Model and its Session belong to one thread at a time. A Model
  * has one open Session at a time, and a process runs one take at a time (the engine's rule): a server runs one
@@ -73,9 +80,9 @@ extern "C" {
 #define TF_API
 #endif
 
-#define TF_SDK_VERSION "4.0.1"
+#define TF_SDK_VERSION "4.0.2"
 
-TF_API const char *tf_version(void); /* "4.0.1" */
+TF_API const char *tf_version(void); /* "4.0.2" */
 
 /* ============================================================================ errors */
 
@@ -116,6 +123,27 @@ TF_API const char *tf_last_error_fix(void);   /* what to do about it: one senten
 TF_API const char *tf_error_name(int error);  /* the stable code: "invalid_argument", ..., "ok" for 0 */
 TF_API const char *tf_error_fix(int error);   /* the catalogue's fix for that code */
 TF_API const char *tf_error_docs(int error);  /* https://sdk.quranlab.ai/docs/errors#<code> */
+
+/* What caused this thread's last failure: the same tokens as the error report Quran Lab receives for it, so an app
+ * can log them, show the right words and send them in a support request. Every field is a short token, never a
+ * message, path, URL, host name or identifier; a field that is absent is NULL (http_status 0). */
+typedef struct {
+  const char *stage;      /* where: "config", "attest", "lease", "manifest", "download", "verify", "storage",
+                             "runtime", "model_open", "session", "sharing", ... */
+  const char *reason;     /* why: "network" (no answer at all), "timeout", "http", "rate_limited", "refused",
+                             "hash", "quota", "memory", "engine", ... ("other" when none fits) */
+  const char *error_name; /* the error's name: a WinHTTP or libcurl error ("ERROR_WINHTTP_TIMEOUT",
+                             "CURLE_COULDNT_CONNECT"), a Core status ("QLC_E_NOMEM"), or NULL */
+  const char *error_code; /* its code, or the server's error ("model_limit", "app_blocked"), or NULL */
+  const char *needs;      /* TF_ERR_NEEDS_CONNECTION only: "model" (the model files are not on this machine yet:
+                             connect to download them) or "lease" (the model is here and needs Quran Lab's answer
+                             to open); NULL for every other error */
+  int http_status;        /* the HTTP status of the answer that failed, or 0 */
+} TfErrorCause;
+/* 1 with *out filled when this thread's last failure has a cause; 0 (and *out zeroed) when there is no failure, for
+ * the codes of a call used wrongly (invalid_argument, client_exists, session_open, session_closed, cancelled), and
+ * for out NULL. The strings stay valid until this thread's next failure. */
+TF_API int tf_last_error_cause(TfErrorCause *out);
 
 /* ============================================================================ Backend */
 
@@ -310,6 +338,8 @@ typedef struct {
 TF_API TfClient *tf_client_create(const TfClientOptions *options);
 /* 4.0.1: tf_client_create with the options of TfClientOptionsExt (NULL: none, which is tf_client_create) */
 TF_API TfClient *tf_client_create2(const TfClientOptions *options, const TfClientOptionsExt *ext);
+/* Ends the Client: sends what is counted and closes the shared recording. A model key request in flight gets up to 3
+ * seconds to finish, so this call can block that long; any other request in flight is cancelled at once. */
 TF_API void tf_client_destroy(TfClient *c);
 
 typedef struct {
@@ -328,11 +358,8 @@ typedef struct {
  * then keeps running until tf_model_close, which removes its files. */
 TF_API TfModel *tf_client_model(TfClient *c, const TfModelOptions *options);
 
+/* Every download goes out on whatever network the machine has: nothing waits for Wi-Fi or an unmetered network. */
 typedef struct {
-  int unmetered_only;          /* 1: wait for an unmetered connection. This library cannot tell what kind of
-                                  connection the machine has (diagnose reports "unknown"), so here the download
-                                  goes ahead: an app that knows it is on a metered connection does not call
-                                  prefetch */
   void (*on_progress)(void *user, long long bytes_done, long long bytes_total);
   void *user;
   const char *version;         /* as TfModelOptions.version */
@@ -352,7 +379,7 @@ TF_API int tf_client_remove_models(TfClient *c);
 
 /* One structured report, safe to paste into an issue: no audio, text or identifiers. */
 typedef struct {
-  const char *sdk_version;     /* "4.0.1" */
+  const char *sdk_version;     /* "4.0.2" */
   const char *sdk_latest;      /* the SDK release the signed config in force names, or NULL when it names none */
   int key_accepted;            /* 1 accepted, 0 refused, -1 not known yet (no answer from the server) */
   const char *key_reason;      /* why not: the server's code, or NULL */
@@ -368,7 +395,8 @@ typedef struct {
   const char *last_error;      /* the code of the last error this process raised, or NULL */
   int dropped_chunks;          /* chunks dropped because the app did not read them: always 0 here (chunks come
                                   by callback, none waits) */
-  const char *connection;      /* "unmetered", "metered", "none" or "unknown": always "unknown" here */
+  const char *connection;      /* "unmetered", "metered", "none" or "unknown": always "unknown" here. A report
+                                  only: no request of the SDK waits for a kind of network */
   const char *json;            /* all of it as JSON; it also has "downloadProtocol", for which this struct
                                   has no field: the protocol the last request for a model file ran on ("h3",
                                   "h2" or "http/1.1"), null while this Client has made none in this process;

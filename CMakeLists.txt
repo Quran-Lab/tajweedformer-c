@@ -167,8 +167,9 @@ foreach(t ikey recited outcome json_leak learner)
 endforeach()
 # tajweedformer-eval's own parts (no model): edit distance, references, WAV and FLAC (test/data/eval: test/make_eval_flac.py)
 add_test(NAME tf40_eval_units COMMAND tf40_tests eval_units "${TF_DATA}/eval" "${TF_WORK}/tf40_eval_units")
-# error reports (ERRORS_40.md 24): test/data/sdk_4.0.0/errors_40.json is the contract's vectors/errors_40.json at 564c144,
-# byte for byte (tools/errors40.py --check); its codes, queue, telemetry and signatures through this library
+# error reports (ERRORS_40.md 24): test/data/sdk_4.0.0/errors_40.json is the contract's vectors/errors_40.json at adca6f6,
+# byte for byte (tools/errors40.py --check); its codes, queue, telemetry, signatures and (4.0.2, 24.13) causes through
+# this library
 add_test(NAME tf40_errors COMMAND tf40_tests errors "${TF_DATA}/sdk_4.0.0" "${TF_WORK}/tf40_errors")
 # 4.0 with the contract's vectors (TF_CONTRACT, a quranlab-contract checkout; its test keys only): lease, clock,
 # container and attest proof through this library and the Core; the whole flow against a stand-in server whose data
@@ -254,6 +255,28 @@ if(TF_CONTRACT)
     set_tests_properties(tf40_grace_data PROPERTIES FIXTURES_SETUP tf_grace40 FIXTURES_REQUIRED tf_work TIMEOUT 120)
     add_test(NAME tf40_grace_vectors COMMAND tf40_tests grace_vectors "${TF_VEC40}" "${TF_WORK}/grace40" "${TF_WORK}/tf40_grace_vectors")
     set_tests_properties(tf40_grace_vectors PROPERTIES FIXTURES_REQUIRED "tf_work;tf_grace40" TIMEOUT 600)
+    # 4.0.2, section 33 (NO_WAIT_40.md): test/data/sdk_4.0.0/no_wait_40.json is the contract's vectors/no_wait_40.json at
+    # adca6f6, byte for byte; its cases that name c against the stand-in, on a vector build with two contexts and the tj3
+    # vocabulary (make_flow40.py --contexts), so a session on c24_l256 fetches that context's files
+    add_test(NAME tf40_nowait_data COMMAND ${Python3_EXECUTABLE} -I "${CMAKE_CURRENT_SOURCE_DIR}/test/make_flow40.py" --contract "${TF_C40}"
+             --out "${TF_WORK}/nowait40" --contexts c16_l64,c24_l256)
+    set_tests_properties(tf40_nowait_data PROPERTIES FIXTURES_SETUP tf_nowait40 FIXTURES_REQUIRED tf_work TIMEOUT 120)
+    add_test(NAME tf40_no_wait COMMAND tf40_tests no_wait "${TF_WORK}/flow40" "${TF_WORK}/nowait40" "${TF_DATA}/sdk_4.0.0" "${TF_WORK}/tf40_no_wait")
+    set_tests_properties(tf40_no_wait PROPERTIES FIXTURES_REQUIRED "tf_work;tf_flow40;tf_nowait40" TIMEOUT 600)
+    # 4.0.2 under load: the lease's retries (PROTECTED_MODEL.md 18.4.7.3) and a 429 (ENDPOINTS_40.md 28.10), on fixed clocks
+    add_test(NAME tf40_load COMMAND tf40_tests load "${TF_WORK}/flow40" "${TF_WORK}/tf40_load")
+    set_tests_properties(tf40_load PROPERTIES FIXTURES_REQUIRED "tf_work;tf_flow40" TIMEOUT 600)
+    # 4.0.2, SPEC 16.7: one request per model file (the requests of a full install and of one cut, counted)
+    add_test(NAME tf40_requests COMMAND tf40_tests requests "${TF_WORK}/flow40" "${TF_WORK}/tf40_requests")
+    set_tests_properties(tf40_requests PROPERTIES FIXTURES_REQUIRED "tf_work;tf_flow40" TIMEOUT 600)
+    # 4.0.2, STEERING_40.md 34.6: per-host download counts (test/data/sdk_4.0.0/steering_40.json is the contract's
+    # vectors/steering_40.json at 9585201, byte for byte)
+    add_test(NAME tf40_hosts COMMAND tf40_tests hosts "${TF_WORK}/nowait40" "${TF_DATA}/sdk_4.0.0" "${TF_WORK}/tf40_hosts")
+    set_tests_properties(tf40_hosts PROPERTIES FIXTURES_REQUIRED "tf_work;tf_nowait40" TIMEOUT 600)
+    # 4.0.2: the objects' lifetimes (a call after an object's end), the one Core per storage folder, and the stress of a
+    # Client destroyed while its Model and Session are in use
+    add_test(NAME tf40_lifetime COMMAND tf40_tests lifetime "${TF_WORK}/nowait40" "${TF_WORK}/tf40_lifetime")
+    set_tests_properties(tf40_lifetime PROPERTIES FIXTURES_REQUIRED "tf_work;tf_nowait40" TIMEOUT 1500)
     set_tests_properties(tf40_flow tf40_lanes tf40_switches tf40_share_moments tf40_share_flac tf40_errors_flow tf40_lease_clock tf40_grace
                          tf40_app27 tf40_endpoints tf40_loopback PROPERTIES FIXTURES_REQUIRED "tf_work;tf_flow40" TIMEOUT 600)
   endif()
@@ -304,9 +327,12 @@ if(TF_C30_ERRORS AND EXISTS "${TF_C30_ERRORS}")
   set_tests_properties(tf_errors PROPERTIES ENVIRONMENT "TF_CONTRACT_ERRORS=${TF_C30_ERRORS}")
 endif()
 add_test(NAME tf_crypto COMMAND tf_tests crypto)
+# contract section 29 (SHARE_WRITE_40.md, 4.0.2): test/data/sdk_4.0.0/share_write_40.json is the contract's
+# vectors/share_write_40.json at b211fe3 (branch share-write-failure-40), kept here so the test needs no newer contract export
+add_test(NAME tf_share_write COMMAND tf_tests share_write "${TF_DATA}/sdk_4.0.0/share_write_40.json" "${TF_WORK}/share_write")
 get_property(_all DIRECTORY PROPERTY TESTS)
 list(REMOVE_ITEM _all tf40_production_sha256 tf40_production_pin tf_work_clean tf40_flow tf40_lanes tf40_flow_data tf40_switches tf40_share_moments tf40_share_flac tf40_errors_flow tf40_lease_clock tf40_grace tf40_grace_data tf40_grace_vectors
-            tf40_app27 tf40_endpoints tf40_loopback)
+            tf40_app27 tf40_endpoints tf40_loopback tf40_nowait_data tf40_no_wait tf40_load tf40_requests tf40_hosts tf40_lifetime)
 set_tests_properties(${_all} PROPERTIES FIXTURES_REQUIRED tf_work LABELS library TIMEOUT 600)
 if(Python3_FOUND)
   add_test(NAME tf_api_scan COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test/api_scan.py")

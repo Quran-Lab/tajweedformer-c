@@ -1,7 +1,8 @@
 /* Error reports, included by tf40_tests.c.
  *
- *   tf40_tests errors      <test/data/sdk_4.0.0> <work>   vectors/errors_40.json (a copy of the contract's at 564c144):
- *                                           every `codes` case through tf__rep_code_for and tf__rep_reported, every
+ *   tf40_tests errors      <test/data/sdk_4.0.0> <work>   vectors/errors_40.json (a copy of the contract's at adca6f6):
+ *                                           every `causes` row (24.13, 4.0.2) through a raised error and
+ *                                           tf_last_error_cause; every `codes` case through tf__rep_code_for and tf__rep_reported, every
  *                                           `queue` sequence through the queue machine (each occurrence's made, each
  *                                           send point's requests and their fields), every `telemetry` reason, every
  *                                           `signatures` string and hex; the queue's file read back; a body's closed
@@ -30,6 +31,27 @@ static int answers_post(void *user, const TfRepItem *it) {
   if (!x->a || x->at >= x->a->n) return -1;
   const TfJson *v = &x->a->kids[x->at++];
   return v->type == TJ_NUM ? (int)v->num : 0;
+}
+
+/* 24.13 (4.0.2) */
+static int code_of(const char *name) {
+  for (int c = -1; c >= TF_ERR_SHARING_UNAVAILABLE; --c)
+    if (tf_error_name(c) && !strcmp(tf_error_name(c), name)) return c;
+  return 0;
+}
+static int same_or_null(const char *got, const char *want) { return want ? got && !strcmp(got, want) : got == NULL; }
+/* the cause the app's error carries against a row's `cause` object (NULL or JSON null: none) */
+static int cause_is(int has, const TfErrorCause *got, const TfJson *want) {
+  if (!want || want->type == TJ_NULL) return !has;
+  return has && same_or_null(got->stage, jstr0(want, "stage")) && same_or_null(got->reason, jstr0(want, "reason")) &&
+         got->http_status == jnum0(want, "http_status") && same_or_null(got->error_name, jstr0(want, "error_name")) &&
+         same_or_null(got->error_code, jstr0(want, "error_code")) && same_or_null(got->needs, jstr0(want, "needs"));
+}
+static void other_thread_fails(void *u) {
+  (void)u;
+  tf__clear_error();
+  tf__cause("storage", "quota", 0, NULL, NULL);
+  tf__raise(tf__fail(TF_ERR_STORAGE_FULL, "full"));
 }
 
 static int t_errors(const char *dir, const char *work) {
@@ -67,6 +89,60 @@ static int t_errors(const char *dir, const char *work) {
     tf__clear_error();
     CHECK(before && began && !strcmp(tf__rep_code_for("lease", "network", 0, TF_REP_NONE, ""), "needs_connection"),
           "errors: a timeout before any answer is network (needs_connection), after an answer began timeout");
+  }
+  /* 24.13 (4.0.2): `causes`, each occurrence the way a real failure goes: the cause recorded where it is seen (with
+   * whether every file the call needs is on the device), the code 24.4 gives it set on the thread, the error raised
+   * to the app; then tf_last_error_cause gives the row's cause, or none. No Client is attached here, so no report is
+   * made or queued: the cause does not depend on the reports. */
+  const TfJson *causes = tf_json_get(v, "causes");
+  int ok_causes = 0;
+  for (int i = 0; causes && i < causes->n; ++i) {
+    const TfJson *k = &causes->kids[i];
+    const char *od = jstr0(k, "on_device");
+    const int on = !strcmp(od, "none") ? TF_REP_NONE : !strcmp(od, "partial") ? TF_REP_PARTIAL : TF_REP_COMPLETE;
+    tf__clear_error();
+    const int was = tf__cause_files_here(on == TF_REP_COMPLETE);
+    tf__cause(jstr0(k, "stage"), jstr0(k, "reason"), jnum0(k, "http_status"), jstr0(k, "error_name"), jstr0(k, "error_code"));
+    tf__cause_files_here(was);
+    const char *name = tf__rep_code_for(jstr0(k, "stage"), jstr0(k, "reason"), jnum0(k, "http_status"), on, jstr0(k, "error_code"));
+    if (strcmp(name, "none")) tf__raise(tf__fail(code_of(name), "x"));
+    TfErrorCause got;
+    const int has = tf_last_error_cause(&got);
+    const int good = !strcmp(name, jstr0(k, "code")) && (strcmp(name, "none") || !tf_last_error_code()) && cause_is(has, &got, tf_json_get(k, "cause"));
+    CHECK(good, "causes[%d] '%s': %s, cause %s %s/%s %d %s %s needs %s", i, jstr0(k, "label"), name, has ? "yes" : "none", got.stage ? got.stage : "-",
+          got.reason ? got.reason : "-", got.http_status, got.error_name ? got.error_name : "-", got.error_code ? got.error_code : "-",
+          got.needs ? got.needs : "-");
+    ok_causes += good;
+  }
+  CHECK(causes && causes->n == 15, "causes: the contract's 15 rows (%d)", causes ? causes->n : 0);
+  /* the codes of a call used wrongly carry none; NULL is 0; a failure never handed to the app shows no older cause;
+   * the strings stay as they were after a call that succeeds, until the thread's next failure; another thread's
+   * failure is its own */
+  {
+    TfErrorCause a, b;
+    tf__clear_error();
+    tf__raise(tf__fail(TF_ERR_INVALID_ARGUMENT, "x"));
+    CHECK(!tf_last_error_cause(&a) && !a.stage && !tf_last_error_cause(NULL), "causes: invalid_argument has none, NULL is 0");
+    tf__clear_error();
+    tf__cause_answer("download", 503, "{}", 2);
+    tf__raise(tf__fail(TF_ERR_DOWNLOAD_FAILED, "x"));
+    const int had = tf_last_error_cause(&a);
+    tf__clear_error(); /* the next call, which succeeds */
+    const int after = tf_last_error_cause(&b);
+    CHECK(had && !after && !strcmp(a.stage, "download") && !strcmp(a.reason, "http") && a.http_status == 503 && !a.needs,
+          "causes: a 503 of a file, then a call that succeeds: no cause, and the strings read as before (%s/%s)", a.stage, a.reason);
+    tf__fail(TF_ERR_DOWNLOAD_FAILED, "x"); /* set, never raised */
+    CHECK(!tf_last_error_cause(&b), "causes: an error that never reached the app shows no older cause");
+    tf__clear_error();
+    tf__cause("config", "network", 0, NULL, NULL);
+    tf__raise(tf__fail(TF_ERR_NEEDS_CONNECTION, NULL));
+    TfThread th;
+    const int started = !tf_thread_start(&th, other_thread_fails, NULL);
+    if (started) tf_thread_join(th);
+    CHECK(started && tf_last_error_cause(&b) && !strcmp(b.stage, "config") && !strcmp(b.reason, "network") && b.needs && !strcmp(b.needs, "model") &&
+              tf_last_error_code() == TF_ERR_NEEDS_CONNECTION,
+          "causes: this thread's needs_connection (config, network, needs model) whatever another thread's failure");
+    tf__clear_error();
   }
   /* 24.5: the signature string and its 32 hex */
   const TfJson *sigs = tf_json_get(v, "signatures");
@@ -188,8 +264,8 @@ static int t_errors(const char *dir, const char *work) {
               !strcmp(tf__rep_code_for("attest", "integrity_failed", 403, TF_REP_COMPLETE, "verdict:boot"), "none"),
           "integrity: server_rejected at the attest and the lease; with the build on the device the attest goes on (rule 3a)");
   }
-  printf("  codes %d of %d, signatures %d of %d, telemetry %d of %d, queue sequences %d of %d\n", ok_codes, codes ? codes->n : 0, ok_sigs,
-         sigs ? sigs->n : 0, ok_tel, tel ? tel->n : 0, ok_q, qs ? qs->n : 0);
+  printf("  codes %d of %d, signatures %d of %d, telemetry %d of %d, queue sequences %d of %d, causes %d of %d\n", ok_codes, codes ? codes->n : 0,
+         ok_sigs, sigs ? sigs->n : 0, ok_tel, tel ? tel->n : 0, ok_q, qs ? qs->n : 0, ok_causes, causes ? causes->n : 0);
   free(r);
   free(back);
   free(made);
@@ -254,11 +330,21 @@ static TfJson *model_fails(const char *work, const char *label, int want, const 
   const int got = tf_last_error_code();
   CHECK(!m && got == want, "%s: %s (%s), want %s", label, tf_error_name(got), tf_last_error() ? tf_last_error() : "", tf_error_name(want));
   CHECK(tf__rep_due() > 0, "%s: a new report is sent 30 s later (24.6)", label);
+  /* 24.13 (4.0.2): the cause on the app's error, kept to hold against the report the stand-in takes */
+  TfErrorCause ec;
+  const int has = tf_last_error_cause(&ec);
+  char cs[5][64];
+  const char *const cf[5] = {ec.stage, ec.reason, ec.error_name, ec.error_code, ec.needs};
+  for (int i = 0; i < 5; ++i) snprintf(cs[i], sizeof cs[i], "%s", cf[i] ? cf[i] : "");
   if (m) tf_model_close(m);
   g_f.fail_url = NULL; /* the server answers again (a refused token would keep the report for the next launch) */
   if (c) tf_client_destroy(c); /* a send point */
   TfJson *b = took(stage, reason, tf_error_name(want));
   const TfJson *e = tf_json_get(b, "error");
+  const char *rn = jstr0(e, "error_name"), *rc = jstr0(e, "error_code");
+  CHECK(has && b && !strcmp(cs[0], stage) && !strcmp(cs[1], reason) && ec.http_status == jnum0(e, "http_status") && !strcmp(cs[2], rn ? rn : "") &&
+            !strcmp(cs[3], rc ? rc : "") && !strcmp(cs[4], want == TF_ERR_NEEDS_CONNECTION ? "model" : ""),
+        "%s: the app's error carries the report's cause (24.13): %s/%s %d %s %s needs %s", label, cs[0], cs[1], ec.http_status, cs[2], cs[3], cs[4]);
   CHECK(b && jnum0(e, "http_status") == status && jnum0(e, "count") == 1 && jbool(e, "first_report") && jbool(e, "first_launch") &&
             !strcmp(jstr0(b, "revision") ? jstr0(b, "revision") : "", !strcmp(stage, "config") || !strcmp(stage, "attest") ? "" : "4.1.0"),
         "%s: the report of %s/%s %d", label, stage, reason, status);
@@ -402,6 +488,9 @@ static int t_errors_flow(const char *fixture, const char *work, const char *errv
     remove(p);
     m = c ? tf_client_model(c, NULL) : NULL;
     CHECK(!m && tf_last_error_code() == TF_ERR_NEEDS_CONNECTION, "partial: offline with none of it is %s", tf_error_name(tf_last_error_code()));
+    TfErrorCause pc;
+    CHECK(tf_last_error_cause(&pc) && !strcmp(pc.stage, "config") && !strcmp(pc.reason, "network") && pc.needs && !strcmp(pc.needs, "model"),
+          "partial: offline with none of it, the cause config/network needs model (24.13)");
     if (c) tf_client_destroy(c);
     g_f.fail_url = NULL;
     b = took("config", "network", "download_failed");
@@ -561,7 +650,7 @@ static int t_errors_flow(const char *fixture, const char *work, const char *errv
     CHECK(g_f.n_err == 0, "misuse: nothing sent (%d)", g_f.n_err);
   }
   tf__download_pause_ms = 1000;
-  tf_http_set_transport(NULL, NULL);
+  tf_http_set_transport(tf_test_net, NULL);
   tf_json_free(fx);
   return done("errors_flow");
 }

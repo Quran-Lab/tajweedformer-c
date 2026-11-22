@@ -51,11 +51,63 @@ def load_p40(contract):
     return p40
 
 
+# TajweedFormer V4's tj3 vocabulary as tokens.txt holds it ("<name> <id>\n", 224 bytes, SHA-256 66fe6eb8...): the one
+# the SDK knows (tf_model.c kVocabs), so a vector build with it opens as far as its engine
+TJ3 = ["<blk>", "|"] + [bytes.fromhex(h).decode() for h in (
+    "d8a1 d8a8 d8aa d8ab d8ac d8ad d8ae d8af d8b0 d8b1 d8b2 d8b3 d8b4 d8b5 d8b6 d8b7 d8b8 d8b9 d8ba d981 d982 d983 d984 d985 d986 "
+    "d987 d988 d98a daba").split()] + ["a", "i", "u", "aa", "ii", "uu", "<foreign>"]
+TJ3_SHA256 = "66fe6eb81b15506270f9e3c6efb0724cda757cd54326f26ca4bcd6be4f3b2aa4"
+
+
+def context_files(p40, contexts):
+    """--contexts: the vector build of protected40.py manifest_files (the same shared files, sealed the same way), with
+    the tj3 vocabulary and each context's own engine files (graph, graph data, frames). No model data: the engine of
+    each context is refused when the Core opens it."""
+    bk = p40.build_key(p40.MODEL_ROOT, p40.KEY_ID, p40.MODEL_ID, p40.VERSION)
+    tokens = "".join(f"{n} {i}\n" for i, n in enumerate(TJ3)).encode()
+    assert len(tokens) == 224 and hashlib.sha256(tokens).hexdigest() == TJ3_SHA256
+    cal = json.dumps({"format": "quranlab.tajweed-calibration/1", "model_id": p40.MODEL_ID, "tokens_sha256": TJ3_SHA256,
+                      "default_context": contexts[0], "contexts": {c: {"classes": {}} for c in contexts}}, sort_keys=True).encode()
+    A, R, O = "*", "required", "optional"
+    spec = [("tokens.txt", tokens, A, "*", "*", "tokens", R), ("calibration.json", cal, A, "*", "*", "calibration", R),
+            # 320 KiB: one transfer of at least 256 KiB for 34.6's rate buckets (tf40_tests requests)
+            ("layers.zfw", p40.stream("layers.zfw", 320 * 1024), A, "*", "*", "weights", R),
+            ("frontend.zfw", p40.stream("frontend.zfw", 700), A, "*", "*", "frontend", R),
+            ("expected_tj3.zfx", p40.stream("expected_tj3.zfx", 400), A, "*", "*", "reference", O)]
+    for c in contexts:
+        spec += [(f"{c}/model_engine2.onnx.zfg", p40.stream(f"graph-{c}", 300), A, "*", c, "graph", R),
+                 (f"{c}/model_engine2.onnx.zfg.bin", p40.stream(f"graph-data-{c}", 500), A, "*", c, "graph-data", R),
+                 (f"{c}/frames.zfw", p40.stream(f"frames-{c}", 200), A, "*", c, "frames", R)]
+    entries = []
+    for path, body, plats, soc, ctxt, role, need in spec:
+        e = {"platforms": plats, "soc": soc, "context": ctxt, "role": role, "need": need,
+             "decoded": {"path": path, "size": len(body), "sha256": hashlib.sha256(body).hexdigest()}}
+        e["encoding"] = "gzip" if p40.plain_allowed(role, path) else "qle1"
+        entries.append((e, body))
+    idx = p40.file_indexes([e for e, _ in entries])
+    out = []
+    for e, body in entries:
+        path = e["decoded"]["path"]
+        if e["encoding"] == "gzip":
+            data = p40.gzip_stored(body)
+            e["path"] = path + ".gz"
+        else:
+            data = p40.seal(p40.gzip_stored(body), p40.file_key(bk, path), suite=p40.AES, form=p40.CDN, payload=p40.GZIP,
+                            key_id=p40.KEY_ID, file_index=idx[path], variant=0, path=path)
+            e["path"] = path + ".qle"
+        e["size"] = len(data)
+        e["sha256"] = hashlib.sha256(data).hexdigest()
+        out.append((e, data, body))
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--contract", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--testbuild")
+    # the vector build with these contexts (the first the default) and the tj3 vocabulary (tf40_tests no_wait, 4.0.2)
+    ap.add_argument("--contexts")
     a = ap.parse_args(argv)
     p40 = load_p40(a.contract)
     from cryptography.hazmat.primitives import serialization
@@ -83,11 +135,12 @@ def main(argv=None):
                 markers[e["decoded"]["path"]] = b[at:at + 32].hex()
         out["plain_markers"] = markers
     else:
-        files = p40.manifest_files()
+        contexts = a.contexts.split(",") if a.contexts else ["c16_l64"]
+        files = context_files(p40, contexts) if a.contexts else p40.manifest_files()
         tokens = next(b for e, _, b in files if e["role"] == "tokens")
-        m = {"format": 3, "model_id": p40.MODEL_ID, "family": "tajweedformer", "revision": "v4.1-vectors-40", "version": p40.VERSION,
-             "min_sdk_version": "4.0.0", "engine_format": 3, "coreml_format": 9, "tokens": "tokens.txt",
-             "tokens_sha256": hashlib.sha256(tokens).hexdigest(), "default_context": "c16_l64", "contexts": ["c16_l64"],
+        m = {"format": 3, "model_id": p40.MODEL_ID, "family": "tajweedformer", "revision": "v4.1-vectors-40" + ("-contexts" if a.contexts else ""),
+             "version": p40.VERSION, "min_sdk_version": "4.0.0", "engine_format": 3, "coreml_format": 9, "tokens": "tokens.txt",
+             "tokens_sha256": hashlib.sha256(tokens).hexdigest(), "default_context": contexts[0], "contexts": contexts,
              "encryption": {"scheme": "qle1", "key_id": p40.KEY_ID.hex(), "root": 1},
              "files": [{k: e[k] for k in ("path", "size", "sha256", "platforms", "soc", "context", "role", "need", "encoding", "decoded")}
                        for e, _, _ in files]}
@@ -128,6 +181,9 @@ def main(argv=None):
     # the build without its key id (not a build for SDK 4.0), and with another key id than the manifest's
     signed("config_nokid", dict(cfg, recommended={k: v for k, v in rec.items() if k != "key_id"}))
     signed("config_badkid", dict(cfg, recommended=dict(rec, key_id=("0" * 31 + "1") if rec["key_id"] != "0" * 31 + "1" else "0" * 32)))
+    # 4.0.2 (SPEC 16.7): one model host (ENDPOINTS_40.md 28.2's endpoints), so a resume goes back to the host that gave
+    # the validator (tf40_tests requests)
+    signed("config_one_models", dict(cfg, endpoints={"models": ["cdn.quranlab.ai"]}))
     # the install certificate (18.4.3): desktop, unattested, the test key does both (one software key)
     cert = {"app": "windows:com.example.recite", "platform": "windows", "key": "apps-one", "install": ih.hex(), "sign": ih.hex(),
             "att": "none", "hw": 0, "iat": now - 60, "exp": now + 10 * 365 * 86400, "recheck": 0, "batch": "-", "digest": "-"}
