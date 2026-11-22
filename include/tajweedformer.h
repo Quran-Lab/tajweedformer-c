@@ -80,9 +80,9 @@ extern "C" {
 #define TF_API
 #endif
 
-#define TF_SDK_VERSION "4.0.2"
+#define TF_SDK_VERSION "4.0.3"
 
-TF_API const char *tf_version(void); /* "4.0.2" */
+TF_API const char *tf_version(void); /* "4.0.3" */
 
 /* ============================================================================ errors */
 
@@ -379,7 +379,7 @@ TF_API int tf_client_remove_models(TfClient *c);
 
 /* One structured report, safe to paste into an issue: no audio, text or identifiers. */
 typedef struct {
-  const char *sdk_version;     /* "4.0.2" */
+  const char *sdk_version;     /* "4.0.3" */
   const char *sdk_latest;      /* the SDK release the signed config in force names, or NULL when it names none */
   int key_accepted;            /* 1 accepted, 0 refused, -1 not known yet (no answer from the server) */
   const char *key_reason;      /* why not: the server's code, or NULL */

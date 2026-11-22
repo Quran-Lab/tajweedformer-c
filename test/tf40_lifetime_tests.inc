@@ -283,3 +283,327 @@ static int t_lifetime(const char *nowait, const char *work) {
   tf_json_free(fx);
   return done("lifetime");
 }
+
+/* ------------------------------------------------------------------ 4.0.3: the folder's one open model
+ *
+ *   tf40_tests lifetime_open <testbuild fixture> <work>
+ *
+ * On the encrypted test build (make_flow40.py --testbuild): real model opens through the Core. The Core holds one
+ * open model (a second qlc_model_open is QLC_E_BUSY), and from 4.0.2 a storage folder has one Core in the process,
+ * so that open model is the folder's, whichever Client's Model holds it:
+ *
+ *   6. Client A's Model opens and a take runs; A is destroyed while the app keeps that Model; Client B on the same
+ *      folder opens a Model: it opens and a take on it works (4.0.2: session_open, the Core's open model held by A's
+ *      idle Model). A's Model, still held, runs a take again, then B's; each Model is freed once at its close, and the
+ *      folder's Core goes with its last holder.
+ *   7. A take of A's Model open while B opens: B's open waits for it, bounded (tf__open_wait_s, set here so a slow
+ *      machine does not decide the outcome). A take that ends within the bound lets B open; one that does not gives B
+ *      session_open after the bound, and the take goes on unharmed; once it ends, B opens.
+ *   8. Takes of A's Model and of B's on two threads at once, the Core's open model going back and forth between them:
+ *      every take runs (TF_OPEN_ROUNDS rounds of 6 takes each, default 2).
+ *   9. The reference data of B's Model fetched and read while A's idle Model has the Core's open model, with a take of
+ *      A's between two reads.
+ *  10. An app's UI thread never waits (Windows: IsGUIThread; here the test's hook says so): B's open there while A's
+ *      take runs is session_open at once; once the take ended, B opens there without a wait.
+ *  11. Windows only, the real check without the hook: the console thread is no UI thread; a thread made a GUI thread
+ *      (IsGUIThread(TRUE)) is, and B's open on it while A's take runs is session_open at once. */
+#define OPEN_NO_MODEL (-1000) /* the step had no Model (its open failed) */
+static void open_audio(float *x, int n) {
+  unsigned s = 20261122u;
+  for (int i = 0; i < n; ++i) x[i] = 0.05f * (float)((int)(life_rand(&s) % 2001) - 1000) / 1000.0f;
+}
+static int open_push(TfSession *s, const float *x, int n) {
+  for (int at = 0; at < n; at += 320) {
+    const int rc = tf_session_push(s, x + at, n - at < 320 ? n - at : 320);
+    if (rc < 0) return rc;
+  }
+  return 0;
+}
+/* the take's end: its finish, then its Heads with frames. 0, or the error */
+static int open_finish(TfSession *s) {
+  if (tf_session_finish(s) < 0) return tf_last_error_code() ? tf_last_error_code() : TF_ERR_ENGINE_FAILED;
+  const TfHeads *h = tf_session_heads(s);
+  const TfDecoded *d = h ? tf_heads_decoded(h) : NULL;
+  return d && d->n_frames > 0 ? 0 : TF_ERR_ENGINE_FAILED;
+}
+/* one take of 1 s on m: 0, or the error of the step that failed (*step names it) */
+static int open_take(TfModel *m, const float *x, const char **step) {
+  *step = "create";
+  TfSession *s = m ? tf_session_create(m, NULL) : NULL;
+  if (!s) return m ? tf_last_error_code() : OPEN_NO_MODEL;
+  *step = "push";
+  int rc = open_push(s, x, 16000);
+  if (!rc) *step = "finish", rc = open_finish(s);
+  tf_session_destroy(s);
+  return rc;
+}
+static int open_ui_thread(void) { return 1; } /* tf__ui_thread_hook: every thread is a UI thread */
+#ifdef _WIN32
+/* case 11: B's open on a thread made a GUI thread (user32 loaded for it and left loaded: a GUI thread uses it) */
+typedef struct {
+  TfClient *b;
+  TfModel *mb;
+  int rc, ui;
+  double dt;
+} OpenGui;
+static void open_gui(void *arg) {
+  OpenGui *g = (OpenGui *)arg;
+  typedef BOOL(WINAPI * IsGuiFn)(BOOL);
+  HMODULE u = LoadLibraryW(L"user32.dll");
+  IsGuiFn f = u ? (IsGuiFn)(void (*)(void))GetProcAddress(u, "IsGUIThread") : NULL;
+  if (f) f(TRUE); /* converts this thread to a GUI thread */
+  g->ui = tf__ui_thread();
+  const double t0 = tf__now_s();
+  g->mb = g->b ? tf_client_model(g->b, NULL) : NULL;
+  g->dt = tf__now_s() - t0;
+  g->rc = g->mb ? 0 : tf_last_error_code();
+}
+#endif
+static const char *open_rc(int rc) { return rc == OPEN_NO_MODEL ? "no Model" : rc ? tf_error_name(rc) : "ok"; }
+/* Client A's Model open with a take run, A destroyed (the app keeps the Model), Client B made on the same folder */
+static TfModel *open_a(const char *w, const float *x, TfClient **b) {
+  fake_reset(LEASE_OK);
+  TfClient *a = flow_client(w);
+  TfModel *ma = a ? tf_client_model(a, NULL) : NULL;
+  const char *step = "";
+  const int rc = ma ? open_take(ma, x, &step) : tf_last_error_code();
+  CHECK(ma && !rc, "open: Client A's Model opens and a take runs (%s at %s: %s)", open_rc(rc), ma ? step : "open", rc ? tf_last_error() : "");
+  if (a) tf_client_destroy(a);
+  fake_reset(LEASE_OK);
+  *b = flow_client_in(w);
+  return ma;
+}
+typedef struct {
+  TfSession *s;
+  const float *x;
+  int delay_ms, rc;
+} OpenEnd;
+static void open_end(void *arg) {
+  OpenEnd *e = (OpenEnd *)arg;
+  tf__sleep_ms(e->delay_ms);
+  int rc = open_push(e->s, e->x + 8000, 8000);
+  if (!rc) rc = open_finish(e->s);
+  e->rc = rc;
+}
+typedef struct {
+  TfModel *m;
+  const float *x;
+  int takes, ran, refused, other, other_rc;
+} OpenTurns;
+static void open_turns(void *arg) {
+  OpenTurns *t = (OpenTurns *)arg;
+  for (int i = 0; i < t->takes; ++i) {
+    const char *step = "";
+    const int rc = open_take(t->m, t->x, &step);
+    if (!rc) t->ran++;
+    else if (rc == TF_ERR_SESSION_OPEN && !strcmp(step, "create")) t->refused++;
+    else t->other++, t->other_rc = rc;
+    tf__sleep_ms(20); /* a gap between takes: the other thread's waiting open finds the Core's model free */
+  }
+}
+
+static int t_lifetime_open(const char *fixture, const char *work) {
+  TfJson *fx = flow_setup(fixture);
+  if (!fx) return 2;
+  float *x = (float *)malloc(16000 * sizeof(float));
+  if (!x) return 2;
+  open_audio(x, 16000);
+  char w[1100];
+  const char *step = "";
+  /* 6: the reported sequence */
+  {
+    snprintf(w, sizeof w, "%s/open6", work);
+    TfClient *b = NULL;
+    TfModel *ma = open_a(w, x, &b);
+    const double t0 = tf__now_s();
+    TfModel *mb = b ? tf_client_model(b, NULL) : NULL;
+    const int orc = mb ? 0 : tf_last_error_code();
+    const int f0 = tf__model_frees; /* after B's open (a failed open frees its own) */
+    CHECK(mb != NULL, "open 6: Client B on the same folder opens a Model while A's Model is held after A's destroy (%s in %.2f s%s%s)",
+          open_rc(orc), tf__now_s() - t0, mb ? "" : ": ", mb ? "" : tf_last_error());
+    int rc = mb ? open_take(mb, x, &step) : OPEN_NO_MODEL;
+    CHECK(mb && !rc, "open 6: a take on B's Model works (%s at %s)", open_rc(rc), step);
+    rc = ma ? open_take(ma, x, &step) : OPEN_NO_MODEL;
+    CHECK(ma && !rc, "open 6: A's Model, held after its Client's destroy, runs a take again (%s at %s)", open_rc(rc), step);
+    rc = mb ? open_take(mb, x, &step) : OPEN_NO_MODEL;
+    CHECK(mb && !rc, "open 6: then B's Model again (%s at %s)", open_rc(rc), step);
+    if (ma) tf_model_close(ma);
+    if (mb) tf_model_close(mb);
+    if (b) tf_client_destroy(b);
+    CHECK(tf__model_frees - f0 == (ma != NULL) + (mb != NULL), "open 6: each Model freed once at its close (%d free(s))", tf__model_frees - f0);
+    const int made = tf__pm_made;
+    fake_reset(LEASE_OK);
+    TfClient *c = flow_client_in(w);
+    TfPm *pc = c ? tf__pm(c) : NULL;
+    CHECK(pc && tf__pm_made == made + 1, "open 6: the folder's Core went with its last holder (a new Client makes one: %d made)", tf__pm_made - made);
+    if (c) tf_client_destroy(c);
+  }
+  /* 7a: a take of A's Model open while B opens; it ends 0.4 s later on another thread: B's open waits and opens */
+  tf__open_wait_s = 60;
+  {
+    snprintf(w, sizeof w, "%s/open7a", work);
+    TfClient *b = NULL;
+    TfModel *ma = open_a(w, x, &b);
+    TfSession *sa = ma ? tf_session_create(ma, NULL) : NULL;
+    const int pushed = sa ? open_push(sa, x, 8000) : OPEN_NO_MODEL;
+    CHECK(sa && !pushed, "open 7a: a take of A's Model is open (%s)", sa ? open_rc(pushed) : tf_last_error());
+    OpenEnd e = {sa, x, 400, -1};
+    TfThread th;
+    const int started = sa && !tf_thread_start(&th, open_end, &e);
+    const double t0 = tf__now_s();
+    TfModel *mb = b ? tf_client_model(b, NULL) : NULL;
+    const double dt = tf__now_s() - t0;
+    const int orc = mb ? 0 : tf_last_error_code();
+    if (started) tf_thread_join(th);
+    CHECK(mb != NULL && dt > 0.3, "open 7a: B's open waits for A's take, which ends after 0.4 s, and opens (%s after %.2f s)", open_rc(orc), dt);
+    CHECK(started && e.rc == 0, "open 7a: A's take ends normally on its thread (%s)", open_rc(e.rc));
+    const int rc = mb ? open_take(mb, x, &step) : OPEN_NO_MODEL;
+    CHECK(mb && !rc, "open 7a: a take on B's Model works (%s at %s)", open_rc(rc), step);
+    if (sa) tf_session_destroy(sa);
+    if (ma) tf_model_close(ma);
+    if (mb) tf_model_close(mb);
+    if (b) tf_client_destroy(b);
+  }
+  /* 7b: a take of A's Model open past the bound (1 s here): B gets session_open after the wait; the take goes on; once
+   * it ends, B opens */
+  tf__open_wait_s = 1;
+  {
+    snprintf(w, sizeof w, "%s/open7b", work);
+    TfClient *b = NULL;
+    TfModel *ma = open_a(w, x, &b);
+    TfSession *sa = ma ? tf_session_create(ma, NULL) : NULL;
+    const int pushed = sa ? open_push(sa, x, 8000) : OPEN_NO_MODEL;
+    const double t0 = tf__now_s();
+    TfModel *mb = b ? tf_client_model(b, NULL) : NULL;
+    const double dt = tf__now_s() - t0;
+    const int orc = mb ? 0 : tf_last_error_code();
+    CHECK(sa && !pushed && !mb && orc == TF_ERR_SESSION_OPEN && dt > 0.9 && dt < 10,
+          "open 7b: B's open while A's take stays open: session_open after the 1 s wait (%s after %.2f s)", open_rc(orc), dt);
+    int rc = sa ? open_push(sa, x + 8000, 8000) : OPEN_NO_MODEL;
+    if (!rc) rc = open_finish(sa);
+    CHECK(sa && !rc, "open 7b: A's take goes on and ends normally (%s)", open_rc(rc));
+    if (sa) tf_session_destroy(sa);
+    if (mb) tf_model_close(mb);
+    mb = b ? tf_client_model(b, NULL) : NULL;
+    CHECK(mb != NULL, "open 7b: once A's take ended, B opens (%s)", mb ? "ok" : open_rc(tf_last_error_code()));
+    rc = mb ? open_take(mb, x, &step) : OPEN_NO_MODEL;
+    CHECK(mb && !rc, "open 7b: a take on B's Model works (%s at %s)", open_rc(rc), step);
+    if (ma) tf_model_close(ma);
+    if (mb) tf_model_close(mb);
+    if (b) tf_client_destroy(b);
+  }
+  /* 8: takes of A's Model and B's on two threads at once */
+  tf__open_wait_s = 60;
+  const int rounds = getenv("TF_OPEN_ROUNDS") ? atoi(getenv("TF_OPEN_ROUNDS")) : 2;
+  for (int round = 0; round < rounds; ++round) {
+    snprintf(w, sizeof w, "%s/open8", work);
+    TfClient *b = NULL;
+    TfModel *ma = open_a(w, x, &b);
+    TfModel *mb = b ? tf_client_model(b, NULL) : NULL;
+    CHECK(mb != NULL, "open 8: B opens (%s)", mb ? "ok" : open_rc(tf_last_error_code()));
+    OpenTurns ta = {ma, x, 6, 0, 0, 0, 0}, tb = {mb, x, 6, 0, 0, 0, 0};
+    TfThread th;
+    const int started = ma && mb && !tf_thread_start(&th, open_turns, &ta);
+    const double t0 = tf__now_s();
+    if (started) {
+      open_turns(&tb);
+      tf_thread_join(th);
+    }
+    printf("  open 8 round %d: A %d run, %d refused; B %d run, %d refused; %.1f s\n", round + 1, ta.ran, ta.refused, tb.ran, tb.refused,
+           tf__now_s() - t0);
+    CHECK(started && ta.ran == 6 && tb.ran == 6,
+          "open 8 round %d: takes of both Models on two threads all run (A %d run, %d refused, %d other %s; B %d run, %d refused, %d other %s)",
+          round + 1, ta.ran, ta.refused, ta.other, open_rc(ta.other_rc), tb.ran, tb.refused, tb.other, open_rc(tb.other_rc));
+    if (ma) tf_model_close(ma);
+    if (mb) tf_model_close(mb);
+    if (b) tf_client_destroy(b);
+  }
+  /* 9: the reference data beside another Model's idle engine. A's kept Model has the Core's open model (a take of it
+   * ran last); B fetches the reference data (the Core installs it only while no model of the build is open, so A's idle
+   * engine is closed for it) and reads an ayah; A runs a take (the open model back to A); B reads another ayah */
+  {
+    snprintf(w, sizeof w, "%s/open9", work);
+    TfClient *b = NULL;
+    TfModel *ma = open_a(w, x, &b);
+    TfModel *mb = b ? tf_client_model(b, NULL) : NULL;
+    int rc = ma && mb ? open_take(ma, x, &step) : OPEN_NO_MODEL;
+    CHECK(mb && !rc, "open 9: B opens, then A's Model runs a take (%s at %s)", open_rc(rc), mb ? step : "open");
+    TfReference *ref = mb ? tf_model_reference(mb) : NULL;
+    rc = ref ? tf_reference_fetch(ref) : OPEN_NO_MODEL;
+    CHECK(ref && !rc && tf_reference_is_downloaded(ref), "open 9: B fetches the reference data while A's idle Model has the Core's open model (%s%s%s)",
+          open_rc(rc), rc && rc != OPEN_NO_MODEL ? ": " : "", rc && rc != OPEN_NO_MODEL ? tf_last_error() : "");
+    TfUnits u;
+    memset(&u, 0, sizeof u);
+    rc = ref && tf_reference_is_downloaded(ref) ? tf_reference_units(ref, 1, 1, &u) : OPEN_NO_MODEL;
+    CHECK(!rc && u.n > 0 && u.n_words > 0, "open 9: B reads 1:1 (%s, %d units)", open_rc(rc), u.n);
+    rc = ma ? open_take(ma, x, &step) : OPEN_NO_MODEL;
+    CHECK(ma && !rc, "open 9: A's Model runs a take after B's read (%s at %s)", open_rc(rc), step);
+    memset(&u, 0, sizeof u);
+    rc = ref && tf_reference_is_downloaded(ref) ? tf_reference_units(ref, 112, 1, &u) : OPEN_NO_MODEL;
+    CHECK(!rc && u.n > 0, "open 9: B reads 112:1 after A's take (%s, %d units)", open_rc(rc), u.n);
+    rc = mb ? open_take(mb, x, &step) : OPEN_NO_MODEL;
+    CHECK(mb && !rc, "open 9: and a take on B's Model works (%s at %s)", open_rc(rc), step);
+    if (ma) tf_model_close(ma);
+    if (mb) tf_model_close(mb);
+    if (b) tf_client_destroy(b);
+  }
+  /* 10: on a UI thread, no wait */
+  tf__open_wait_s = 3;
+  {
+    snprintf(w, sizeof w, "%s/open10", work);
+    TfClient *b = NULL;
+    TfModel *ma = open_a(w, x, &b);
+    TfSession *sa = ma ? tf_session_create(ma, NULL) : NULL;
+    const int pushed = sa ? open_push(sa, x, 8000) : OPEN_NO_MODEL;
+    tf__ui_thread_hook = open_ui_thread;
+    double t0 = tf__now_s();
+    TfModel *mb = b ? tf_client_model(b, NULL) : NULL;
+    double dt = tf__now_s() - t0;
+    const int orc = mb ? 0 : tf_last_error_code();
+    CHECK(sa && !pushed && !mb && orc == TF_ERR_SESSION_OPEN && dt < 1.0,
+          "open 10: on a UI thread, B's open while A's take runs is session_open at once (%s after %.2f s; off it the wait is up to 3 s)", open_rc(orc), dt);
+    int rc = sa ? open_push(sa, x + 8000, 8000) : OPEN_NO_MODEL;
+    if (!rc) rc = open_finish(sa);
+    CHECK(sa && !rc, "open 10: A's take goes on and ends normally (%s)", open_rc(rc));
+    if (sa) tf_session_destroy(sa);
+    if (mb) tf_model_close(mb);
+    t0 = tf__now_s();
+    mb = b ? tf_client_model(b, NULL) : NULL;
+    dt = tf__now_s() - t0;
+    tf__ui_thread_hook = NULL;
+    CHECK(mb != NULL, "open 10: on a UI thread, once A's take ended, B opens (%s in %.2f s)", mb ? "ok" : open_rc(tf_last_error_code()), dt);
+    if (ma) tf_model_close(ma);
+    if (mb) tf_model_close(mb);
+    if (b) tf_client_destroy(b);
+  }
+#ifdef _WIN32
+  /* 11 (Windows): IsGUIThread itself, no hook */
+  {
+    const int console_ui = tf__ui_thread();
+    snprintf(w, sizeof w, "%s/open11", work);
+    TfClient *b = NULL;
+    TfModel *ma = open_a(w, x, &b);
+    TfSession *sa = ma ? tf_session_create(ma, NULL) : NULL;
+    const int pushed = sa ? open_push(sa, x, 8000) : OPEN_NO_MODEL;
+    OpenGui g = {b, NULL, -1, 0, 0};
+    TfThread th;
+    const int started = sa && !pushed && !tf_thread_start(&th, open_gui, &g);
+    if (started) tf_thread_join(th);
+    CHECK(!console_ui && started && g.ui == 1 && !g.mb && g.rc == TF_ERR_SESSION_OPEN && g.dt < 1.0,
+          "open 11: the console thread is no UI thread (%d); on a thread made a GUI thread (IsGUIThread %d), B's open while A's take "
+          "runs is session_open at once (%s after %.2f s)",
+          console_ui, g.ui, open_rc(g.rc), g.dt);
+    int rc = sa ? open_push(sa, x + 8000, 8000) : OPEN_NO_MODEL;
+    if (!rc) rc = open_finish(sa);
+    CHECK(sa && !rc, "open 11: A's take goes on and ends normally (%s)", open_rc(rc));
+    if (sa) tf_session_destroy(sa);
+    if (g.mb) tf_model_close(g.mb);
+    if (ma) tf_model_close(ma);
+    if (b) tf_client_destroy(b);
+  }
+#endif
+  tf__open_wait_s = 3;
+  free(x);
+  tf_json_free(fx);
+  return done("lifetime_open");
+}

@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.0.3
+
+- **Fixed: a new Client on a storage folder opens its model while the app still holds a Model of a destroyed Client.**
+  4.0.2 refused that open with `TF_ERR_SESSION_OPEN`. Now the held Model gives up the engine while it has no take
+  running, and opens it again for its next take. While its take runs, a call that needs the engine (`tf_client_model`,
+  `tf_session_create`, `tf_reference_fetch`, `tf_reference_units`) waits up to 3 seconds for that take to end, then
+  fails with `TF_ERR_SESSION_OPEN`. On Windows a call on a GUI thread never waits: it fails at once. No result changes
+  by a bit.
+
 ## 4.0.2
 
 Nothing waits for Wi-Fi, an error says what caused it, and the SDK steps back further when Quran Lab's servers are

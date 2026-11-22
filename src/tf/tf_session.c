@@ -278,18 +278,27 @@ static TfSession *session_new(TfModel *m, const TfSessionOptions *opt, int rate_
     tf__model_context_in_force(m, context, sizeof context);
   }
   const int rate = rate_override ? rate_override : o.sample_rate > 0 ? o.sample_rate : 16000;
+  /* 4.0.3: the engine stays this Model's from its stream until the take holds it (no other Model of the folder takes
+   * the Core's open model in between) */
+  tf__model_engine_claim(m);
   qlc_stream *zs = tf__model_stream(m, context, rate);
-  if (!zs) return NULL;
+  if (!zs) {
+    tf__model_engine_unclaim(m);
+    return NULL;
+  }
   TfSession *s = (TfSession *)calloc(1, sizeof *s);
   if (!s) {
+    tf__model_engine_unclaim(m);
     tf__fail(TF_ERR_ENGINE_FAILED, "out of memory");
     return NULL;
   }
   if (tf__model_set_session(m, s)) {
+    tf__model_engine_unclaim(m);
     free(s);
     tf__fail(TF_ERR_SESSION_OPEN, NULL);
     return NULL;
   }
+  tf__model_engine_unclaim(m);
   s->m = m;
   s->client = tf__model_client(m);
   s->zs = zs;
@@ -440,9 +449,13 @@ static int engine_failed(TfSession *s, int status) {
 static void wrap_up(TfSession *s, int reason) {
   s->state = ENDED;
   share_end(s, 1);
+  /* 4.0.3: the engine stays this Model's until the count below has read the take's stream (the recited range): no
+   * other Model of the folder takes the Core's open model in between */
+  tf__model_engine_claim(s->m);
   tf__model_clear_session(s->m, s);
   /* the app's finish, silence, the limit, the clip's end: normal; the background reasons (never raised here) not */
   count_take(s, 0, reason == TF_ENDED_BACKGROUND || reason == TF_ENDED_HIDDEN || reason == TF_ENDED_INTERRUPTED ? 1 : 0);
+  tf__model_engine_unclaim(s->m);
   if (reason) emit(s, TF_EVENT_ENDED, 0, 0, reason, 0);
 }
 

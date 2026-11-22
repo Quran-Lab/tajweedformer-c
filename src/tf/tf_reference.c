@@ -62,7 +62,15 @@ void tf__reference_release(TfReference *r) {
 }
 
 /* the Core's answer for one ayah into the cache: 0, or an error */
+static int read_ayah_claimed(TfReference *r, int surah, int ayah, int at);
 static int read_ayah(TfReference *r, int surah, int ayah, int at) {
+  /* 4.0.3: the engine stays this Model's while it is read (no other Model of the folder takes the Core's open model) */
+  tf__model_engine_claim(r->m);
+  const int rc = read_ayah_claimed(r, surah, ayah, at);
+  tf__model_engine_unclaim(r->m);
+  return rc;
+}
+static int read_ayah_claimed(TfReference *r, int surah, int ayah, int at) {
   qlc_model *zm = tf__model_engine_for_reference(r->m);
   if (!zm) return tf__error_code() ? tf__error_code() : tf__fail(TF_ERR_REFERENCE_MISSING, NULL);
   TfPm *pm = tf__model_pm(r->m);

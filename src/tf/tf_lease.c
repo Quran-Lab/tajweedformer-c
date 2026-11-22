@@ -71,6 +71,7 @@ struct TfPm {
   char *dir;          /* 4.0.2: the storage folder; one host per folder in the process (the registry below) */
   long long lease_iat; /* 4.0.2: the server's issue time of the lease in lease.json (0: not known) */
   int open_err;       /* why the key store or the Core could not be made (0 when they were) */
+  TfModel *holder;    /* 4.0.3: the Model of the folder that has the Core's one open model, or is opening it (tf_model.c) */
   /* 18.4.7.1, this process's lease attempts */
   TfCond cv;           /* an attempt ended */
   int attempting;      /* attempts running now */
@@ -1105,8 +1106,26 @@ void tf__pm_close(TfPm *p, qlc_model *m) {
   qlc_model_close(m);
   tf_mutex_lock(&p->lock);
   p->open_models--;
+  tf_cond_signal(&p->cv);
   tf_mutex_unlock(&p->lock);
   pm_drop(p);
+}
+
+/* 4.0.3: the Core holds one open model (a second qlc_model_open is QLC_E_BUSY) and the Clients of a storage folder
+ * share its Core (4.0.2), so the open model is the folder's: one Model of the folder at a time has it, `holder`, read and
+ * changed under the host's lock (tf_model.c slot_take). The waits are on `cv` (shared with the lease attempts: every
+ * waiter checks its own condition again). */
+TfModel *tf__pm_holder(TfPm *p) { return p ? p->holder : NULL; }
+void tf__pm_set_holder(TfPm *p, TfModel *m) { p->holder = m; }
+void tf__pm_wait(TfPm *p, long ms) { tf_cond_wait_ms(&p->cv, &p->lock, ms); }
+void tf__pm_notify(TfPm *p) { tf_cond_signal(&p->cv); }
+/* a Model's open model closed under the host's lock. Never the host's last reference: the Model holds its own
+ * (tf__pm_retain) until its close */
+void tf__pm_close_held(TfPm *p, qlc_model *m) {
+  qlc_model_close(m);
+  p->open_models--;
+  p->refs--;
+  tf_cond_signal(&p->cv);
 }
 
 int tf__pm_status(TfPm *p, qlc_lease_status *s) {

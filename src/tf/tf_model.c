@@ -77,6 +77,7 @@ struct TfModel {
   TfMutex link;
   int holders, sessions, app_closed, fetch_off;
   unsigned zs_gen;
+  int eng_claims;          /* 4.0.3: calls using the engine now, under the host's lock (tf__model_engine_claim) */
   TfReference ref;
   int has_ref;
   char *info_json;
@@ -718,7 +719,7 @@ static void read_clips(TfModel *m) {
   tf_json_free(j);
 }
 
-static void engine_close(TfModel *m);
+static void engine_close(TfModel *m, int keep_slot);
 
 int tf__client_model_release(TfClient *c, TfModel *m);
 void tf__session_detach(TfSession *s);
@@ -742,7 +743,7 @@ void tf_model_close(TfModel *m) {
   if (client) tf__client_session_close(client); /* 17.8: the Model's close ends the analytics session */
   /* 4.0.2: a take still open is cancelled; its Session stays valid, its take over */
   if (m->open) tf_session_cancel(m->open);
-  engine_close(m);
+  engine_close(m, 0);
   tf__reference_release(&m->ref);
   if (m->pm) tf__pm_release(m->pm);
   m->pm = NULL;
@@ -981,12 +982,87 @@ static void stream_close(TfModel *m) {
   if (g_stream_owner == m) g_stream_owner = NULL;
   owner_unlock();
 }
-static void engine_close(TfModel *m) {
+/* the Model's engine closed: its stream and its model, under the host's lock, so another Model of the folder never
+ * finds it half closed. The folder's open model is left to the others unless `keep_slot` (an engine reopened at once) */
+static void engine_close(TfModel *m, int keep_slot) {
+  TfPm *const p = m->pm;
+  if (!p) {
+    stream_close(m); /* no engine without a host */
+    return;
+  }
+  tf__pm_lock(p);
   stream_close(m);
-  if (m->zm) tf__pm_close(m->pm, m->zm);
+  if (m->zm) tf__pm_close_held(p, m->zm);
   m->zm = NULL;
   m->eng_context[0] = 0;
   m->eng_rate = 0;
+  if (!keep_slot && tf__pm_holder(p) == m) tf__pm_set_holder(p, NULL);
+  tf__pm_unlock(p);
+}
+
+/* 4.0.3: the folder's one open model. The Core holds one (a second qlc_model_open is QLC_E_BUSY) and the Clients of a
+ * storage folder share its Core (4.0.2): 4.0.2 left it with a Model whose Client was destroyed while the app kept it,
+ * and a new Client of the folder then failed to open its own (session_open). Now one Model of the folder at a time has
+ * it (the host's holder). Another Model that has it gives it up when no take of it is open and no call uses its
+ * engine: its stream and model are closed (a Session of it reads that stream no longer: its generation moves on), and
+ * its next take opens them again the same way. One with a take open is waited for, up to tf__open_wait_s, except on an
+ * app's UI thread (tf__ui_thread), which never waits: session_open at once. */
+double tf__open_wait_s = 3;
+static int take_open(TfModel *m) {
+  tf_mutex_lock(&m->link);
+  const int open = m->open != NULL;
+  tf_mutex_unlock(&m->link);
+  return open;
+}
+/* h gives up the folder's open model (under the host's lock) */
+static void engine_give_up(TfModel *h, TfPm *p) {
+  stream_close(h);
+  if (h->zm) tf__pm_close_held(p, h->zm);
+  h->zm = NULL;
+  h->eng_context[0] = 0;
+  h->eng_rate = 0;
+  tf__pm_set_holder(p, NULL);
+}
+/* the folder's open model for m (m claims its engine): 0, or TF_ERR_SESSION_OPEN when another Model's take held it
+ * past the wait. On an app's UI thread there is no wait: session_open at once (tf__ui_thread) */
+static int slot_take(TfModel *m) {
+  TfPm *const p = m->pm;
+  if (!p) return tf__fail(TF_ERR_STORAGE_FAILED, "no install key store");
+  const double until = tf__now_s() + (tf__ui_thread() ? 0 : tf__open_wait_s);
+  tf__pm_lock(p);
+  for (;;) {
+    TfModel *const h = tf__pm_holder(p);
+    if (!h || h == m) break;
+    if (!h->eng_claims && !take_open(h)) {
+      engine_give_up(h, p);
+      continue;
+    }
+    const double left = until - tf__now_s();
+    if (left <= 0) {
+      tf__pm_unlock(p);
+      return tf__fail(TF_ERR_SESSION_OPEN, "a take of another Model of this storage folder is open");
+    }
+    tf__pm_wait(p, left < 0.01 ? (long)(left * 1000) + 1 : 10); /* a take's end is not signalled: looked at every 10 ms */
+  }
+  tf__pm_set_holder(p, m);
+  tf__pm_unlock(p);
+  return 0;
+}
+void tf__model_engine_claim(TfModel *m) {
+  TfPm *const p = m ? m->pm : NULL;
+  if (!p) return;
+  tf__pm_lock(p);
+  m->eng_claims++;
+  tf__pm_unlock(p);
+}
+void tf__model_engine_unclaim(TfModel *m) {
+  TfPm *const p = m ? m->pm : NULL;
+  if (!p) return;
+  tf__pm_lock(p);
+  /* a claim that brought no engine (an open that failed) leaves the folder's open model to the others */
+  if (m->eng_claims > 0 && --m->eng_claims == 0 && !m->zm && tf__pm_holder(p) == m) tf__pm_set_holder(p, NULL);
+  tf__pm_notify(p);
+  tf__pm_unlock(p);
 }
 
 /* bytes of a file's CDN form in the build's folder: whole, or the partial file of a download that stopped */
@@ -1040,7 +1116,14 @@ static int engine_files(TfModel *m, const char *context) {
   return 0;
 }
 
+static qlc_stream *model_stream(TfModel *m, const char *context, int rate);
 qlc_stream *tf__model_stream(TfModel *m, const char *context, int rate) {
+  tf__model_engine_claim(m); /* 4.0.3: the engine stays this Model's while it is opened and its stream made */
+  qlc_stream *zs = model_stream(m, context, rate);
+  tf__model_engine_unclaim(m);
+  return zs;
+}
+static qlc_stream *model_stream(TfModel *m, const char *context, int rate) {
   if (!m || !context) return NULL;
   if (rate <= 0) rate = 16000;
   if (rate != 16000 && (rate < 8000 || rate > 48000)) {
@@ -1060,7 +1143,10 @@ qlc_stream *tf__model_stream(TfModel *m, const char *context, int rate) {
   const int making = !m->zm || strcmp(m->eng_context, context) || m->eng_rate != rate || !m->zs;
   if (making) tf__qos_snapshot(&before);
   if (!m->zm || strcmp(m->eng_context, context) || m->eng_rate != rate) {
-    engine_close(m);
+    /* 4.0.3: the folder's open model first (before the files and the lease: the Core installs and attests only while
+     * no model is open) */
+    if (slot_take(m)) return NULL;
+    engine_close(m, 1);
     if (engine_files(m, context)) return NULL;
     /* 4.0.2 (24.13 item 3): every file of the context is on the device from here, so a lease that cannot be had
      * (no answer, or the Core's needs_connection) needs the lease, not the model */
@@ -1294,6 +1380,7 @@ qlc_model *tf__model_engine_for_reference(TfModel *m) {
     tf__fail(TF_ERR_REFERENCE_MISSING, NULL);
     return NULL;
   }
+  if (slot_take(m)) return NULL; /* 4.0.3: the folder's open model (the caller claims the engine) */
   const char *ctx = m->warm_context[0] ? m->warm_context : m->default_context;
   if (engine_files(m, ctx)) return NULL;
   TfClient *c = tf__model_client_hold(m);
@@ -1318,8 +1405,12 @@ qlc_model *tf__model_engine_for_reference(TfModel *m) {
 int tf__model_engine_release(TfModel *m) {
   if (!m) return tf__fail(TF_ERR_INVALID_ARGUMENT, "no model");
   if (m->open) return tf__fail(TF_ERR_SESSION_OPEN, NULL);
-  engine_close(m);
-  return 0;
+  /* 4.0.3: another Model of the folder may have the Core's open model: it is closed too (an idle one), or waited for */
+  tf__model_engine_claim(m);
+  const int rc = m->pm ? slot_take(m) : 0;
+  engine_close(m, 0);
+  tf__model_engine_unclaim(m);
+  return rc;
 }
 
 /* ------------------------------------------------------------------ info */
